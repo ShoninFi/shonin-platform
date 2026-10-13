@@ -91,7 +91,8 @@ pub struct Capabilities {
     /// When an observation or a check here last failed.
     pub(super) failed_at: Option<tokio::time::Instant>,
     /// When a check here last failed or gave no answer: what it was to find
-    /// out is not asked again for [`RECHECK_AFTER_FAILURE`].
+    /// out is not asked again for [`RECHECK_AFTER_FAILURE`]. A check the
+    /// endpoint turned away (a rate limit, a server error) does not set it.
     pub(super) check_failed_at: Option<tokio::time::Instant>,
 }
 
@@ -158,6 +159,14 @@ impl Capabilities {
         self.check_failed_at = Some(now);
         self.failed_at = Some(now);
     }
+
+    /// A check the endpoint turned away in part: what it did not settle is
+    /// asked again the next time it is wanted, at once, and a recheck it cut
+    /// short is due again after [`RECHECK_AFTER_FAILURE`] (as after any
+    /// failure here), but the endpoint is not passed over meanwhile.
+    fn check_turned_away(&mut self) {
+        self.failed_at = Some(tokio::time::Instant::now());
+    }
 }
 
 /// One endpoint's capabilities, shared by the follower and the check that
@@ -175,6 +184,10 @@ enum Asked<T> {
     Found(T),
     /// It answered, but not so the question was settled.
     Failed,
+    /// It turned a request away for now (a rate limit, an HTTP server
+    /// error): nothing was learned, and the question is asked again the
+    /// next time it is wanted.
+    TurnedAway,
     /// It did not answer within [`CHECK_TIMEOUT`] (or not at all): the
     /// endpoint is in trouble and nothing more is asked of it now.
     Silent,
@@ -183,10 +196,27 @@ enum Asked<T> {
 async fn ask<T>(within: Duration, check: impl Future<Output = Result<T>>) -> Asked<T> {
     match tokio::time::timeout(within, check).await {
         Ok(Ok(found)) => Asked::Found(found),
+        Ok(Err(error)) if turned_away(&error) => Asked::TurnedAway,
         Ok(Err(error)) if silent(&error) => Asked::Silent,
         Ok(Err(_)) => Asked::Failed,
         Err(_) => Asked::Silent,
     }
+}
+
+/// Whether an error is the endpoint turning a request away for now (a rate
+/// limit however it arrived, or an HTTP server error), which is an answer
+/// of a kind: the endpoint is there, and may answer the next time it is
+/// asked.
+fn turned_away(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<CallError>() {
+            Some(CallError::Transport(text)) => crate::client::turned_away_text(text),
+            Some(_) => false,
+            None => cause
+                .downcast_ref::<alloy::transports::TransportError>()
+                .is_some_and(crate::client::turned_away),
+        })
 }
 
 /// Whether an error is the endpoint not answering at all (the connection,
@@ -207,8 +237,11 @@ fn silent(error: &anyhow::Error) -> bool {
 /// limits), otherwise only what the paths need and is not known. A check
 /// that fails leaves what was known before and marks the failure, so it is
 /// not asked again for [`RECHECK_AFTER_FAILURE`]; one the endpoint does not
-/// answer ends the whole check. Run apart from any observation, which waits
-/// for it at most until its budget runs out.
+/// answer ends the whole check. One the endpoint turns away (a rate limit,
+/// a server error) also leaves what was known, but is not marked so: it is
+/// asked again the next time it is wanted, so an endpoint that limited a
+/// burst of requests is used as soon as it answers again. Run apart from
+/// any observation, which waits for it at most until its budget runs out.
 pub(super) async fn check(
     endpoint: DynProvider,
     shared: Shared,
@@ -230,11 +263,14 @@ pub(super) async fn check(
     };
     // Asked when wanted and not known, or, on a recheck, when known or wanted.
     let asks = |known: bool, wanted: bool| (wanted && !known) || (again && (known || wanted));
+    // Whether the endpoint turned a step away.
+    let mut turned = false;
     macro_rules! settle {
         ($asked:expr, $found:pat => $write:expr) => {
             match $asked {
                 Asked::Found($found) => $write,
                 Asked::Failed => lock(&shared).check_failed(),
+                Asked::TurnedAway => turned = true,
                 Asked::Silent => {
                     lock(&shared).check_failed();
                     return;
@@ -274,7 +310,7 @@ pub(super) async fn check(
         // backed off for it, and is asked again at the next check.
         match ask(CHECK_TIMEOUT, probe_gas(&endpoint, gas)).await {
             Asked::Found(found) => lock(&shared).gas_at_entry = Some(found),
-            Asked::Failed => {}
+            Asked::Failed | Asked::TurnedAway => {}
             Asked::Silent => {
                 lock(&shared).check_failed();
                 return;
@@ -283,14 +319,24 @@ pub(super) async fn check(
     }
     if asks(known.hash_pin.is_some(), wanted.hash_pin) {
         let Some(source) = known.source else {
-            // Not to be asked without the block source, which failed.
-            lock(&shared).check_failed();
+            // Not to be asked without the block source: one the endpoint
+            // turned away is asked again the next time it is wanted, one
+            // that failed not for a while.
+            let mut known = lock(&shared);
+            if turned {
+                known.check_turned_away();
+            } else {
+                known.check_failed();
+            }
             return;
         };
         settle!(
             ask(CHECK_TIMEOUT * 2, probe_hash_pin(&endpoint, source)).await,
             honours => lock(&shared).hash_pin = Some(honours)
         );
+    }
+    if turned {
+        lock(&shared).check_turned_away();
     }
 }
 
@@ -476,6 +522,8 @@ pub async fn probe_overrides(endpoint: &DynProvider, gas: u64) -> Result<Option<
                 {
                     return Ok(Some(source));
                 }
+                // Turned away, the header says nothing either way.
+                Err(error) if turned_away(&error) => return Err(error),
                 Ok(_) | Err(_) => inconclusive |= near,
             }
         }

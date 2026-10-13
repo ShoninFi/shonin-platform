@@ -1,7 +1,8 @@
 //! A stand-in node for the follower's tests: a local anvil of the test's
 //! own (killed when dropped), and a scriptable JSON-RPC proxy in front of
 //! it that misbehaves the ways public endpoints do: it answers late, lags a
-//! few blocks behind, fails for a while, ignores block pins (answering at
+//! few blocks behind, fails for a while, turns requests away with an HTTP
+//! status (a rate limit, a server error), ignores block pins (answering at
 //! its head), refuses state overrides, caps a call's gas without saying so,
 //! refuses wide log ranges, or leaves a log out of an answer once.
 //!
@@ -258,6 +259,12 @@ pub struct Script {
     pub fail_next: u32,
     /// Fail every request for these methods.
     pub fail_methods: Vec<String>,
+    /// Turn this many of the next HTTP requests (`eth_chainId` alone
+    /// excepted) away with the status `turn_away_with` and a body that is
+    /// not JSON-RPC, as a public endpoint does when it limits the rate (429)
+    /// or is overloaded (503).
+    pub turn_away_next: u32,
+    pub turn_away_with: u16,
     /// Answer every call and state read at the head, whatever block it was
     /// pinned to (a hash it has never seen included).
     pub ignore_pins: bool,
@@ -373,6 +380,24 @@ async fn serve(
             Err(_) => return,
         };
         buffer.drain(..start + size);
+        if let Some(status) = turned_away(&body, &script, &seen) {
+            let text = b"try again later";
+            let reply = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                if status == 429 {
+                    "Too Many Requests"
+                } else {
+                    "Service Unavailable"
+                },
+                text.len()
+            );
+            if socket.write_all(reply.as_bytes()).await.is_err()
+                || socket.write_all(text).await.is_err()
+            {
+                return;
+            }
+            continue;
+        }
         let answer = match body {
             Value::Array(requests) => {
                 let mut answers = Vec::new();
@@ -394,6 +419,34 @@ async fn serve(
             return;
         }
     }
+}
+
+/// The status to turn `body` away with, if the script says to (counting
+/// its requests as seen).
+fn turned_away(body: &Value, script: &Mutex<Script>, seen: &Mutex<Seen>) -> Option<u16> {
+    let methods: Vec<String> = match body {
+        Value::Array(requests) => requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect(),
+        request => vec![request["method"].as_str().unwrap_or_default().to_string()],
+    };
+    if methods.iter().all(|method| method == "eth_chainId") {
+        return None;
+    }
+    let status = {
+        let mut script = script.lock().unwrap();
+        if script.turn_away_next == 0 {
+            return None;
+        }
+        script.turn_away_next -= 1;
+        script.turn_away_with
+    };
+    let mut seen = seen.lock().unwrap();
+    for method in methods {
+        *seen.methods.entry(method).or_default() += 1;
+    }
+    Some(status)
 }
 
 fn error(id: &Value, code: i64, message: &str) -> Value {

@@ -11,17 +11,18 @@
 //! followed branch's hash at its number (from the observation's window, the
 //! anchors, or one header beyond them), and so must the last block of each
 //! window of logs, as the endpoint that answered the window gives it just
-//! after (one header there, unless that endpoint is the one the observation
-//! came from). A window from an endpoint on another branch, which may leave
-//! out a log the followed branch has, is refused that way. That is one
-//! comparison per window and per log-bearing block, never one per block.
+//! after (one header there, whichever endpoint it is: the one the
+//! observation came from may have moved to another branch since). A window
+//! from an endpoint on another branch, which may leave out a log the
+//! followed branch has, is refused that way. That is one comparison per
+//! window and per log-bearing block, never one per block.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256};
 use alloy::rpc::types::{Filter, Log};
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::{At, Continuity, Follower, Observed, Plan};
 use crate::rpc_policy::RpcPolicy;
@@ -68,9 +69,8 @@ pub struct Pages {
     /// The last block read.
     pub to: u64,
     /// The last block of each window of logs, with its hash as the
-    /// endpoint that answered the window gave it (`None` for the endpoint
-    /// the observation came from, checked against what it saw there).
-    pub ends: Vec<(u64, Option<B256>)>,
+    /// endpoint that answered the window gave it just after the logs.
+    pub ends: Vec<(u64, B256)>,
     pub logs: Vec<Log>,
 }
 
@@ -162,7 +162,14 @@ impl RangeReader {
                     filter = filter.event_signature(self.watch.topics.clone());
                 }
                 for window in follower.client().logs_by_window(&filter, seen).await? {
-                    ends.push((window.to, window.end_hash));
+                    let Some(end_hash) = window.end_hash else {
+                        bail!(
+                            "the logs from block {} came without block {}'s hash",
+                            window.from,
+                            window.to
+                        );
+                    };
+                    ends.push((window.to, end_hash));
                     logs.extend(window.logs);
                 }
             }
@@ -237,9 +244,7 @@ impl RangeReader {
             }
         }
         // The hashes to compare: each log-bearing block's, and each window
-        // end's as the endpoint that answered the window gave it (none for
-        // the observation's own endpoint: the end is then held as the
-        // followed branch has it).
+        // end's as the endpoint that answered the window gave it.
         let mut wanted: BTreeMap<u64, BTreeSet<B256>> = by_block
             .iter()
             .map(|(n, (h, _))| (*n, BTreeSet::from([*h])))
@@ -250,8 +255,7 @@ impl RangeReader {
                     "a window of logs ends at block {end}, outside the read"
                 ));
             }
-            let found = wanted.entry(*end).or_default();
-            found.extend(*hash);
+            wanted.entry(*end).or_default().insert(*hash);
         }
         let mut proven = Vec::new();
         for (number, found) in wanted {

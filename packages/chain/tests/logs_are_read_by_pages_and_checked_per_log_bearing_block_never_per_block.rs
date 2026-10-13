@@ -127,10 +127,16 @@ async fn a_history_is_read_whole_by_pages_with_no_header_per_block() {
     // One log query per page.
     let pages = (head - 1).div_ceil(200);
     assert_eq!(seen.count("eth_getLogs"), pages);
-    // Headers: at most one per page end and per log-bearing block outside
-    // the observations' windows, far fewer than one per block.
+    // Headers: one per page end where the page's logs came from, read just
+    // after them, and at most one more per page end and per log-bearing
+    // block outside the observations' windows, for the followed branch's
+    // hash there: far fewer than one per block.
     let headers = seen.count("eth_getBlockByNumber");
-    assert!(headers <= pages + 5, "{headers} headers for {head} blocks");
+    assert!(headers >= pages, "{headers} headers for {pages} pages");
+    assert!(
+        headers <= 2 * pages + 5,
+        "{headers} headers for {pages} pages and {head} blocks"
+    );
     // No head read per page: the observation's head is used.
     assert_eq!(seen.count("eth_blockNumber"), 0);
 }

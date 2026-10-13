@@ -1290,6 +1290,37 @@ fn rate_limited(error: &alloy::transports::TransportError) -> bool {
     }
 }
 
+/// Whether a request's failure is the endpoint turning it away for now
+/// rather than not answering at all: a rate limit, however it arrived
+/// ([`rate_limited`]), or an HTTP server error (a 5xx status). The endpoint
+/// is there and did nothing with the request; asked again later, it may
+/// answer.
+pub(crate) fn turned_away(error: &alloy::transports::TransportError) -> bool {
+    use alloy::transports::RpcError;
+    rate_limited(error)
+        || matches!(
+            error,
+            RpcError::Transport(kind) if kind.as_http_error().is_some_and(|http| http.status >= 500)
+        )
+}
+
+/// [`turned_away`], for a failure carried only as its text (as
+/// `follow::capabilities::CallError` carries one): a rate limit's wording,
+/// or an HTTP error whose status is 429 or 5xx, as the transport writes it.
+pub(crate) fn turned_away_text(text: &str) -> bool {
+    if text.contains(RATE_LIMITED) || is_rate_limit(0, text) {
+        return true;
+    }
+    text.match_indices("HTTP error ").any(|(at, prefix)| {
+        let rest = &text[at + prefix.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        rest[digits.len()..].starts_with(" with")
+            && digits
+                .parse::<u16>()
+                .is_ok_and(|status| status == 429 || (500..600).contains(&status))
+    })
+}
+
 /// What became of a transaction handed to a list's endpoints.
 enum Handed {
     /// Taken, or it may have been: watched for by its hash.
@@ -2336,11 +2367,12 @@ impl Client {
     /// When the caller has just seen `rpc` endpoint `seen.0` (its place in
     /// the list, from [`Client::each_endpoint`]) at block `seen.1`, that
     /// endpoint is asked first and not asked for its head again for a
-    /// window ending at or below that block, and a window it answers so is
-    /// given no hash: the caller checks that end against what it saw there.
-    /// Every other endpoint is still asked for its head before it reads a
-    /// window. When log queries go to `logs_rpc`, `seen` names another list
-    /// and is not used.
+    /// window ending at or below that block. A window it answers is still
+    /// given its end's hash as it has it just after the logs: the endpoint
+    /// may have moved to another branch since the caller saw it. Every
+    /// other endpoint is still asked for its head before it reads a window.
+    /// When log queries go to `logs_rpc`, `seen` names another list and is
+    /// not used.
     pub async fn logs_by_window(
         &self,
         filter: &Filter,
@@ -2353,7 +2385,7 @@ impl Client {
             heads.saw(at, head);
             self.log_endpoints.answered(at);
         }
-        self.logs_with(filter, heads, Ends::Read { seen }).await
+        self.logs_with(filter, heads, Ends::Read).await
     }
 
     async fn logs_with(&self, filter: &Filter, heads: Heads, ends: Ends) -> Result<Vec<LogWindow>> {
@@ -2376,7 +2408,7 @@ impl Client {
             );
         }
         let Some((from, to)) = from.zip(to).filter(|(from, to)| from <= to) else {
-            if matches!(ends, Ends::Read { .. }) {
+            if matches!(ends, Ends::Read) {
                 bail!("logs are read by window only over a numbered range");
             }
             let logs = self.logs.get_logs(filter).await.context("reading logs")?;
@@ -2406,9 +2438,7 @@ impl Client {
                 running.spawn(async move {
                     let read = match read_window(&endpoints, &heads, &window, from, to).await {
                         Ok((logs, at)) => match ends {
-                            Ends::Read { seen }
-                                if !seen.is_some_and(|(seen, head)| seen == at && to <= head) =>
-                            {
+                            Ends::Read => {
                                 end_hash(&endpoints.each[at].provider, to)
                                     .await
                                     .with_context(|| {
@@ -2424,7 +2454,7 @@ impl Client {
                                         end_hash: Some(hash),
                                     })
                             }
-                            _ => Ok(LogWindow {
+                            Ends::Unread => Ok(LogWindow {
                                 from,
                                 to,
                                 logs,
@@ -3385,21 +3415,17 @@ pub struct LogWindow {
     /// The logs in `from..=to`.
     pub logs: Vec<Log>,
     /// The hash of block `to` as the endpoint that answered the window gave
-    /// it, read there just after the logs; `None` when that endpoint is the
-    /// one the caller had just seen, which the caller checks itself.
+    /// it, read there just after the logs. Every window of
+    /// [`Client::logs_by_window`] has it.
     pub end_hash: Option<B256>,
 }
 
 /// Whether a log read also reads each window's last block on the endpoint
-/// that answered it.
+/// that answered it, every window and every endpoint alike.
 #[derive(Clone, Copy, Debug)]
 enum Ends {
     Unread,
-    /// Except for a window the `rpc` endpoint `seen.0`, seen at block
-    /// `seen.1`, answers up to that block.
-    Read {
-        seen: Option<(usize, u64)>,
-    },
+    Read,
 }
 
 /// The hash of block `number` on `endpoint`'s branch.
@@ -4200,5 +4226,32 @@ mod tests {
         let refused =
             anyhow::Error::new(Reverted).context("the registry would not take the registration");
         assert!(!node_trouble(&refused));
+    }
+
+    #[test]
+    fn a_request_turned_away_is_told_from_one_never_answered() {
+        use alloy::transports::TransportErrorKind;
+        for status in [429, 500, 502, 503, 504] {
+            let error = TransportErrorKind::http_error(status, "try again later".into());
+            assert!(turned_away(&error), "{status}");
+            assert!(turned_away_text(&error.to_string()), "{status}");
+            let empty = TransportErrorKind::http_error(status, String::new());
+            assert!(turned_away_text(&empty.to_string()), "{status}");
+        }
+        for status in [400, 401, 403, 404] {
+            let error = TransportErrorKind::http_error(status, "no".into());
+            assert!(!turned_away(&error), "{status}");
+            assert!(!turned_away_text(&error.to_string()), "{status}");
+        }
+        assert!(turned_away(&TransportErrorKind::custom_str(RATE_LIMITED)));
+        assert!(turned_away_text(RATE_LIMITED));
+        assert!(turned_away_text(
+            "no answer: 25/second request limit reached"
+        ));
+        let unanswered =
+            TransportErrorKind::custom_str("error sending request: connection refused");
+        assert!(!turned_away(&unanswered));
+        assert!(!turned_away_text(&unanswered.to_string()));
+        assert!(!turned_away_text("operation timed out"));
     }
 }
