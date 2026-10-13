@@ -1,13 +1,13 @@
 //! The footer: the navy band at the end of every page, on both sites. Brand,
 //! three columns of links, then the legal and social row, then the risk line,
-//! always. Discord and X stay hidden until their addresses are known.
+//! always.
 
 use ui::icons::Icon;
 
 use crate::atoms::icon;
 use crate::atoms::logo::{Logo, image};
-use crate::route::{DOCS, GITHUB, PRIVACY, Route, SITE, TERMS};
-use crate::view::{El, View, el};
+use crate::route::{DOCS, PRIVACY, Route, SITE, TERMS};
+use crate::view::{El, View, el, svg};
 use crate::web::app_link;
 
 fn docs(path: &str, label: &'static str) -> El {
@@ -99,20 +99,7 @@ pub fn bottom() -> El {
                         .child(el("a").attr("href", TERMS).text("Terms of Use"))
                         .child(el("a").attr("href", PRIVACY).text("Privacy Policy")),
                 )
-                .child(
-                    el("ul")
-                        .class("sh-footer__social")
-                        .attr("aria-label", "Shonin elsewhere")
-                        .child(
-                            el("li").child(
-                                el("a")
-                                    .attr("href", GITHUB)
-                                    .attr("aria-label", "Shonin on GitHub")
-                                    .attr("data-logo", "github")
-                                    .text("GH"),
-                            ),
-                        ),
-                ),
+                .child(social_row()),
         )
         // The longer line names the build checklist, which has no public
         // page yet; until it does, every footer carries the phone's line.
@@ -121,4 +108,32 @@ pub fn bottom() -> El {
                 .class("sh-footer__risk")
                 .text("Agents can lose money. A review isn’t a prediction, and a track record isn’t a promise."),
         )
+}
+
+/// Where Shonin is elsewhere: X, Discord and GitHub, each with its own mark.
+fn social_row() -> El {
+    let mut row = el("ul")
+        .class("sh-footer__social")
+        .attr("aria-label", "Shonin elsewhere");
+    for social in ui::social::ALL {
+        let mark = svg("svg")
+            .attr("width", "20")
+            .attr("height", "20")
+            .attr("viewBox", "0 0 24 24")
+            .attr("fill", "currentColor")
+            .attr("aria-hidden", "true")
+            .attr("focusable", "false")
+            .child(svg("path").attr("d", social.path()));
+        row = row.child(
+            el("li").child(
+                el("a")
+                    .attr("href", social.href)
+                    .attr("aria-label", social.label())
+                    .attr("target", "_blank")
+                    .attr("rel", "noopener")
+                    .child(mark),
+            ),
+        );
+    }
+    row
 }
