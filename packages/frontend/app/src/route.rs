@@ -94,6 +94,8 @@ pub enum Route {
     Activate {
         slug: String,
     },
+    /// `/you`: the connected account's agents and publishing jobs.
+    You,
     /// `/you/agents/<slug>`: an agent's controls, for its Author.
     Manage {
         slug: String,
@@ -170,6 +172,7 @@ impl Route {
                 Some(slug) if is_slug(&slug) => Self::Activate { slug },
                 _ => Self::NotFound,
             },
+            ["you"] => Self::You,
             ["you", "agents", slug] => match decode(slug) {
                 Some(slug) if is_slug(&slug) => Self::Manage { slug },
                 _ => Self::NotFound,
@@ -218,6 +221,7 @@ impl Route {
             Self::Publish => "/publish".to_string(),
             Self::Job { id } => format!("/publish/jobs/{id}"),
             Self::Activate { slug } => format!("/publish/{slug}/activate"),
+            Self::You => "/you".to_string(),
             Self::Manage { slug } => format!("/you/agents/{slug}"),
             Self::Status => "/status".to_string(),
             Self::Atoms => "/_atoms".to_string(),
@@ -241,6 +245,7 @@ impl Route {
             | Self::Claim { .. }
             | Self::Job { .. }
             | Self::Activate { .. }
+            | Self::You
             | Self::Manage { .. } => {
                 return None;
             }
@@ -260,14 +265,16 @@ impl Route {
     }
 
     /// The shared page a route with an id no pre-render can list (a claim,
-    /// a publishing job, an activation, an Author's controls) is served
-    /// from: one file per kind, which `_redirects` serves with status 200 at
+    /// a publishing job, an activation, an Author's controls), or one that
+    /// is only ever someone's own (their agents and jobs), is served from:
+    /// one file per kind, which `_redirects` serves with status 200 at
     /// every such address. The app reads the address itself when it boots.
     pub fn shell_file(&self) -> Option<&'static str> {
         Some(match self {
             Self::Claim { .. } => "_shells/claim.html",
             Self::Job { .. } => "_shells/job.html",
             Self::Activate { .. } => "_shells/activate.html",
+            Self::You => "_shells/you.html",
             Self::Manage { .. } => "_shells/manage.html",
             _ => return None,
         })
@@ -275,7 +282,7 @@ impl Route {
 
     /// One route of each kind served from a shared page, as the pre-render
     /// writes it: no id, so its title names the kind.
-    pub fn shell_kinds() -> [Route; 4] {
+    pub fn shell_kinds() -> [Route; 5] {
         [
             Route::Claim {
                 slug: String::new(),
@@ -285,6 +292,7 @@ impl Route {
             Route::Activate {
                 slug: String::new(),
             },
+            Route::You,
             Route::Manage {
                 slug: String::new(),
             },
@@ -296,9 +304,11 @@ impl Route {
         match self {
             Self::Agents { .. } | Self::Agent { .. } => Some(Section::Agents),
             Self::Portfolio | Self::Claim { .. } => Some(Section::Portfolio),
-            Self::Publish | Self::Job { .. } | Self::Activate { .. } | Self::Manage { .. } => {
-                Some(Section::Publish)
-            }
+            Self::Publish
+            | Self::Job { .. }
+            | Self::Activate { .. }
+            | Self::You
+            | Self::Manage { .. } => Some(Section::Publish),
             _ => None,
         }
     }
@@ -324,6 +334,7 @@ impl Route {
             Self::Publish => Some("Publish".to_string()),
             Self::Job { .. } => Some("Publishing job".to_string()),
             Self::Activate { .. } => Some("Activate".to_string()),
+            Self::You => Some("Your agents".to_string()),
             Self::Manage { slug } => Some(
                 store::get()
                     .agent(slug)
@@ -413,6 +424,10 @@ impl Route {
             Self::Activate { .. } => page(
                 "Activate agent · Shonin".to_string(),
                 "Set an agent's limits, fill its tank and open its vault.",
+            ),
+            Self::You => page(
+                "Your agents · Shonin".to_string(),
+                "The agents you've published and your publishing jobs, for the wallet you publish with.",
             ),
             Self::Manage { slug } if slug.is_empty() => page(
                 "Manage an agent · Shonin".to_string(),
@@ -556,6 +571,7 @@ mod tests {
             Route::Activate {
                 slug: "base-7".to_string(),
             },
+            Route::You,
             Route::Manage {
                 slug: "base-7".to_string(),
             },
@@ -585,6 +601,19 @@ mod tests {
             Route::from_url("/publish/base-7/manage", ""),
             Route::NotFound
         );
+    }
+
+    #[test]
+    fn your_agents_page_is_never_indexed_and_has_only_its_shell() {
+        let route = Route::from_url("/you", "");
+        assert_eq!(route, Route::You);
+        assert!(!route.is_indexable());
+        assert_eq!(route.file(), None);
+        assert_eq!(route.shell_file(), Some("_shells/you.html"));
+        assert!(!Route::all_pages().contains(&Route::You));
+        assert_eq!(route.section(), Some(Section::Publish));
+        assert_eq!(Route::from_url("/you/", ""), Route::You);
+        assert_eq!(Route::from_url("/you/jobs", ""), Route::NotFound);
     }
 
     #[test]

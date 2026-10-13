@@ -295,7 +295,7 @@ fn account_button(
 
 /// The wallet sheet: each kind of wallet, its full address and Disconnect,
 /// or, for a kind that isn't connected, a button to connect one; then
-/// Portfolio. It follows the connections while open.
+/// Portfolio and Your agents. It follows the connections while open.
 fn wallet_sheet() {
     let session = crate::wallet::get();
     let solana = crate::wallet::solana::get();
@@ -320,10 +320,20 @@ fn wallet_sheet() {
             }),
         )
         .child(
-            crate::web::app_link("/portfolio")
-                .class("sh-link")
-                .text("View your portfolio")
-                .hook(|dom| dom.event(|_: dominator::events::Click| dialog::close())),
+            el("div")
+                .class("sh-walletsheet__links")
+                .child(
+                    crate::web::app_link("/portfolio")
+                        .class("sh-link")
+                        .text("View your portfolio")
+                        .hook(|dom| dom.event(|_: dominator::events::Click| dialog::close())),
+                )
+                .child(
+                    crate::web::app_link("/you")
+                        .class("sh-link")
+                        .text("Your agents")
+                        .hook(|dom| dom.event(|_: dominator::events::Click| dialog::close())),
+                ),
         );
     dialog::open(Dialog {
         title: "Your wallets".to_string(),

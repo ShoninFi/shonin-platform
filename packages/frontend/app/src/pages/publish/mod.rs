@@ -245,7 +245,7 @@ fn page_of(draft: &Rc<Draft>) -> Page {
                         )),
                 )
                 .child(
-                    el("div").class("sh-author__links").child(
+                    el("div").class("sh-author__links").child_signal(None, yours_link()).child(
                         Button::new(Kind::Quiet, "Publishing guide")
                             .size(Size::Small)
                             .icon_after(Icon::External)
@@ -274,6 +274,27 @@ fn page_of(draft: &Rc<Draft>) -> Page {
         top: None,
         body: body.into(),
     }
+}
+
+/// "Your agents and jobs", while a wallet is connected: where an Author
+/// gets back to a job and to the agents they published.
+fn yours_link() -> impl futures_signals::signal::Signal<Item = Option<View>> + 'static {
+    let session = crate::wallet::get();
+    let solana = crate::wallet::solana::get();
+    futures_signals::map_ref! {
+        let evm = session.connection.signal_cloned(),
+        let solana = solana.connection.signal_cloned() =>
+            evm.account().is_some() || solana.account().is_some()
+    }
+    .dedupe()
+    .map(|connected| {
+        connected.then(|| {
+            crate::web::app_link("/you")
+                .class("sh-btn sh-btn-secondary sh-btn-sm")
+                .text("Your agents and jobs")
+                .into()
+        })
+    })
 }
 
 // The stepper ------------------------------------------------------------------
@@ -1799,6 +1820,7 @@ mod browser {
             .map(|summary| summary.agents.len() > 1)
             .unwrap_or(false);
         let sealed = draft.source.get() == Source::Sealed;
+        let title = title_of(&agent);
         let package = if several { agent.package.clone() } else { None };
         let offered = format!(
             "{}|{sealed}|{package:?}",
@@ -1873,11 +1895,26 @@ mod browser {
                                 strategy_id: *strategy_id,
                             },
                         );
+                        crate::pages::you::list::remember(
+                            &job,
+                            &title,
+                            chain,
+                            &format!("{uploader:#x}"),
+                        );
                         go_to_job(&job);
                     }
                 },
             );
         });
+    }
+
+    /// The chosen agent's title, from its `shonin.toml`.
+    fn title_of(agent: &archive::Agent) -> String {
+        agent
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.description.title.clone())
+            .unwrap_or_default()
     }
 
     fn go_to_job(job: &str) {
@@ -1900,6 +1937,11 @@ mod browser {
         if on != chain {
             return;
         }
+        let title = draft
+            .picked
+            .get_cloned()
+            .and_then(|picked| super::chosen(&picked, draft.agent.get()).map(title_of))
+            .unwrap_or_default();
         let since = match draft
             .running
             .lock_ref()
@@ -1931,6 +1973,12 @@ mod browser {
                             uploader,
                             strategy_id,
                         },
+                    );
+                    crate::pages::you::list::remember(
+                        &job,
+                        &title,
+                        chain,
+                        &format!("{uploader:#x}"),
                     );
                     go_to_job(&job);
                 }

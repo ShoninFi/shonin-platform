@@ -277,7 +277,7 @@ pub fn status_words(job: &Job) -> (String, String) {
     }
 }
 
-fn chip(state: &JobState) -> El {
+pub(crate) fn chip(state: &JobState) -> El {
     match state {
         JobState::AwaitingPayment => badge(Tone::Neutral, Some(Icon::Clock), "Waiting for payment"),
         JobState::Queued { .. } => badge(Tone::Neutral, Some(Icon::Clock), "Queued"),
@@ -313,7 +313,7 @@ pub(crate) fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
             .child(
                 el("div")
                     .class("sh-job__titlerow")
-                    .child(el("h1").class("sh-author__title").text(title))
+                    .child(el("h1").class("sh-author__title").text(title.clone()))
                     .child(match job.strategy_id {
                         Some(id) => el("span")
                             .class("sh-mono sh-muted")
@@ -332,6 +332,7 @@ pub(crate) fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
     };
     el("div")
         .class("sh-job__body")
+        .child(crumb(&title))
         .child(head)
         .child(
             el("div")
@@ -345,6 +346,26 @@ pub(crate) fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
                 .child(facts(job)),
         )
         .into()
+}
+
+/// "Your agents / {job}": the way back to every job and agent of yours.
+fn crumb(title: &str) -> El {
+    el("nav")
+        .class("ag-crumb")
+        .attr("aria-label", "Breadcrumb")
+        .child(
+            el("ol")
+                .child(
+                    el("li")
+                        .child(app_link("/you").text("Your agents"))
+                        .child(el("span").attr("aria-hidden", "true").text("/")),
+                )
+                .child(
+                    el("li")
+                        .attr("aria-current", "page")
+                        .text(title.to_string()),
+                ),
+        )
 }
 
 fn status_card(job: &Job, paid: Option<PaymentRecord>) -> View {
@@ -696,6 +717,22 @@ mod tests {
         let html = outcome_card(&job(JobState::Refused)).html();
         assert!(!html.contains("/activate"));
         assert!(html.contains("This agent can never be activated."));
+    }
+
+    #[test]
+    fn a_jobs_breadcrumb_starts_at_your_agents() {
+        let html = job_view(&job(JobState::Reviewing), None).html();
+        let crumb = &html[html
+            .find("aria-label=\"Breadcrumb\"")
+            .expect("a breadcrumb")..];
+        assert!(
+            crumb.starts_with("aria-label=\"Breadcrumb\"><ol><li><a href=\"/you\">Your agents</a>"),
+            "{crumb}"
+        );
+        assert!(
+            crumb.contains("aria-current=\"page\">Funding basis</li>"),
+            "{crumb}"
+        );
     }
 
     #[test]

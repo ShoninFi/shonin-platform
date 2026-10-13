@@ -193,6 +193,29 @@
 .sh-manage__edit > .sh-field, .sh-manage__edit > .sh-activate__fields { width: 100%; }
 .sh-manage__pending { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-radius: var(--radius-m); background: var(--caution-soft); }
 
+/* /you (Your agents): the connected account's agents and publishing jobs,
+   each a row in one card: name and facts, the state chip, the money in the
+   vault (agents only) and the row's action. Phone: name and state on one
+   line, the figure and the action under them. */
+.sh-you__gate, .sh-you__empty { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
+.sh-you__section { display: flex; flex-direction: column; gap: var(--space-3); }
+.sh-you__sectionhead { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+.sh-you__h2 { font: var(--type-heading); letter-spacing: var(--track-heading); }
+.sh-you__list { margin: 0; padding: 0; list-style: none; }
+.sh-you__row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto 168px 112px; align-items: center; gap: var(--space-4);
+  padding: 14px var(--space-5); border-bottom: var(--border-hairline) solid var(--line);
+}
+.sh-you__row:last-child { border-bottom: 0; }
+.sh-you__row--job { grid-template-columns: minmax(0, 1fr) auto 112px; }
+.sh-you__main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sh-you__name { font: 600 16px/24px var(--font-sans); color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
+@media (hover: hover) { .sh-you__name:hover { text-decoration: underline; } }
+.sh-you__meta { font: var(--type-body-s); color: var(--ink-muted); overflow-wrap: anywhere; }
+.sh-you__fig { display: flex; flex-direction: column; align-items: flex-end; }
+.sh-you__fig .sh-fig { font: var(--type-figure); }
+.sh-you__actions { display: flex; justify-content: flex-end; }
+
 /* The retire dialog */
 .sh-retire { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-retire__table th[scope="row"] { font-weight: 600; }
@@ -225,6 +248,10 @@
   .sh-publish__barline { display: flex; }
   .sh-app:has(.sh-publish__bar) { padding-bottom: calc(64px + 140px + env(safe-area-inset-bottom)); }
   .sh-activate__fields, .sh-manage__split { grid-template-columns: minmax(0, 1fr); }
+  .sh-you__row, .sh-you__row--job { grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2) var(--space-3); padding: var(--space-4); }
+  .sh-you__fig { flex-direction: row; align-items: baseline; gap: var(--space-2); }
+  .sh-you__row--job .sh-you__actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .sh-you__row--job .sh-you__actions:empty { display: none; }
   .sh-retire__table thead { display: none; }
   .sh-retire__table, .sh-retire__table tbody, .sh-retire__table tr, .sh-retire__table th, .sh-retire__table td { display: block; }
   .sh-retire__table tr { padding: var(--space-3) 0; border-bottom: var(--border-hairline) solid var(--line); }

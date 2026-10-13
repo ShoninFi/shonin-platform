@@ -17,7 +17,7 @@ use std::rc::Rc;
 use futures_signals::signal::Mutable;
 use futures_signals::signal_map::MutableBTreeMap;
 use futures_signals::signal_vec::MutableVec;
-use shared::{Chain, Config, FeedEvent, FeedKind, Snapshot, Standing, Strategy, VaultState};
+use shared::{Chain, Config, FeedEvent, FeedKind, Job, Snapshot, Standing, Strategy, VaultState};
 use time::{Date, PrimitiveDateTime};
 
 use crate::model::{self, AuthorKey, Figures, Group, ReviewSummary, TankState};
@@ -188,6 +188,14 @@ pub struct Store {
     pub unread: Mutable<usize>,
     /// The public feed, newest first.
     pub feed: MutableVec<Rc<FeedItem>>,
+    /// Every paid publishing job, as the build service last listed it.
+    /// Replaced only when a job changed.
+    pub jobs: Mutable<Rc<Vec<Job>>>,
+    /// When the build service last listed its jobs, on the API's clock.
+    pub jobs_as_of: Mutable<Option<PrimitiveDateTime>>,
+    /// Whether the build service failed to answer the latest ask: the jobs
+    /// are then as it last listed them, as of `jobs_as_of`.
+    pub jobs_stale: Mutable<bool>,
     pub chains: Mutable<Vec<ChainRead>>,
     /// The chains' own clock: the latest of them. None before the first
     /// snapshot.
@@ -273,6 +281,15 @@ impl Store {
                 .lock_mut()
                 .replace_cloned(feed.into_iter().map(Rc::new).collect());
         }
+
+        // Jobs have no equality of their own: compared as the API wrote them.
+        let same_jobs = serde_json::to_string(&snapshot.jobs).ok()
+            == serde_json::to_string(&**self.jobs.lock_ref()).ok();
+        if !same_jobs {
+            self.jobs.set(Rc::new(snapshot.jobs.clone()));
+        }
+        self.jobs_as_of.set_neq(snapshot.jobs_as_of);
+        self.jobs_stale.set_neq(snapshot.jobs_stale);
         true
     }
 
