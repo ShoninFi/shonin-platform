@@ -28,13 +28,12 @@ use ui::icons::Icon;
 
 use crate::atoms::badge::{Tone, badge};
 use crate::atoms::button::{Button, Kind, on_click};
-use crate::atoms::notice::{NoticeTone, notice};
 use crate::components::wallet::open_connect;
 use crate::pages::Page;
 use crate::pages::agent::facts::{ChipTone, state_chip};
 use crate::pages::publish::parts::this_year;
 use crate::store::{Agent, Store};
-use crate::view::{View, el, text};
+use crate::view::{View, el};
 use crate::web::app_link;
 
 /// How many of the jobs this browser paid for it remembers.
@@ -186,9 +185,6 @@ pub struct Listing {
     pub both: bool,
     pub agents: Vec<Rc<Agent>>,
     pub jobs: Vec<JobRow>,
-    /// When the build service last listed its jobs, if its latest answer
-    /// failed.
-    pub stale: Option<Option<PrimitiveDateTime>>,
 }
 
 /// The agent a job published, by its slug: the one the queue gives, or
@@ -288,7 +284,6 @@ pub fn listing(accounts: &Accounts, store: &Store, remembered: &[Remembered]) ->
         both: accounts.evm.is_some() && accounts.solana.is_some(),
         agents,
         jobs,
-        stale: store.jobs_stale.get().then(|| store.jobs_as_of.get()),
     }
 }
 
@@ -310,7 +305,6 @@ pub fn page() -> Page {
         let loaded = store.loaded.signal(),
         let _members = store.membership.signal(),
         let _jobs = store.jobs.signal_cloned(),
-        let _stale = store.jobs_stale.signal(),
         let remembered = held.signal_cloned() => {
             let store = crate::store::get();
             if accounts.is_empty() {
@@ -533,27 +527,6 @@ fn agent_row(agent: &Rc<Agent>) -> View {
 }
 
 fn jobs_section(listing: &Listing, wallet: &str) -> View {
-    let stale: View = match listing.stale {
-        Some(at) => {
-            let when = at
-                .map(|at| {
-                    format!(
-                        ", as of {}",
-                        crate::format::day_time(at, this_year(at.year()))
-                    )
-                })
-                .unwrap_or_default();
-            notice(
-                NoticeTone::Caution,
-                text(format!(
-                    "The build service isn’t answering right now, so these are the jobs as it last listed them{when}."
-                )),
-            )
-            .attr("role", "status")
-            .into()
-        }
-        None => View::Empty,
-    };
     let body = if listing.jobs.is_empty() {
         empty(format!("No publishing jobs paid for from {wallet}."))
     } else {
@@ -569,7 +542,6 @@ fn jobs_section(listing: &Listing, wallet: &str) -> View {
         .child(el("p").class("sh-muted sh-author__small").text(
             "Newest first. A job is listed once its payment is seen; this browser also keeps the last few it paid for.",
         ))
-        .child(stale)
         .child(body)
         .into()
 }
