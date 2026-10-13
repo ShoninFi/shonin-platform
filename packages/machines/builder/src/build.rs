@@ -311,11 +311,94 @@ fn walk(directory: &Path, depth: usize) -> Vec<PathBuf> {
 /// Point the submission's SDK at the one this build service carries, whatever
 /// it asked for, and crates.io at the vendored copy of the reviewed crates.
 /// An author declares a version; the build service decides what that version
-/// is, and that every other crate is one the platform reviewed.
+/// is, and that every other crate is one the platform reviewed. A lock that
+/// names the SDK from crates.io is made to name the path package patched in,
+/// at the carried version, so the build is `--locked` to the lock as checked
+/// (see [`shared::dependencies::with_carried_sdk`]).
 fn pin(source: &Path, sdk: &Path, vendor: &Path) -> std::io::Result<()> {
+    for lock in walk(source, 32)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.lock"))
+    {
+        let text = std::fs::read_to_string(&lock)?;
+        let rewritten = shared::dependencies::with_carried_sdk(&text, strategy_sdk::VERSION)
+            .map_err(std::io::Error::other)?;
+        if let Some(rewritten) = rewritten {
+            std::fs::write(&lock, rewritten)?;
+        }
+    }
     let directory = source.join(".cargo");
     std::fs::create_dir_all(&directory)?;
     std::fs::write(directory.join("config.toml"), config(sdk, vendor))
+}
+
+/// The packages the SDK at `sdk` depends on, as its entry in a lock lists
+/// them, if `sdk` is a copy of the SDK this program is built with, at its
+/// version ([`strategy_sdk::VERSION`]): the version a lock must name the SDK
+/// at, and the copy patched in for the build to be `--locked` to it. Only the
+/// name and version are checked here; what the copy holds is pinned by the
+/// image that carries it.
+///
+/// A dependency is named as its table names the package (`package = ...`,
+/// or its key). An optional dependency, which a lock lists only as features
+/// turn it on, makes the entry a lock must hold depend on features, so a
+/// copy with one is refused rather than checked loosely.
+pub fn carries(sdk: &Path) -> Result<Vec<String>, String> {
+    let manifest = sdk.join("Cargo.toml");
+    let cargo = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+    let field = |key: &str| {
+        cargo
+            .get("package")
+            .and_then(|package| package.get(key))
+            .and_then(toml::Value::as_str)
+    };
+    if field("name") != Some(shared::dependencies::SDK)
+        || field("version") != Some(strategy_sdk::VERSION)
+    {
+        return Err(format!(
+            "{} is not {} {}, the SDK this build service is built with: give --sdk a copy of \
+             it",
+            manifest.display(),
+            shared::dependencies::SDK,
+            strategy_sdk::VERSION,
+        ));
+    }
+    // A lock lists a package's dependencies and build dependencies, on
+    // every target; a dependency's own dev-dependencies never.
+    let mut tables: Vec<&toml::Value> = ["dependencies", "build-dependencies"]
+        .iter()
+        .filter_map(|kind| cargo.get(*kind))
+        .collect();
+    if let Some(targets) = cargo.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for kind in ["dependencies", "build-dependencies"] {
+                tables.extend(target.get(kind));
+            }
+        }
+    }
+    let mut named = Vec::new();
+    for (key, dependency) in tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flatten()
+    {
+        if dependency.get("optional").and_then(toml::Value::as_bool) == Some(true) {
+            return Err(format!(
+                "{} has an optional dependency, {key}: a lock lists it only as features turn \
+                 it on, so the SDK's entry in a lock can't be checked exactly",
+                manifest.display()
+            ));
+        }
+        let package = dependency
+            .get("package")
+            .and_then(toml::Value::as_str)
+            .unwrap_or(key);
+        named.push(package.to_string());
+    }
+    Ok(named)
 }
 
 /// The Cargo config every build is made with.

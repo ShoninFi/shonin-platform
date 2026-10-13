@@ -19,6 +19,9 @@ devnet = ["chain/devnet"]
 
 [dependencies]
 shared.workspace = true
+# For its version only: the SDK the build service carries, which a lock may
+# name from crates.io.
+strategy-sdk.workspace = true
 chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true

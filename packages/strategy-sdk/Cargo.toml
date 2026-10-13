@@ -1,7 +1,10 @@
 [package]
 name = "shonin-strategy-sdk"
 description = "Rust SDK for writing Shonin strategies as WASM components"
-version.workspace = true
+# Its own version, not the workspace's: crates.io holds exactly the SDK the
+# build service carries, and the build service accepts a lock naming this
+# version or an earlier one compatible with it.
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
