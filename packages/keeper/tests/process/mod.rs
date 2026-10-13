@@ -273,7 +273,7 @@ fn answer(node: &Shared, asked: &Value) -> Value {
 /// Whether a call is the keeper's check that the node simulates: its probe,
 /// as creation code or as an overridden contract's code, names
 /// [`NOTHING_AT`].
-fn simulation_check(params: &Value) -> bool {
+pub fn simulation_check(params: &Value) -> bool {
     let names = |code: &[u8]| code.windows(20).any(|at| at == NOTHING_AT.as_slice());
     let created = params[0].get("to").is_none_or(Value::is_null) && names(&tx_fields(&params[0]).1);
     let overridden = params
@@ -357,6 +357,22 @@ impl Keeper {
 
     /// Ask its health until `wanted` holds of the status, for at most
     /// `limit`; the last answer.
+    /// Ask its health until its answer says `text`, for at most `limit`;
+    /// the last answer. A keeper just started answers 503 while its chains
+    /// connect, which says nothing of the trouble a test waits for.
+    pub async fn health_saying(&self, limit: Duration, text: &str) -> Option<(u16, String)> {
+        let started = Instant::now();
+        loop {
+            let health = self.health().await;
+            if health.as_ref().is_some_and(|(_, said)| said.contains(text))
+                || started.elapsed() >= limit
+            {
+                return health;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     pub async fn health_until(
         &self,
         limit: Duration,
@@ -465,7 +481,40 @@ pub fn start_keeper_on(test: &str, chains: &[(&str, u64, &str)], executor: &str)
     start(test, chains, executor, &[])
 }
 
+/// Start one chain with `settings` overriding its RPC settings in the file
+/// the process loads.
+pub fn start_keeper_with_rpc_policy(
+    test: &str,
+    rpc: &str,
+    executor: &str,
+    settings: &[(&str, u64)],
+) -> Keeper {
+    start_configured(test, &[("base", 31337, rpc)], executor, &[], settings)
+}
+
+/// Start each of `chains` with `args` on the command line and `settings`
+/// overriding every chain's RPC settings in the file the process loads.
+pub fn start_keeper_configured(
+    test: &str,
+    chains: &[(&str, u64, &str)],
+    executor: &str,
+    args: &[&str],
+    settings: &[(&str, u64)],
+) -> Keeper {
+    start_configured(test, chains, executor, args, settings)
+}
+
 fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[&str]) -> Keeper {
+    start_configured(test, chains, executor, shortened, &[])
+}
+
+fn start_configured(
+    test: &str,
+    chains: &[(&str, u64, &str)],
+    executor: &str,
+    shortened: &[&str],
+    settings: &[(&str, u64)],
+) -> Keeper {
     let dir = std::env::temp_dir().join(format!("keeper-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut network = Vec::new();
@@ -499,6 +548,14 @@ fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[
     for (vault_chain, key, _) in &network {
         toml.push_str(&format!("{vault_chain} = \"{key}\"\n"));
     }
+    if !settings.is_empty() {
+        for (_, key, _) in &network {
+            toml.push_str(&format!("\n[rpc.chains.\"{key}\"]\n"));
+            for (name, value) in settings {
+                toml.push_str(&format!("{name} = {value}\n"));
+            }
+        }
+    }
     let config = dir.join("chains.toml");
     std::fs::write(&config, toml).unwrap();
     let all: Vec<Deployments> = chains
@@ -511,6 +568,7 @@ fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[
     command
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_default())
         .env(
             "SHONIN_DEPLOYMENTS_JSON",
             serde_json::to_string(&all).unwrap(),
