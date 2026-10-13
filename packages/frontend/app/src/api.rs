@@ -78,8 +78,13 @@ mod browser {
                         store.sync.last_ok.set(Some(js_sys::Date::now()));
                         store.sync.failing.set_neq(false);
                         store.sync.error.set_neq(None);
+                        // The terms are the same on every chain: read from
+                        // the EVM chains' configs, which answer quickly, and
+                        // never a second ask for the Solana cluster's,
+                        // which the wallet session already makes.
                         for info in &snapshot.chains {
-                            if configured.insert(info.chain) {
+                            if info.chain != shared::Chain::Solana && configured.insert(info.chain)
+                            {
                                 let store = store.clone();
                                 let chain = info.chain;
                                 wasm_bindgen_futures::spawn_local(async move {

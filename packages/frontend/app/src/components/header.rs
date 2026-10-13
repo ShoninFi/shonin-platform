@@ -53,7 +53,7 @@ pub fn header(route: &Route) -> View {
             inner.child(nav).child(
                 el("div")
                     .class("sh-appheader__tools")
-                    .child(super::wallet::header_control()),
+                    .child(super::wallet::header_control(route)),
             ),
         )
         .into()

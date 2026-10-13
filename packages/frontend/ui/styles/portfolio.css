@@ -17,6 +17,23 @@
 .sh-portfolio__empty, .sh-portfolio__loading { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
 .sh-portfolio__emptytitle { font: var(--type-heading); }
 .sh-portfolio__risk { font: var(--type-body-s); }
+/* One section per connected wallet, headed by its chain family, its app
+   and its short address; its dollars on each chain; what this browser
+   sent from it. */
+.sh-portfolio__wallet { gap: var(--space-5); padding-top: var(--space-5); border-top: var(--border-hairline) solid var(--line); }
+.sh-portfolio__wallet .sh-portfolio__body { gap: var(--space-5); }
+.sh-portfolio__wallethead .sh-mono { font-family: var(--font-mono); font-size: 0.85em; font-weight: 500; }
+.sh-portfolio__h3 { font: 600 16px/24px var(--font-sans); }
+.sh-portfolio__balances { display: flex; flex-direction: column; gap: var(--space-1); }
+.sh-portfolio__balances dl { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-5); margin: 0; }
+.sh-portfolio__balances dl > div { display: flex; gap: var(--space-2); align-items: baseline; }
+.sh-portfolio__balances dt { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-portfolio__balances dd { margin: 0; font-weight: 600; }
+.sh-portfolio__recent { display: flex; flex-direction: column; gap: var(--space-2); }
+.sh-portfolio__recent ul { display: flex; flex-direction: column; gap: var(--space-3); margin: var(--space-2) 0 0; padding: 0; list-style: none; }
+.sh-portfolio__recent li { display: flex; flex-direction: column; gap: 2px; }
+.sh-portfolio__recent li p { overflow-wrap: anywhere; }
+.sh-portfolio__recentwhat { font-weight: 600; }
 .sh-act { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); }
 .sh-act__status { font: var(--type-body-s); }
 .sh-act__error { font-weight: 650; color: var(--loss); }
@@ -40,7 +57,7 @@
    Deposit and Withdraw. The table is for wider screens only. */
 .sh-poscards { display: none; }
 @media (max-width: 599px) {
-  .sh-portfolio .sh-table-wrap { display: none; }
+  .sh-portfolio .sh-table-wrap:not(.sh-table-wrap--always) { display: none; }
   .sh-poscards { display: flex; flex-direction: column; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
   .sh-poscard { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4); }
   .sh-poscard__head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-3); }

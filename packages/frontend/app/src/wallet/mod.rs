@@ -8,6 +8,7 @@
 //! [`machine::WalletId`]s and their own signer; nothing here assumes every
 //! wallet is an EVM one beyond the EVM adapters themselves.
 
+pub mod config_cache;
 pub mod dev;
 #[cfg(target_arch = "wasm32")]
 pub mod eip1193;
@@ -15,6 +16,7 @@ pub mod machine;
 pub mod network;
 pub mod networks;
 pub mod phrase;
+pub mod recent;
 pub mod rpc;
 pub mod run;
 pub mod session;

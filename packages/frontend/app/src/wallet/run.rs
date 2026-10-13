@@ -134,6 +134,75 @@ impl Clock for Timer {
     }
 }
 
+/// What this browser keeps of a send, from the step that sent it: only a
+/// deposit, a withdrawal or a claim's own transaction (never an approval,
+/// or the optional second step).
+pub fn recent_of(
+    prompt: &crate::tx::flow::Prompt,
+    vault: &VaultRef,
+    account: Address,
+    chain_id: u64,
+    decimals: u8,
+    hash: alloy_primitives::B256,
+    at_ms: f64,
+) -> Option<super::recent::Entry> {
+    use super::recent::{Entry, Family, Kind};
+    use crate::money::{Rounding, format as money};
+    use crate::tx::flow::Prompt;
+    let (kind, amount) = match prompt {
+        Prompt::Deposit { amount } => (
+            Kind::Deposit,
+            money::dollars(*amount, decimals, Rounding::Down),
+        ),
+        Prompt::Withdraw { shares } => (
+            Kind::Withdrawal,
+            format!("{} shares", money::shares(*shares, Rounding::Down)),
+        ),
+        Prompt::SettleClaim { claim } => (Kind::Claim, format!("Settling claim {claim}")),
+        Prompt::TakeCash => (Kind::Claim, "Taking the cash share".to_string()),
+        Prompt::ClaimInstead => (Kind::Claim, "Making a claim instead".to_string()),
+        _ => return None,
+    };
+    Some(Entry {
+        tx: format!("{hash:?}"),
+        tx_url: super::networks::tx_url(chain_id, hash),
+        family: Family::Evm,
+        account: format!("{account:?}"),
+        slug: vault.slug.clone(),
+        title: vault.title.clone(),
+        kind,
+        amount,
+        at_ms,
+        outcome: None,
+    })
+}
+
+/// How a flow ended, in a few words for this browser's record.
+pub fn outcome_words(outcome: &crate::tx::flow::Outcome, decimals: u8) -> String {
+    use crate::money::{Rounding, format as money};
+    use crate::tx::flow::Outcome;
+    use crate::tx::read::ClaimState;
+    let dollars = |value: &U256| money::dollars(*value, decimals, Rounding::Down);
+    match outcome {
+        Outcome::Deposited { shares, .. } => {
+            format!("Bought {} shares", money::shares(*shares, Rounding::Down))
+        }
+        Outcome::Refunded { assets, .. } => format!("Sent back: {}", dollars(assets)),
+        Outcome::Paid { assets, .. } => format!("Paid {}", dollars(assets)),
+        Outcome::Booked { claim, .. } => format!("Booked as claim {claim}"),
+        Outcome::SettledBefore(how) => outcome_words(how, decimals),
+        Outcome::Claim {
+            state: ClaimState::Paid,
+            paid,
+            ..
+        } => format!("Paid {}", dollars(paid)),
+        Outcome::Claim { .. } => "Still booked".to_string(),
+        Outcome::TookCash { assets, .. } => format!("Paid {} in cash", dollars(assets)),
+        Outcome::ClaimMade { claim, .. } => format!("Made claim {claim}"),
+        Outcome::Collected { assets, .. } => format!("Collected {}", dollars(assets)),
+    }
+}
+
 /// Start `action` on `vault`, reporting into `running`.
 #[cfg(target_arch = "wasm32")]
 pub fn start(vault: &VaultRef, action: Action, running: &Running) {
@@ -147,17 +216,63 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
     session.track(running.cancel.clone());
     wasm_bindgen_futures::spawn_local(async move {
         let step = running.step.clone();
-        let on_step = move |next: Step| step.set(Some(next));
         let Some(account) = session.account() else {
-            on_step(Step::Failed(crate::tx::TxError::NotConnected));
+            step.set(Some(Step::Failed(crate::tx::TxError::NotConnected)));
             return;
         };
-        let Some(network) = session.network(vault.chain).await else {
-            on_step(Step::Failed(crate::tx::TxError::Network(
-                "this vault's chain isn't reachable from this app".to_string(),
-            )));
-            return;
+        // This browser keeps the send once it is on its way, and how it
+        // ended once the flow says.
+        let kept: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        let decimals = Rc::new(std::cell::Cell::new(6u8));
+        let on_step = {
+            let vault = vault.clone();
+            let decimals = decimals.clone();
+            move |next: Step| {
+                match &next {
+                    Step::Sent { prompt, hash, .. } if kept.borrow().is_none() => {
+                        let chain_id = crate::wallet::get()
+                            .networks
+                            .lock_ref()
+                            .get(&vault.chain)
+                            .map_or(0, |network| network.chain_id);
+                        if let Some(entry) = recent_of(
+                            prompt,
+                            &vault,
+                            account,
+                            chain_id,
+                            decimals.get(),
+                            *hash,
+                            js_sys::Date::now(),
+                        ) {
+                            *kept.borrow_mut() = Some(entry.tx.clone());
+                            super::recent::record(entry);
+                        }
+                    }
+                    Step::Done(outcome) => {
+                        if let Some(tx) = kept.borrow().as_deref() {
+                            super::recent::settle(tx, &outcome_words(outcome, decimals.get()));
+                        }
+                    }
+                    Step::Failed(error) if !error.may_have_moved() => {
+                        if let Some(tx) = kept.borrow().as_deref() {
+                            super::recent::settle(tx, "Didn’t go through");
+                        }
+                    }
+                    _ => {}
+                }
+                step.set(Some(next));
+            }
         };
+        // Never a config remembered from an earlier visit alone: one the
+        // API answered in this page's life.
+        let network = match session.network_to_sign(vault.chain).await {
+            Ok(network) => network,
+            Err(error) => {
+                on_step(Step::Failed(error));
+                return;
+            }
+        };
+        decimals.set(network.asset_decimals);
         let reader = Session::reader(&network);
         let signer = session.signer(network.clone());
         let ctx = Ctx {
@@ -227,4 +342,96 @@ pub fn directory(snapshot: &shared::Snapshot) -> BTreeMap<String, Rc<VaultRef>> 
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx::flow::{Outcome, Prompt};
+    use alloy_primitives::B256;
+
+    fn vault() -> VaultRef {
+        VaultRef {
+            slug: "base-2".to_string(),
+            title: "Funding basis".to_string(),
+            chain: Chain::Base,
+            address: Address::repeat_byte(0x5f),
+            served: false,
+            state: VaultState::Open,
+            requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn this_browser_keeps_a_deposit_withdrawal_or_claim_never_an_approval_or_the_second_step() {
+        let keep = |prompt: Prompt| {
+            recent_of(
+                &prompt,
+                &vault(),
+                Address::repeat_byte(0x7e),
+                84532,
+                6,
+                B256::repeat_byte(0xab),
+                1.0,
+            )
+        };
+        assert!(
+            keep(Prompt::Approve {
+                amount: U256::from(1u8)
+            })
+            .is_none()
+        );
+        assert!(keep(Prompt::Finish).is_none());
+        assert!(keep(Prompt::Statement).is_none());
+        let deposit = keep(Prompt::Deposit {
+            amount: U256::from(250_000_000u64),
+        })
+        .unwrap();
+        assert_eq!(deposit.kind, super::super::recent::Kind::Deposit);
+        assert_eq!(deposit.amount, "$250.00");
+        assert_eq!(
+            deposit.tx_url.as_deref(),
+            Some(format!("https://sepolia.basescan.org/tx/0x{}", "ab".repeat(32)).as_str())
+        );
+        let withdrawal = keep(Prompt::Withdraw {
+            shares: U256::from(12_500_000_000_000_000_000u128),
+        })
+        .unwrap();
+        assert_eq!(
+            withdrawal.what(),
+            "Withdrawal of 12.5 shares from Funding basis"
+        );
+        assert_eq!(withdrawal.status(), "Pending, priced at the next valuation");
+        let claim = keep(Prompt::SettleClaim {
+            claim: U256::from(3u8),
+        })
+        .unwrap();
+        assert_eq!(claim.kind, super::super::recent::Kind::Claim);
+    }
+
+    #[test]
+    fn a_withdrawal_paid_from_cash_is_recorded_as_paid_with_its_dollars() {
+        let paid = Outcome::Paid {
+            shares: U256::from(1u8),
+            assets: U256::from(251_200_000u64),
+            at: None,
+            hash: B256::ZERO,
+        };
+        assert_eq!(outcome_words(&paid, 6), "Paid $251.20");
+        assert_eq!(
+            outcome_words(&Outcome::SettledBefore(Box::new(paid)), 6),
+            "Paid $251.20"
+        );
+        assert_eq!(
+            outcome_words(
+                &Outcome::Booked {
+                    claim: U256::from(4u8),
+                    shares: U256::from(1u8),
+                    hash: B256::ZERO
+                },
+                6
+            ),
+            "Booked as claim 4"
+        );
+    }
 }

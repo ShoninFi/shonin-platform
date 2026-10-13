@@ -22,9 +22,11 @@ use crate::components::wallet::open_connect;
 use crate::money::format as money;
 use crate::money::{Rounding, units::pow10};
 use crate::pages::Page;
+use crate::pages::portfolio::{Balance, Summary, balances_view, section_loading, wallet_section};
 use crate::tx::solana::flow::{Fallback, HeldAt, Outcome, Step};
 use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
 use crate::view::{El, View, el, text};
+use crate::wallet::recent::Family;
 use crate::wallet::solana::SolNetwork;
 use crate::web::app_link;
 
@@ -57,6 +59,8 @@ struct Loaded {
     rows: Vec<Row>,
     claims: Vec<ClaimRow>,
     network: Option<Rc<SolNetwork>>,
+    /// The dollars in this wallet's own token account on the cluster.
+    balance: Option<Balance>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -74,59 +78,145 @@ fn dollars_from_cents(cents: u128) -> String {
 }
 
 /// The portfolio's Solana section: nothing while no Solana wallet is
-/// connected.
-pub fn section() -> View {
+/// connected. It reads on its own, so the EVM wallet's section never waits
+/// for it, and tells the page's totals what it holds through `summary`.
+pub fn section(summary: Mutable<Option<Summary>>) -> View {
     let session = crate::wallet::solana::get();
     let loaded: Mutable<Option<Loaded>> = Mutable::new(None);
-    el("section")
-        .class("sh-portfolio__section sh-portfolio__solana")
-        .attr("aria-label", "On Solana")
+    let failing = Mutable::new(false);
+    el("div")
+        .class("sh-contents")
         .child_signal(
             None,
             futures_signals::map_ref! {
                 let account = session.connection.signal_ref(|c| c.account()),
-                let loaded = loaded.signal_cloned() => (*account, loaded.clone())
+                let _name = session.wallet_name.signal_cloned(),
+                let failing = failing.signal(),
+                let loaded = loaded.signal_cloned() => (*account, *failing, loaded.clone())
             }
-            .map(|(account, loaded)| {
+            .map(|(account, failing, loaded)| {
                 let account = account?;
-                Some(match loaded {
-                    None => el("p")
-                        .class("sh-muted")
-                        .text("Reading your Solana wallet…")
-                        .into(),
-                    Some(loaded) => holdings_view(&account, &loaded),
-                })
+                let address = account.to_string();
+                let app = crate::wallet::solana::get().app_name();
+                Some(wallet_section(
+                    Family::Solana,
+                    &app,
+                    &address,
+                    short(&address),
+                    match loaded {
+                        Some(loaded) => holdings_view(&loaded),
+                        None if failing => el("p")
+                            .class("sh-muted")
+                            .attr("role", "status")
+                            .text("Solana isn’t answering just now. This page keeps trying.")
+                            .into(),
+                        None => section_loading(),
+                    },
+                ))
             }),
         )
-        .hook(move |dom| dom.future(follow(loaded)))
+        .hook(move |dom| dom.future(follow(loaded, failing, summary)))
         .into()
 }
 
-async fn follow(loaded: Mutable<Option<Loaded>>) {
+async fn follow(
+    loaded: Mutable<Option<Loaded>>,
+    failing: Mutable<bool>,
+    summary: Mutable<Option<Summary>>,
+) {
     #[cfg(target_arch = "wasm32")]
     {
         let session = crate::wallet::solana::get();
+        // Reads that failed in a row: one is retried quietly; only a cluster
+        // that keeps not answering is said to.
+        let mut failures = 0u32;
         loop {
             let account = session.account();
             match account {
-                Some(account) => {
-                    if let Some(read) = read(account).await {
+                Some(account) => match read(account).await {
+                    Some(read) if session.account() == Some(account) => {
+                        failures = 0;
+                        summary.set(Some(summary_of(&read)));
                         loaded.set(Some(read));
+                        failing.set_neq(false);
                     }
+                    Some(_) => {}
+                    None => {
+                        failures = failures.saturating_add(1);
+                        failing.set_neq(failures >= 3);
+                    }
+                },
+                None => {
+                    failures = 0;
+                    loaded.set(None);
+                    summary.set(None);
+                    failing.set_neq(false);
                 }
-                None => loaded.set(None),
             }
             let seen = (session.changed.get(), session.account());
-            for _ in 0..15 {
+            let wait = if failures > 0 { 5 } else { 15 };
+            for _ in 0..wait {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
                 if (session.changed.get(), session.account()) != seen {
+                    if session.account() != seen.1 {
+                        loaded.set(None);
+                        summary.set(None);
+                        failing.set_neq(false);
+                    }
                     break;
                 }
             }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = loaded;
+    let _ = (loaded, failing, summary);
+}
+
+/// A reading's positions, booked withdrawals not yet paid, payouts held on
+/// claims, and waiting requests, units or held payouts.
+fn parts(loaded: &Loaded) -> (Vec<&Row>, Vec<&ClaimRow>, Vec<&ClaimRow>, Vec<&Row>) {
+    let positions: Vec<&Row> = loaded
+        .rows
+        .iter()
+        .filter(|row| row.holder.as_ref().is_some_and(|h| h.shares > 0))
+        .collect();
+    let open_claims: Vec<&ClaimRow> = loaded
+        .claims
+        .iter()
+        .filter(|row| !matches!(row.claim.state, ClaimState::Paid | ClaimState::Fallback))
+        .collect();
+    let held_claims: Vec<&ClaimRow> = loaded
+        .claims
+        .iter()
+        .filter(|row| row.claim.held > 0)
+        .collect();
+    let extras: Vec<&Row> = loaded
+        .rows
+        .iter()
+        .filter(|row| {
+            !row.waiting.is_empty()
+                || !row.held.is_empty()
+                || row.holder.as_ref().is_some_and(|h| h.units > 0)
+        })
+        .collect();
+    (positions, open_claims, held_claims, extras)
+}
+
+/// What the Solana wallet's reading adds to the page's totals. What was
+/// paid in isn't read on Solana, so the totals leave it out.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn summary_of(loaded: &Loaded) -> Summary {
+    let (positions, open_claims, held_claims, extras) = parts(loaded);
+    Summary {
+        value_cents: positions.iter().map(|row| row.value_cents).sum(),
+        positions: positions.len(),
+        booked: open_claims.len(),
+        paid_cents: None,
+        holds: !positions.is_empty()
+            || !open_claims.is_empty()
+            || !held_claims.is_empty()
+            || !extras.is_empty(),
+    }
 }
 
 /// Every Solana vault the store knows.
@@ -158,7 +248,15 @@ async fn read(owner: Pubkey) -> Option<Loaded> {
         keys.push(vault.address);
         keys.push(address::holder(&vault.address, &owner));
     }
+    // And the wallet's own dollar account, last.
+    keys.push(address::dollars(&owner, &network.mint));
     let accounts = reader.accounts(&keys).await.ok()?;
+    let dollars = accounts
+        .last()
+        .cloned()
+        .flatten()
+        .and_then(|account| accounts::token_amount(&account.data))
+        .unwrap_or(0);
     let now = reader.chain_time().await.ok()?;
     // This wallet's requests, and payouts held for it, across vaults.
     let mine = reader
@@ -190,6 +288,10 @@ async fn read(owner: Pubkey) -> Option<Loaded> {
         .ok()?;
     let mut loaded = Loaded {
         network: Some(network.clone()),
+        balance: Some(Balance {
+            chain: network.label.clone(),
+            dollars: money::dollars(U256::from(dollars), network.asset_decimals, Rounding::Down),
+        }),
         ..Loaded::default()
     };
     for (i, vault) in vaults.iter().enumerate() {
@@ -297,127 +399,80 @@ fn claim_badge(state: ClaimState) -> El {
     }
 }
 
-fn holdings_view(account: &Pubkey, loaded: &Loaded) -> View {
+fn holdings_view(loaded: &Loaded) -> View {
     let decimals = loaded.network.as_ref().map_or(6, |n| n.asset_decimals);
-    let positions: Vec<&Row> = loaded
-        .rows
-        .iter()
-        .filter(|row| row.holder.as_ref().is_some_and(|h| h.shares > 0))
-        .collect();
-    let open_claims: Vec<&ClaimRow> = loaded
-        .claims
-        .iter()
-        .filter(|row| !matches!(row.claim.state, ClaimState::Paid | ClaimState::Fallback))
-        .collect();
-    let held_claims: Vec<&ClaimRow> = loaded
-        .claims
-        .iter()
-        .filter(|row| row.claim.held > 0)
-        .collect();
-    let extras: Vec<&Row> = loaded
-        .rows
-        .iter()
-        .filter(|row| {
-            !row.waiting.is_empty()
-                || !row.held.is_empty()
-                || row.holder.as_ref().is_some_and(|h| h.units > 0)
-        })
-        .collect();
-    let head = el("div")
-        .class("sh-portfolio__head")
-        .child(el("h2").class("sh-portfolio__h2").text("On Solana"))
-        .child(el("p").class("sh-muted").text(format!(
-            "Wallet {} · figures read from each vault’s account",
-            short(&account.to_string())
-        )));
+    let (positions, open_claims, held_claims, extras) = parts(loaded);
+    let balances: Vec<Balance> = loaded.balance.clone().into_iter().collect();
+    let mut body = el("div")
+        .class("sh-portfolio__body")
+        .child(balances_view(&balances));
     if positions.is_empty() && open_claims.is_empty() && extras.is_empty() && held_claims.is_empty()
     {
-        return el("div")
-            .child(head)
+        return body
             .child(
-                el("div")
-                    .class("sh-portfolio__empty")
-                    .child(el("p").text("You haven’t deposited from this Solana wallet yet."))
-                    .child(
-                        app_link("/agents")
-                            .class("sh-btn sh-btn-primary")
-                            .text("Browse agents"),
-                    ),
+                el("p")
+                    .class("sh-muted")
+                    .text("Nothing in agents from this wallet."),
             )
             .into();
     }
     let total: u128 = positions.iter().map(|row| row.value_cents).sum();
-    let mut body = el("div").class("sh-portfolio__body").child(head).child(
-        el("div").class("sh-portfolio__tiles").child(
-            el("div")
-                .class("sh-stat sh-stat--tile")
-                .child(el("p").class("sh-label").text("Total value on Solana"))
-                .child(
-                    el("p")
-                        .class("sh-stat__value sh-num")
-                        .text(dollars_from_cents(total)),
-                )
-                .child(el("p").class("sh-stat__period").text(format!(
-                    "{} {}, at today’s share prices",
-                    positions.len(),
-                    if positions.len() == 1 {
-                        "agent"
-                    } else {
-                        "agents"
-                    }
-                ))),
-        ),
-    );
     if !positions.is_empty() {
         body = body.child(
-            el("div").class("sh-table-wrap").child(
-                el("table")
-                    .class("sh-table")
-                    .child(
-                        el("caption")
-                            .class("sh-vh")
-                            .text("Your positions on Solana"),
-                    )
-                    .child(
-                        el("thead").child(
+            el("div")
+                .class("sh-table-wrap sh-table-wrap--always")
+                .child(
+                    el("table")
+                        .class("sh-table")
+                        .child(
+                            el("caption")
+                                .class("sh-vh")
+                                .text("Your positions on Solana"),
+                        )
+                        .child(
+                            el("thead").child(
+                                el("tr")
+                                    .child(el("th").attr("scope", "col").text("Agent"))
+                                    .child(
+                                        el("th").attr("scope", "col").class("sh-r").text("Shares"),
+                                    )
+                                    .child(
+                                        el("th").attr("scope", "col").class("sh-r").text("Value"),
+                                    ),
+                            ),
+                        )
+                        .child(el("tbody").children(positions.iter().map(|row| {
                             el("tr")
-                                .child(el("th").attr("scope", "col").text("Agent"))
-                                .child(el("th").attr("scope", "col").class("sh-r").text("Shares"))
-                                .child(el("th").attr("scope", "col").class("sh-r").text("Value")),
-                        ),
-                    )
-                    .child(el("tbody").children(positions.iter().map(|row| {
-                        el("tr")
-                            .class("sh-row")
-                            .child(
-                                el("th").attr("scope", "row").child(
-                                    app_link(format!("/agents/{}", row.vault.slug))
-                                        .text(row.vault.title.clone()),
-                                ),
-                            )
-                            .child(el("td").class("sh-r sh-fig").text(money::shares(
-                                U256::from(row.holder.as_ref().map_or(0, |h| h.shares)),
-                                Rounding::Down,
-                            )))
-                            .child(
-                                el("td")
-                                    .class("sh-r sh-fig")
-                                    .text(dollars_from_cents(row.value_cents)),
-                            )
-                    })))
-                    .child(
-                        el("tfoot").child(
-                            el("tr")
-                                .child(el("th").attr("scope", "row").text("Total"))
-                                .child(el("td"))
+                                .class("sh-row")
+                                .child(
+                                    el("th").attr("scope", "row").child(
+                                        app_link(format!("/agents/{}", row.vault.slug))
+                                            .text(row.vault.title.clone()),
+                                    ),
+                                )
+                                .child(el("td").class("sh-r sh-fig").text(money::shares(
+                                    U256::from(row.holder.as_ref().map_or(0, |h| h.shares)),
+                                    Rounding::Down,
+                                )))
                                 .child(
                                     el("td")
                                         .class("sh-r sh-fig")
-                                        .text(dollars_from_cents(total)),
-                                ),
+                                        .text(dollars_from_cents(row.value_cents)),
+                                )
+                        })))
+                        .child(
+                            el("tfoot").child(
+                                el("tr")
+                                    .child(el("th").attr("scope", "row").text("Total"))
+                                    .child(el("td"))
+                                    .child(
+                                        el("td")
+                                            .class("sh-r sh-fig")
+                                            .text(dollars_from_cents(total)),
+                                    ),
+                            ),
                         ),
-                    ),
-            ),
+                ),
         );
     }
     if !open_claims.is_empty() {

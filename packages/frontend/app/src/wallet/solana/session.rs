@@ -63,8 +63,12 @@ pub struct SolSession {
     pub wallets: Mutable<Vec<SolWalletOption>>,
     /// "Phantom", "your recovery phrase wallet".
     pub wallet_name: Mutable<String>,
-    /// The Solana cluster, once its config is read.
+    /// The Solana cluster, as the page reads it: from a copy remembered
+    /// from an earlier visit at first, then from the API's answer.
     pub network: Mutable<Option<Rc<SolNetwork>>>,
+    /// The cluster's config as the API wrote it, and where the page's copy
+    /// came from: only a fetched copy is ever used to sign.
+    config: crate::wallet::config_cache::ConfigSlot,
     /// Rises when a flow lands, so pages read the cluster again.
     pub changed: Mutable<u64>,
     active: RefCell<Option<Active>>,
@@ -77,6 +81,7 @@ thread_local! {
         wallets: Mutable::new(Vec::new()),
         wallet_name: Mutable::new(String::new()),
         network: Mutable::new(None),
+        config: crate::wallet::config_cache::ConfigSlot::new(),
         changed: Mutable::new(0),
         active: RefCell::new(None),
         flows: RefCell::new(Vec::new()),
@@ -207,6 +212,83 @@ impl SolSession {
         }
     }
 
+    /// Take a copy of the cluster's config into what the page reads, if it
+    /// is one this build can use. Redraws only when it changed.
+    fn adopt(&self, raw: &str) -> Option<Rc<SolNetwork>> {
+        let network = Rc::new(parse_network(raw)?);
+        if self.network.lock_ref().as_deref() != Some(&*network) {
+            self.network.set(Some(network.clone()));
+        }
+        Some(network)
+    }
+
+    /// A copy of the cluster's config kept from an earlier visit: read from
+    /// at once, never signed with.
+    pub fn remember(&self, raw: &str) {
+        if parse_network(raw).is_some() {
+            self.config.remember(raw);
+            if self.network.lock_ref().is_none() {
+                self.adopt(raw);
+            }
+        }
+    }
+
+    /// Ask the API for the cluster's config (or wait for the ask in
+    /// flight), and read from its answer.
+    pub async fn refresh_with<F, Fut>(&self, fetch: F) -> Option<Rc<SolNetwork>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let raw = self.config.refresh(fetch).await.ok()?;
+        self.adopt(&raw)
+    }
+
+    /// The cluster a flow sends on: from a config fetched in this page's
+    /// life, never from a remembered copy alone (see
+    /// [`crate::wallet::config_cache`]).
+    pub async fn network_to_sign_with<F, Fut>(&self, fetch: F) -> Result<Rc<SolNetwork>, SolError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        use crate::wallet::config_cache::ForSigning;
+        match self.config.for_signing(fetch).await {
+            ForSigning::Use(raw) => self.adopt(&raw).ok_or_else(|| {
+                SolError::Network(
+                    "the Solana cluster's settings can't be used by this app".to_string(),
+                )
+            }),
+            ForSigning::Changed(raw) => {
+                self.adopt(&raw);
+                Err(SolError::Network(
+                    "this page's settings for the Solana cluster were just updated, so nothing was sent"
+                        .to_string(),
+                ))
+            }
+            ForSigning::Unavailable(_) => Err(SolError::Network(
+                "the Solana cluster isn't reachable from this app".to_string(),
+            )),
+        }
+    }
+
+    /// The connected wallet's app, as a name on its own: "Phantom",
+    /// "Development wallet".
+    pub fn app_name(&self) -> String {
+        match self.connection.lock_ref().wallet() {
+            Some(SolWalletId::Phrase) => "Recovery phrase".to_string(),
+            Some(SolWalletId::Dev) => "Development wallet".to_string(),
+            _ => {
+                let name = self.wallet_name.get_cloned();
+                if name.is_empty() {
+                    "Browser wallet".to_string()
+                } else {
+                    name
+                }
+            }
+        }
+    }
+
     /// Whether the connected wallet lives in the browser.
     pub fn is_browser(&self) -> bool {
         self.connection
@@ -214,6 +296,12 @@ impl SolSession {
             .wallet()
             .is_some_and(SolWalletId::is_browser)
     }
+}
+
+/// The cluster a config names, if this build can use it.
+fn parse_network(raw: &str) -> Option<SolNetwork> {
+    let config: shared::Config = serde_json::from_str(raw).ok()?;
+    SolNetwork::from_config(&config).ok()
 }
 
 /// The session's Solana wallet, signing.
@@ -300,15 +388,30 @@ impl SolSigner for SessionSigner {
 
 #[cfg(target_arch = "wasm32")]
 impl SolSession {
-    /// On load: find wallets, read the cluster's config, and reconnect a
-    /// remembered wallet if it still allows this site.
+    /// On load: find wallets, read from the cluster's config remembered
+    /// from an earlier visit, ask the API for it in the background (again,
+    /// with growing waits, until it answers), and reconnect a remembered
+    /// wallet if it still allows this site.
     pub fn start(self: &Rc<Self>) {
         let session = self.clone();
         super::standard::discover(Rc::new(move || session.refresh_wallets()));
         self.refresh_wallets();
+        if let Some(raw) = crate::wallet::config_cache::recall(shared::Chain::Solana) {
+            self.remember(&raw);
+        }
         let session = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            session.load_network().await;
+            let mut failures = 0u32;
+            while session.refresh().await.is_none() {
+                failures = failures.saturating_add(1);
+                gloo_timers::future::TimeoutFuture::new(crate::api::next_delay(failures)).await;
+                if session.config.is_fresh() {
+                    break;
+                }
+            }
+        });
+        let session = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
             gloo_timers::future::TimeoutFuture::new(300).await;
             session.refresh_wallets();
             session.restore().await;
@@ -322,22 +425,36 @@ impl SolSession {
         self.refresh_wallets();
     }
 
-    /// The cluster's config, read once.
+    /// Ask the API for the cluster's config, keep it for the next visit if
+    /// it reads well, and read from it.
+    async fn refresh(&self) -> Option<Rc<SolNetwork>> {
+        let network = self
+            .refresh_with(|| crate::wallet::config_cache::fetch_raw(shared::Chain::Solana))
+            .await?;
+        if let Some(held) = self.config.held() {
+            crate::wallet::config_cache::keep(shared::Chain::Solana, &held.raw);
+        }
+        Some(network)
+    }
+
+    /// The cluster to read from: the copy the page holds (remembered or
+    /// fetched), else the API's answer.
     pub async fn load_network(&self) -> Option<Rc<SolNetwork>> {
         if let Some(network) = self.network.get_cloned() {
             return Some(network);
         }
-        let reply = gloo_net::http::Request::get(&format!("{}/solana/config", crate::api::BASE))
-            .send()
-            .await
-            .ok()?;
-        if !reply.ok() {
-            return None;
+        self.refresh().await
+    }
+
+    /// The cluster to send on: never a remembered copy alone.
+    pub async fn network_to_sign(&self) -> Result<Rc<SolNetwork>, SolError> {
+        let network = self
+            .network_to_sign_with(|| crate::wallet::config_cache::fetch_raw(shared::Chain::Solana))
+            .await?;
+        if let Some(held) = self.config.held() {
+            crate::wallet::config_cache::keep(shared::Chain::Solana, &held.raw);
         }
-        let config: shared::Config = reply.json().await.ok()?;
-        let network = Rc::new(SolNetwork::from_config(&config).ok()?);
-        self.network.set(Some(network.clone()));
-        Some(network)
+        Ok(network)
     }
 
     fn standard_named(name: &str) -> Option<StandardWallet> {
@@ -451,7 +568,15 @@ impl SolSession {
         };
         let found = match &id {
             SolWalletId::Dev => {
-                if self.account().is_none() {
+                use futures_signals::signal::SignalExt;
+                // The development key comes with the cluster's config.
+                self.network
+                    .signal_ref(Option::is_some)
+                    .wait_for(true)
+                    .await;
+                if self.account().is_none()
+                    && matches!(*self.connection.lock_ref(), SolConnection::SignedOut)
+                {
                     self.connect_dev();
                 }
                 return;
@@ -586,6 +711,103 @@ impl SolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A devnet config naming this build's programs, as the API writes it.
+    fn config_text() -> String {
+        use chain::solana_ix::ids;
+        serde_json::json!({
+            "chain": {"chain": "solana", "key": "solana:devnet", "block": 510561479, "as_of": [2026, 286, 8, 14, 18, 0]},
+            "rpc_url": "https://api.devnet.solana.com",
+            "addresses": {
+                "cluster": "devnet",
+                "programs": {
+                    "shonin_vault": ids::VAULT.to_string(),
+                    "shonin_station": ids::STATION.to_string(),
+                    "shonin_publishing": ids::PUBLISHING.to_string(),
+                    "shonin_registry": ids::REGISTRY.to_string(),
+                    "shonin_prices": ids::PRICES.to_string(),
+                },
+                "mint": Pubkey::new_from_array([7; 32]).to_string(),
+                "token_program": ids::TOKEN.to_string(),
+                "vault_factory": Pubkey::new_from_array([1; 32]).to_string(),
+                "publishing_config": Pubkey::new_from_array([2; 32]).to_string(),
+            },
+            "asset_symbol": "USDC",
+            "asset_decimals": 6,
+            "terms": {
+                "minimum_tank": 10.0, "publish_fee": 1.0,
+                "fees": {"holding_bps": 100, "author_bps": 1000, "platform_bps": 500, "transaction_bps": 10},
+                "exit_band_bps": 100, "freeze_after_days": 7.0, "image_timelock_days": 2.0,
+                "minimum_deposit": 10.0, "terms_hash": format!("0x{}", "00".repeat(32)),
+            },
+            "dev": null,
+        })
+        .to_string()
+    }
+
+    fn fresh_session() -> SolSession {
+        SolSession {
+            connection: Mutable::new(SolConnection::SignedOut),
+            wallets: Mutable::new(Vec::new()),
+            wallet_name: Mutable::new(String::new()),
+            network: Mutable::new(None),
+            config: crate::wallet::config_cache::ConfigSlot::new(),
+            changed: Mutable::new(0),
+            active: RefCell::new(None),
+            flows: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_remembered_cluster_config_is_read_from_at_once_but_never_signed_with_until_the_api_agrees()
+    {
+        use futures::executor::block_on;
+        // As the page keeps it: without the chain's head, and still read.
+        let raw = crate::wallet::config_cache::canonical(&config_text()).unwrap();
+        let session = fresh_session();
+        session.remember(&raw);
+        // Readers have the cluster at once, from the remembered copy.
+        let read = session
+            .network
+            .get_cloned()
+            .expect("read from the remembered copy");
+        assert_eq!(read.cluster, "devnet");
+        // A send while the API is down: nothing is signed.
+        let down = || async { Err::<String, String>("the API answered 503".to_string()) };
+        assert!(matches!(
+            block_on(session.network_to_sign_with(down)),
+            Err(SolError::Network(_))
+        ));
+        // The API answers the same bytes: the send goes on, with it.
+        let same = raw.clone();
+        let signed = block_on(session.network_to_sign_with(|| async move { Ok(same) })).unwrap();
+        assert_eq!(*signed, *read);
+
+        // The API answers something else: this send stops, and the page
+        // reads the fresh config from now on.
+        let session = fresh_session();
+        session.remember(&raw);
+        let other = raw.replace(
+            "https://api.devnet.solana.com",
+            "https://devnet.example.com",
+        );
+        let fresh = other.clone();
+        assert!(matches!(
+            block_on(session.network_to_sign_with(|| async move { Ok(fresh) })),
+            Err(SolError::Network(_))
+        ));
+        assert_eq!(
+            session.network.get_cloned().unwrap().rpc,
+            "https://devnet.example.com"
+        );
+        // A copy that names another deployment's programs is never read.
+        let session = fresh_session();
+        session.remember(&raw.replace(
+            &chain::solana_ix::ids::VAULT.to_string(),
+            &Pubkey::new_from_array([9; 32]).to_string(),
+        ));
+        assert!(session.network.get_cloned().is_none());
+    }
 
     #[test]
     fn the_phrase_wallet_connects_in_memory_signs_only_for_its_account_and_is_never_remembered() {

@@ -1,6 +1,7 @@
 /* The wallet in the header and the connect dialog (Wallet-*, States-System
-   "Wallet"). Network chip: an initial tile and the chain's name. Wallet
-   button: the short address in mono, the full one in its label. The
+   "Wallet"). Network chip: the EVM wallet's network, named; it cautions
+   only where the page acts on a vault on another chain. Wallet button:
+   each wallet's chain mark and short address, the full ones in its label. The
    dialog lists wallets as 56px rows (36px tile, name, "Detected", chevron);
    connecting draws the traced hexagon. The wrong-network bar sits under the
    header, caution-soft, 48px. */
@@ -8,23 +9,35 @@
 .sh-netchip {
   display: inline-flex; align-items: center; gap: var(--space-2);
   height: 36px; padding: 0 var(--space-3) 0 6px; border-radius: var(--radius-full);
-  border: var(--border-hairline) solid var(--line); background: var(--paper);
-  font: 600 14px/20px var(--font-sans); white-space: nowrap;
+  border: var(--border-hairline) solid var(--line); background: var(--paper); color: var(--ink);
+  font: 600 14px/20px var(--font-sans); white-space: nowrap; cursor: pointer;
 }
+@media (hover: hover) { .sh-netchip:hover { background: var(--row-hover); } }
+.sh-netchip > .sh-chainmark:first-child { margin-left: 4px; }
 .sh-netchip .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-full); }
-/* On a network no vault is on: caution-soft, the triangle, "Not on Shonin";
-   a button that offers the switch. */
-.sh-netchip--other { padding-left: 10px; border-color: transparent; background: var(--caution-soft); color: var(--caution); cursor: pointer; }
+/* Where the page acts on a vault on another chain: caution-soft and the
+   triangle, as the panel's own wrong-network state says it. */
+.sh-netchip--other { padding-left: 10px; border-color: transparent; background: var(--caution-soft); color: var(--caution); }
+@media (hover: hover) { .sh-netchip--other:hover { background: var(--caution-soft); } }
 .sh-netchip--other > .sh-icon { flex: none; }
-.sh-netchip__flag { font: 400 13px/18px var(--font-sans); }
+/* A wallet's chain family, beside its address or its network. */
+.sh-chainmark {
+  flex: none; display: inline-block; padding: 1px 5px; border-radius: var(--radius-s);
+  background: var(--neutral-soft); color: var(--ink-muted);
+  font: 700 10px/14px var(--font-sans); letter-spacing: 0.04em;
+}
 .sh-walletbtn .sh-mono { font-size: 14px; }
-/* One account button, whatever is connected: a Solana-only wallet leads with
-   a small "S" mark, and with both kinds a second mark says the sheet lists two. */
-.sh-walletbtn { min-width: 0; white-space: nowrap; }
-.sh-walletbtn .sh-tile { width: 20px; height: 20px; font-size: 11px; line-height: 20px; border-radius: var(--radius-full); }
-.sh-walletbtn__also { margin-left: calc(-1 * var(--space-1)); }
+/* One account button, whatever is connected: each wallet's chain mark and
+   short address; the app's name beside it on a wide screen. */
+.sh-walletbtn { min-width: 0; white-space: nowrap; gap: var(--space-2); }
+.sh-walletbtn__one { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.sh-walletbtn__app { display: none; font-weight: 600; }
+.sh-walletbtn__sep { color: var(--ink-muted); }
+@media (min-width: 1280px) { .sh-walletbtn__app { display: inline; } }
 .sh-walletsheet__kind { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); padding-bottom: var(--space-3); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-walletsheet__title { font: 600 15px/20px var(--font-sans); }
 .sh-walletsheet__kind .sh-hash { max-width: 100%; }
+.sh-walletsheet__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .sh-walletsheet__links { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-5); }
 .sh-tile {
   flex: none; display: inline-flex; align-items: center; justify-content: center;
@@ -61,7 +74,15 @@
 .sh-wrongnet__inner p { flex: 1; min-width: 0; }
 
 @media (max-width: 599px) {
-  .sh-netchip__name, .sh-netchip__flag { display: none; }
-  .sh-netchip { padding: 0 6px; }
+  /* A phone shows the network in the wallet sheet; the chip stays only to
+     caution, as the triangle alone. */
+  .sh-netchip { display: none; }
+  .sh-netchip--other { display: inline-flex; padding: 0 10px; }
+  .sh-netchip__name, .sh-netchip .sh-chainmark { display: none; }
+  /* Two wallets stack, smaller, so both fit at 320. */
+  .sh-walletbtn--both { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; height: auto; min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
+  .sh-walletbtn--both .sh-walletbtn__sep { display: none; }
+  .sh-walletbtn--both .sh-mono { font-size: 12px; line-height: 16px; }
+  .sh-walletbtn--both .sh-chainmark { font-size: 9px; line-height: 12px; padding: 0 4px; }
   .sh-wrongnet__inner { flex-wrap: wrap; }
 }

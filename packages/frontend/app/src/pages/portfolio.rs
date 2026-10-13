@@ -65,6 +65,89 @@ struct ClaimRow {
 struct Loaded {
     rows: Vec<Row>,
     claims: Vec<ClaimRow>,
+    /// The dollars in this wallet on each chain the app has a vault on.
+    balances: Vec<Balance>,
+}
+
+/// The stand-in dollar in a wallet on one chain, read from its token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Balance {
+    /// "Base Sepolia".
+    pub chain: String,
+    /// "$4,960.00".
+    pub dollars: String,
+}
+
+/// What one wallet's section adds to the page's totals, once read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// What its shares are worth, in cents (each row rounded down once).
+    pub value_cents: u128,
+    /// Agents it holds shares in.
+    pub positions: usize,
+    /// Its booked withdrawals not yet paid.
+    pub booked: usize,
+    /// What its positions were paid in with, where every one is known.
+    pub paid_cents: Option<u128>,
+    /// Whether it holds anything at all: shares, a booked withdrawal, a
+    /// waiting request, units or a held payout.
+    pub holds: bool,
+}
+
+/// What the top of the page shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Top {
+    /// No wallet connected.
+    SignedOut,
+    /// A connected wallet is still being read.
+    Reading,
+    /// No connected wallet holds anything; `before` when this browser sent
+    /// something from one of them, so it isn't said they never deposited.
+    Empty { before: bool },
+    /// The totals across every connected wallet.
+    Totals {
+        value_cents: u128,
+        positions: usize,
+        booked: usize,
+        paid_cents: Option<u128>,
+    },
+}
+
+/// The top of the page for each wallet: `None` if not connected,
+/// `Some(None)` while it is read, `Some(Some(summary))` once read; `before`
+/// when this browser sent something from one of them.
+pub fn top(wallets: &[Option<Option<Summary>>], before: bool) -> Top {
+    let connected: Vec<&Option<Summary>> = wallets.iter().flatten().collect();
+    if connected.is_empty() {
+        return Top::SignedOut;
+    }
+    if connected.iter().any(|summary| summary.is_none()) {
+        return Top::Reading;
+    }
+    let read: Vec<&Summary> = connected.into_iter().flatten().collect();
+    if !read.iter().any(|summary| summary.holds) {
+        return Top::Empty { before };
+    }
+    let holding: Vec<&&Summary> = read
+        .iter()
+        .filter(|summary| summary.positions > 0)
+        .collect();
+    Top::Totals {
+        value_cents: read.iter().map(|summary| summary.value_cents).sum(),
+        positions: read.iter().map(|summary| summary.positions).sum(),
+        booked: read.iter().map(|summary| summary.booked).sum(),
+        paid_cents: holding.iter().map(|summary| summary.paid_cents).sum(),
+    }
+}
+
+/// A wallet section's heading: its chain family, its app and its short
+/// address. "EVM · Phantom · 0xed47…b3c0".
+pub fn wallet_heading(family: crate::wallet::recent::Family, app: &str, short: &str) -> String {
+    let family = match family {
+        crate::wallet::recent::Family::Evm => "EVM",
+        crate::wallet::recent::Family::Solana => "Solana",
+    };
+    format!("{family} · {app} · {short}")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -81,49 +164,58 @@ fn dollars_from_cents(cents: u128) -> String {
     money::dollars(U256::from(cents), 2, Rounding::Down)
 }
 
-/// The portfolio.
+/// The portfolio: one view across every connected wallet. The totals at
+/// the top add up every wallet's; each wallet then has its own section,
+/// named by its chain family, its app and its address, read on its own so
+/// neither waits for the other.
 pub fn page() -> Page {
     let session = crate::wallet::get();
+    let solana = crate::wallet::solana::get();
     let loaded: Mutable<Option<Loaded>> = Mutable::new(None);
+    let solana_summary: Mutable<Option<Summary>> = Mutable::new(None);
+    let top_signal = futures_signals::map_ref! {
+        let evm = session.connection.signal_ref(Connection::account),
+        let solana = solana.connection.signal_ref(|c| c.account()),
+        let evm_summary = loaded.signal_ref(|loaded| loaded.as_ref().map(summary_of)),
+        let solana_summary = solana_summary.signal(),
+        let recent = crate::wallet::recent::get().signal_cloned() => {
+            use crate::wallet::recent::{Family, of};
+            let before = evm.is_some_and(|evm| !of(recent, Family::Evm, &format!("{evm:?}")).is_empty())
+                || solana.is_some_and(|solana| !of(recent, Family::Solana, &solana.to_string()).is_empty());
+            top(&[evm.map(|_| *evm_summary), solana.map(|_| *solana_summary)], before)
+        }
+    }
+    .dedupe_cloned();
     let body = el("div")
         .class("sh-portfolio")
         .child(
             el("div")
                 .class("sh-portfolio__head")
                 .child(el("h1").class("sh-portfolio__title").text("Portfolio"))
-                .child(
-                    el("p")
-                        .class("sh-muted")
-                        .text_from(&session.connection, |connection| {
-                            match connection.account() {
-                                Some(account) => format!(
-                                    "Wallet {} · figures read from each vault’s contract",
-                                    crate::format::short_hash(&format!("{account:?}"))
-                                ),
-                                None => {
-                                    "Your shares, what they’re worth and any booked withdrawals."
-                                        .to_string()
-                                }
-                            }
-                        }),
-                ),
+                .child(el("p").class("sh-muted").text(
+                    "Your shares, what they’re worth and any booked withdrawals, read from each vault.",
+                )),
         )
+        .child_signal(Some(top_view(&Top::SignedOut)), top_signal.map(|top| Some(top_view(&top))))
+        .child(evm_section(&loaded))
+        // What the connected Solana wallet holds, beside the EVM one's.
+        .child(crate::components::solana::portfolio::section(solana_summary))
         .child_signal(
-            Some(signed_out()),
+            None,
             futures_signals::map_ref! {
-                let connection = session.connection.signal_cloned(),
-                let loaded = loaded.signal_cloned() => (connection.account(), loaded.clone())
+                let evm = session.connection.signal_ref(|c| c.account().is_some()),
+                let solana = solana.connection.signal_ref(|c| c.account().is_some()) => *evm || *solana
             }
-            .map(|(account, loaded)| {
-                Some(match (account, loaded) {
-                    (None, _) => signed_out(),
-                    (Some(_), None) => loading(),
-                    (Some(_), Some(loaded)) => holdings_view(&loaded),
+            .dedupe()
+            .map(|connected| {
+                connected.then(|| {
+                    el("p")
+                        .class("sh-muted sh-portfolio__risk")
+                        .text("Agents can lose money. Nothing here stops that. Values use today’s share prices; a withdrawal is valued at exit-side marks and can come to a little less.")
+                        .into()
                 })
             }),
         )
-        // What the connected Solana wallet holds, beside the EVM one's.
-        .child(crate::components::solana::portfolio::section())
         .hook(move |dom| dom.future(follow(loaded)));
     Page {
         top: None,
@@ -156,6 +248,237 @@ fn loading() -> View {
         .into()
 }
 
+/// A wallet's section while it is read.
+pub(crate) fn section_loading() -> View {
+    el("div")
+        .class("sh-portfolio__loading")
+        .attr("aria-busy", "true")
+        .child(el("span").class("sh-vh").text("Reading this wallet"))
+        .child(crate::atoms::skeleton::skeleton_block("100%", 120))
+        .into()
+}
+
+/// The top of the page: connect, the totals being read, the empty state,
+/// or the totals across every connected wallet.
+fn top_view(top: &Top) -> View {
+    match top {
+        Top::SignedOut => signed_out(),
+        Top::Reading => el("div")
+            .class("sh-portfolio__tiles")
+            .attr("aria-busy", "true")
+            .child(crate::atoms::skeleton::skeleton_block("100%", 96))
+            .into(),
+        Top::Empty { before } => el("div")
+            .class("sh-portfolio__empty")
+            .child(el("p").class("sh-portfolio__emptytitle").text(if *before {
+                "Nothing in agents right now."
+            } else {
+                "You haven’t deposited yet."
+            }))
+            .child(el("p").class("sh-muted").text("When you deposit, your shares, what they’re worth and any booked withdrawals show up here."))
+            .child(app_link("/agents").class("sh-btn sh-btn-primary").text("Browse agents"))
+            .into(),
+        Top::Totals {
+            value_cents,
+            positions,
+            booked,
+            paid_cents,
+        } => {
+            let mut tiles = el("div").class("sh-portfolio__tiles").child(tile_stat(
+                "Total value",
+                dollars_from_cents(*value_cents),
+                format!(
+                    "{positions} {}, at today’s share prices",
+                    if *positions == 1 { "agent" } else { "agents" }
+                ),
+            ));
+            if let Some(paid) = paid_cents.filter(|_| *positions > 0) {
+                tiles = tiles
+                    .child(tile_stat(
+                        "Paid in",
+                        dollars_from_cents(paid),
+                        "into these agents".to_string(),
+                    ))
+                    .child(tile_stat(
+                        "Gain",
+                        match gain_percent(*value_cents, paid) {
+                            Some(percent) => {
+                                format!("{} · {percent}", signed_cents(*value_cents, paid))
+                            }
+                            None => signed_cents(*value_cents, paid),
+                        },
+                        "since you joined, after fees".to_string(),
+                    ));
+            }
+            if *booked > 0 {
+                tiles = tiles.child(tile_stat(
+                    "Not counted",
+                    format!(
+                        "{booked} booked {}",
+                        if *booked == 1 { "withdrawal" } else { "withdrawals" }
+                    ),
+                    "pending shares aren’t in the totals".to_string(),
+                ));
+            }
+            tiles.into()
+        }
+    }
+}
+
+/// The EVM wallet's section: nothing while no EVM wallet is connected.
+fn evm_section(loaded: &Mutable<Option<Loaded>>) -> View {
+    let session = crate::wallet::get();
+    el("div")
+        .class("sh-contents")
+        .child_signal(
+            None,
+            futures_signals::map_ref! {
+                let account = session.connection.signal_ref(Connection::account),
+                let _name = session.wallet_name.signal_cloned(),
+                let loaded = loaded.signal_cloned() => (*account, loaded.clone())
+            }
+            .map(|(account, loaded)| {
+                let account = account?;
+                let address = format!("{account:?}");
+                let app = crate::wallet::get().app_name();
+                Some(wallet_section(
+                    crate::wallet::recent::Family::Evm,
+                    &app,
+                    &address,
+                    crate::format::short_hash(&address),
+                    match loaded {
+                        None => section_loading(),
+                        Some(loaded) => evm_content(&loaded),
+                    },
+                ))
+            }),
+        )
+        .into()
+}
+
+/// One wallet's section: its heading, what was read, and what this browser
+/// sent from it.
+pub(crate) fn wallet_section(
+    family: crate::wallet::recent::Family,
+    app: &str,
+    address: &str,
+    short: String,
+    content: View,
+) -> View {
+    use crate::wallet::recent::Family;
+    let id = match family {
+        Family::Evm => "pf-wallet-evm",
+        Family::Solana => "pf-wallet-solana",
+    };
+    let heading = wallet_heading(family, app, &short);
+    let mark = match family {
+        Family::Evm => "EVM",
+        Family::Solana => "Solana",
+    };
+    el("section")
+        .class("sh-portfolio__section sh-portfolio__wallet")
+        .attr(
+            "data-wallet",
+            match family {
+                Family::Evm => "evm",
+                Family::Solana => "solana",
+            },
+        )
+        .attr("aria-labelledby", id)
+        .child(
+            el("h2")
+                .class("sh-portfolio__h2 sh-portfolio__wallethead")
+                .attr("id", id)
+                .attr("aria-label", heading)
+                .text(format!("{mark} · {app} · "))
+                .child(el("span").class("sh-mono").text(short)),
+        )
+        .child(content)
+        .child(recent_list(family, address.to_string()))
+        .into()
+}
+
+/// The stand-in dollar in a wallet on each chain the app has a vault on.
+pub(crate) fn balances_view(balances: &[Balance]) -> View {
+    if balances.is_empty() {
+        return View::Empty;
+    }
+    el("div")
+        .class("sh-portfolio__balances")
+        .child(el("p").class("sh-label").text("Dollars in this wallet"))
+        .child(el("dl").children(balances.iter().map(|balance| {
+            el("div")
+                .child(el("dt").text(format!("On {}", balance.chain)))
+                .child(el("dd").class("sh-num").text(balance.dollars.clone()))
+        })))
+        .into()
+}
+
+/// The last sends this browser made from one wallet, newest first, with
+/// where each stands: nothing when there are none.
+pub(crate) fn recent_list(family: crate::wallet::recent::Family, account: String) -> View {
+    el("div")
+        .class("sh-contents")
+        .child_signal(
+            None,
+            crate::wallet::recent::get().signal_ref(move |list| {
+                let mine = crate::wallet::recent::of(list, family, &account);
+                (!mine.is_empty()).then(|| recent_view(&mine))
+            }),
+        )
+        .into()
+}
+
+fn recent_view(entries: &[crate::wallet::recent::Entry]) -> View {
+    el("div")
+        .class("sh-portfolio__recent")
+        .child(
+            el("h3")
+                .class("sh-portfolio__h3")
+                .text("Recent in this browser"),
+        )
+        .child(el("p").class("sh-muted").text(
+            "Only what was sent from this browser. Your wallet’s own history has everything.",
+        ))
+        .child(el("ul").children(entries.iter().map(|entry| {
+            let when = utc_day((entry.at_ms / 1000.0).max(0.0) as u64);
+            el("li")
+                .child(el("p").class("sh-portfolio__recentwhat").text(entry.what()))
+                .child(
+                    el("p")
+                        .class("sh-muted")
+                        .text(format!("{} · {when} · ", entry.status()))
+                        .child(View::from(match &entry.tx_url {
+                            Some(url) => el("a")
+                                .class("sh-link")
+                                .attr("href", url.clone())
+                                .attr("target", "_blank")
+                                .attr("rel", "noopener noreferrer")
+                                .text("Transaction")
+                                .child(el("span").class("sh-vh").text(" (opens the explorer)")),
+                            None => el("span")
+                                .class("sh-mono")
+                                .text(crate::format::short_hash(&entry.tx)),
+                        })),
+                )
+        })))
+        .into()
+}
+
+/// What one EVM wallet's reading adds to the page's totals.
+fn summary_of(loaded: &Loaded) -> Summary {
+    let (positions, open_claims, extras) = parts(loaded);
+    Summary {
+        value_cents: positions.iter().map(|row| row.value_cents).sum(),
+        positions: positions.len(),
+        booked: open_claims.len(),
+        paid_cents: (!positions.is_empty())
+            .then(|| positions.iter().map(|row| row.paid_cents).sum())
+            .flatten(),
+        holds: !positions.is_empty() || !open_claims.is_empty() || !extras.is_empty(),
+    }
+}
+
 /// Read the wallet's holdings: now, whenever the account changes or a flow
 /// lands, and every 15 s.
 async fn follow(loaded: Mutable<Option<Loaded>>) {
@@ -165,8 +488,11 @@ async fn follow(loaded: Mutable<Option<Loaded>>) {
         loop {
             let seen = (session.changed.get(), session.account());
             if let Some(account) = seen.1 {
-                let result = read(account).await;
-                if session.account() == Some(account) {
+                // A reading that reached no chain at all keeps what was
+                // shown (or the skeleton), and is tried again.
+                if let Some(result) = read(account).await
+                    && session.account() == Some(account)
+                {
                     loaded.set(Some(result));
                 }
             } else {
@@ -187,136 +513,185 @@ async fn follow(loaded: Mutable<Option<Loaded>>) {
     let _ = loaded;
 }
 
+/// Every EVM chain's holdings for `account`, the chains read side by side;
+/// `None` if no chain could be read at all.
 #[cfg(target_arch = "wasm32")]
-async fn read(account: alloy_primitives::Address) -> Loaded {
+async fn read(account: alloy_primitives::Address) -> Option<Loaded> {
+    let session = crate::wallet::get();
+    let vaults = session.read_vaults().await;
+    let chains: std::collections::BTreeSet<shared::Chain> = vaults
+        .values()
+        .map(|vault| vault.chain)
+        .filter(|chain| *chain != shared::Chain::Solana)
+        .collect();
+    let parts = futures::future::join_all(
+        chains
+            .into_iter()
+            .map(|chain| read_chain(chain, &vaults, account)),
+    )
+    .await;
+    if !parts.is_empty() && parts.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut loaded = Loaded::default();
+    for part in parts.into_iter().flatten() {
+        loaded.rows.extend(part.rows);
+        loaded.claims.extend(part.claims);
+        loaded.balances.extend(part.balances);
+    }
+    Some(loaded)
+}
+
+/// One chain's holdings for `account`: its dollars, then each vault, read
+/// side by side; `None` if the chain couldn't be reached.
+#[cfg(target_arch = "wasm32")]
+async fn read_chain(
+    chain: shared::Chain,
+    vaults: &std::collections::BTreeMap<String, Rc<VaultRef>>,
+    account: alloy_primitives::Address,
+) -> Option<Loaded> {
     use crate::tx::port::Reader;
     use crate::tx::read;
     use crate::wallet::session::Session;
     let session = crate::wallet::get();
-    let vaults = session.read_vaults().await;
     let mut loaded = Loaded::default();
     let address = format!("{account:?}");
-    let chains: std::collections::BTreeSet<shared::Chain> =
-        vaults.values().map(|vault| vault.chain).collect();
-    for chain in chains {
-        let Some(network) = session.network(chain).await else {
-            continue;
-        };
-        let reply = gloo_net::http::Request::get(&format!(
-            "{}/{chain}/portfolio/{address}",
-            crate::api::BASE
-        ))
-        .send()
+    let network = session.network(chain).await?;
+    let reply =
+        gloo_net::http::Request::get(&format!("{}/{chain}/portfolio/{address}", crate::api::BASE))
+            .send()
+            .await
+            .ok()
+            .filter(|reply| reply.ok());
+    let portfolio: Option<shared::Portfolio> = match reply {
+        Some(reply) => reply.json().await.ok(),
+        None => None,
+    };
+    let reader = Session::reader(&network);
+    // The chain's own answer for the wallet's dollars; a chain that doesn't
+    // answer it isn't read.
+    let balance = read::asset_balance(&reader, network.asset, account)
         .await
-        .ok()
-        .filter(|reply| reply.ok());
-        let portfolio: Option<shared::Portfolio> = match reply {
-            Some(reply) => reply.json().await.ok(),
-            None => None,
-        };
-        let reader = Session::reader(&network);
-        let now = reader.chain_time().await.unwrap_or_default();
-        for vault in vaults.values().filter(|vault| vault.chain == chain) {
-            let Ok(held) = read::holdings(&reader, vault.address, network.asset, account).await
-            else {
-                continue;
-            };
-            let waiting: Vec<shared::Request> = vault
-                .requests
-                .iter()
-                .filter(|request| request.owner.eq_ignore_ascii_case(&address))
-                .cloned()
-                .collect();
-            if held.shares.is_zero()
-                && held.units.is_zero()
-                && held.held.is_zero()
-                && waiting.is_empty()
-            {
-                continue;
-            }
-            let Ok(figures) = read::figures(&reader, vault.address).await else {
-                continue;
-            };
-            // The fallback's conditions are the contract's (a deposit goes
-            // back only while nothing could price it): ask the chain whether
-            // it would take it, for each request whose day has passed.
-            let mut fallbacks = Vec::new();
-            for request in &waiting {
-                let earliest = request.earliest.assume_utc().unix_timestamp().max(0) as u64;
-                let priced = figures
-                    .last
-                    .as_ref()
-                    .is_some_and(|last| last.time >= earliest);
-                if priced
-                    || figures.state == State::Closed
-                    || now < earliest.saturating_add(figures.timers.fallback_after)
-                    || !matches!(
-                        request.kind,
-                        shared::RequestKind::Deposit | shared::RequestKind::Withdrawal
-                    )
-                {
-                    continue;
-                }
-                let attempt = crate::tx::port::TxRequest {
-                    chain_id: network.chain_id,
-                    from: account,
-                    to: vault.address,
-                    data: alloy_sol_types::SolCall::abi_encode(
-                        &chain::bindings::vault::IVault::takeProRataCall {
-                            requestId: U256::from(request.id),
-                        },
-                    )
-                    .into(),
-                    gas: None,
-                };
-                let answer = match reader.estimate_gas(&attempt).await {
-                    Ok(_) => Ok(()),
-                    Err(crate::tx::TxError::WouldRevert { reason }) => Err(reason),
-                    // Unread: offered, and the flow's own estimate decides.
-                    Err(_) => Ok(()),
-                };
-                fallbacks.push((request.id, answer));
-            }
-            let value = figures
-                .share_price()
-                .and_then(|price| crate::money::quote::value_of(held.shares, price))
-                .unwrap_or_default();
-            let paid_cents = portfolio
-                .as_ref()
-                .and_then(|p: &shared::Portfolio| p.positions.iter().find(|h| h.slug == vault.slug))
-                .filter(|holding| holding.cost.is_finite() && holding.cost >= 0.0)
-                .map(|holding| (holding.cost * 100.0).round() as u128);
-            loaded.rows.push(Row {
-                vault: vault.clone(),
-                network: network.clone(),
-                value_cents: cents(value, network.asset_decimals),
-                figures,
-                held,
-                paid_cents,
-                waiting,
-                fallbacks,
-                now,
-            });
-        }
-        if let Some(portfolio) = portfolio {
-            for claim in portfolio.claims {
-                if let Some(vault) = vaults.get(&claim.slug) {
-                    let closed =
-                        matches!(read::state(&reader, vault.address).await, Ok(State::Closed));
-                    loaded.claims.push(ClaimRow {
-                        vault: vault.clone(),
-                        network: network.clone(),
-                        claim,
-                        closed,
-                    });
-                }
+        .ok()?;
+    loaded.balances.push(Balance {
+        chain: networks::chain_name(network.chain_id),
+        dollars: money::dollars(balance, network.asset_decimals, Rounding::Down),
+    });
+    let now = reader.chain_time().await.unwrap_or_default();
+    let rows = futures::future::join_all(
+        vaults
+            .values()
+            .filter(|vault| vault.chain == chain)
+            .map(|vault| read_row(&reader, &network, vault, account, now, portfolio.as_ref())),
+    )
+    .await;
+    loaded.rows.extend(rows.into_iter().flatten());
+    if let Some(portfolio) = portfolio {
+        for claim in portfolio.claims {
+            if let Some(vault) = vaults.get(&claim.slug) {
+                let closed = matches!(read::state(&reader, vault.address).await, Ok(State::Closed));
+                loaded.claims.push(ClaimRow {
+                    vault: vault.clone(),
+                    network: network.clone(),
+                    claim,
+                    closed,
+                });
             }
         }
     }
-    loaded
+    Some(loaded)
 }
 
-fn holdings_view(loaded: &Loaded) -> View {
+/// One vault's row for `account`, if it holds anything there.
+#[cfg(target_arch = "wasm32")]
+async fn read_row(
+    reader: &crate::wallet::rpc::RpcReader<crate::wallet::rpc::Endpoint>,
+    network: &Rc<Network>,
+    vault: &Rc<VaultRef>,
+    account: alloy_primitives::Address,
+    now: u64,
+    portfolio: Option<&shared::Portfolio>,
+) -> Option<Row> {
+    use crate::tx::port::Reader;
+    use crate::tx::read;
+    let address = format!("{account:?}");
+    let held = read::holdings(reader, vault.address, network.asset, account)
+        .await
+        .ok()?;
+    let waiting: Vec<shared::Request> = vault
+        .requests
+        .iter()
+        .filter(|request| request.owner.eq_ignore_ascii_case(&address))
+        .cloned()
+        .collect();
+    if held.shares.is_zero() && held.units.is_zero() && held.held.is_zero() && waiting.is_empty() {
+        return None;
+    }
+    let figures = read::figures(reader, vault.address).await.ok()?;
+    // The fallback's conditions are the contract's (a deposit goes back
+    // only while nothing could price it): ask the chain whether it would
+    // take it, for each request whose day has passed.
+    let mut fallbacks = Vec::new();
+    for request in &waiting {
+        let earliest = request.earliest.assume_utc().unix_timestamp().max(0) as u64;
+        let priced = figures
+            .last
+            .as_ref()
+            .is_some_and(|last| last.time >= earliest);
+        if priced
+            || figures.state == State::Closed
+            || now < earliest.saturating_add(figures.timers.fallback_after)
+            || !matches!(
+                request.kind,
+                shared::RequestKind::Deposit | shared::RequestKind::Withdrawal
+            )
+        {
+            continue;
+        }
+        let attempt = crate::tx::port::TxRequest {
+            chain_id: network.chain_id,
+            from: account,
+            to: vault.address,
+            data: alloy_sol_types::SolCall::abi_encode(
+                &chain::bindings::vault::IVault::takeProRataCall {
+                    requestId: U256::from(request.id),
+                },
+            )
+            .into(),
+            gas: None,
+        };
+        let answer = match reader.estimate_gas(&attempt).await {
+            Ok(_) => Ok(()),
+            Err(crate::tx::TxError::WouldRevert { reason }) => Err(reason),
+            // Unread: offered, and the flow's own estimate decides.
+            Err(_) => Ok(()),
+        };
+        fallbacks.push((request.id, answer));
+    }
+    let value = figures
+        .share_price()
+        .and_then(|price| crate::money::quote::value_of(held.shares, price))
+        .unwrap_or_default();
+    let paid_cents = portfolio
+        .and_then(|p| p.positions.iter().find(|h| h.slug == vault.slug))
+        .filter(|holding| holding.cost.is_finite() && holding.cost >= 0.0)
+        .map(|holding| (holding.cost * 100.0).round() as u128);
+    Some(Row {
+        vault: vault.clone(),
+        network: network.clone(),
+        value_cents: cents(value, network.asset_decimals),
+        figures,
+        held,
+        paid_cents,
+        waiting,
+        fallbacks,
+        now,
+    })
+}
+
+/// A reading's positions, booked withdrawals not yet paid, and waiting
+/// requests, units or held payouts.
+fn parts(loaded: &Loaded) -> (Vec<&Row>, Vec<&ClaimRow>, Vec<&Row>) {
     let positions: Vec<&Row> = loaded
         .rows
         .iter()
@@ -342,63 +717,29 @@ fn holdings_view(loaded: &Loaded) -> View {
                 || !row.waiting.is_empty()
         })
         .collect();
+    (positions, open_claims, extras)
+}
+
+/// The EVM wallet's section, once read: its dollars, then its positions,
+/// booked withdrawals and anything waiting; one quiet line if it holds
+/// nothing in agents.
+fn evm_content(loaded: &Loaded) -> View {
+    let (positions, open_claims, extras) = parts(loaded);
+    let body = el("div")
+        .class("sh-portfolio__body")
+        .child(balances_view(&loaded.balances));
     if positions.is_empty() && open_claims.is_empty() && extras.is_empty() {
-        return el("div")
-            .class("sh-portfolio__empty")
-            .child(el("p").class("sh-portfolio__emptytitle").text("You haven’t deposited yet."))
-            .child(el("p").class("sh-muted").text("When you deposit, your shares, what they’re worth and any booked withdrawals show up here."))
-            .child(app_link("/agents").class("sh-btn sh-btn-primary").text("Browse agents"))
+        return body
+            .child(
+                el("p")
+                    .class("sh-muted")
+                    .text("Nothing in agents from this wallet."),
+            )
             .into();
     }
     let total: u128 = positions.iter().map(|row| row.value_cents).sum();
     let paid: Option<u128> = positions.iter().map(|row| row.paid_cents).sum();
-    let mut tiles = el("div").class("sh-portfolio__tiles").child(tile_stat(
-        "Total value",
-        dollars_from_cents(total),
-        format!(
-            "{} {}, at today’s share prices",
-            positions.len(),
-            if positions.len() == 1 {
-                "agent"
-            } else {
-                "agents"
-            }
-        ),
-    ));
-    if let Some(paid) = paid {
-        tiles = tiles.child(tile_stat(
-            "Paid in",
-            dollars_from_cents(paid),
-            "into these agents".to_string(),
-        ));
-        tiles = tiles.child(tile_stat(
-            "Gain",
-            match gain_percent(total, paid) {
-                Some(percent) => format!("{} · {percent}", signed_cents(total, paid)),
-                None => signed_cents(total, paid),
-            },
-            "since you joined, after fees".to_string(),
-        ));
-    }
-    if !open_claims.is_empty() {
-        tiles = tiles.child(tile_stat(
-            "Not counted",
-            format!(
-                "{} booked {}",
-                open_claims.len(),
-                if open_claims.len() == 1 {
-                    "withdrawal"
-                } else {
-                    "withdrawals"
-                }
-            ),
-            "pending shares aren’t in the totals".to_string(),
-        ));
-    }
-    el("div")
-        .class("sh-portfolio__body")
-        .child(tiles)
-        .child(tank_warnings(&positions))
+    body.child(tank_warnings(&positions))
         .child(if positions.is_empty() {
             View::Empty
         } else {
@@ -412,12 +753,11 @@ fn holdings_view(loaded: &Loaded) -> View {
         } else {
             claims_list(&open_claims)
         })
-        .child(if extras.is_empty() { View::Empty } else { extras_list(&extras) })
-        .child(
-            el("p")
-                .class("sh-muted sh-portfolio__risk")
-                .text("Agents can lose money. Nothing here stops that. Values use today’s share prices; a withdrawal is valued at exit-side marks and can come to a little less."),
-        )
+        .child(if extras.is_empty() {
+            View::Empty
+        } else {
+            extras_list(&extras)
+        })
         .into()
 }
 
@@ -684,7 +1024,7 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
     });
     el("section")
         .class("sh-portfolio__section")
-        .child(el("h2").class("sh-portfolio__h2").text("Your positions"))
+        .child(el("h3").class("sh-portfolio__h3").text("Your positions"))
         .child(
             el("div").class("sh-table-wrap").child(
                 el("table")
@@ -778,8 +1118,8 @@ fn claims_list(claims: &[&ClaimRow]) -> View {
     el("section")
         .class("sh-portfolio__section")
         .child(
-            el("h2")
-                .class("sh-portfolio__h2")
+            el("h3")
+                .class("sh-portfolio__h3")
                 .text("Booked withdrawals"),
         )
         .child(
@@ -843,8 +1183,8 @@ fn extras_list(rows: &[&Row]) -> View {
     el("section")
         .class("sh-portfolio__section")
         .child(
-            el("h2")
-                .class("sh-portfolio__h2")
+            el("h3")
+                .class("sh-portfolio__h3")
                 .text("Waiting, units and held payouts"),
         )
         .child(
@@ -1567,6 +1907,160 @@ fn claim_view(view: &ClaimView) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn holding(value_cents: u128) -> Summary {
+        Summary {
+            value_cents,
+            positions: 1,
+            booked: 0,
+            paid_cents: None,
+            holds: true,
+        }
+    }
+
+    #[test]
+    fn the_empty_state_shows_only_when_no_connected_wallet_holds_anything() {
+        let nothing = Summary::default();
+        // The EVM side of a wallet holds nothing, its Solana side holds
+        // shares: the totals, never "You haven't deposited yet".
+        assert_eq!(
+            top(&[Some(Some(nothing)), Some(Some(holding(148_000)))], false),
+            Top::Totals {
+                value_cents: 148_000,
+                positions: 1,
+                booked: 0,
+                paid_cents: None
+            }
+        );
+        // Every connected wallet read and holding nothing: the empty state.
+        assert_eq!(
+            top(&[Some(Some(nothing)), Some(Some(nothing))], false),
+            Top::Empty { before: false }
+        );
+        assert_eq!(
+            top(&[Some(Some(nothing)), None], false),
+            Top::Empty { before: false }
+        );
+        // Withdrawn from since: never "haven't deposited".
+        assert_eq!(
+            top(&[Some(Some(nothing)), None], true),
+            Top::Empty { before: true }
+        );
+        // A wallet still being read: never the empty state yet.
+        assert_eq!(top(&[Some(Some(nothing)), Some(None)], false), Top::Reading);
+        assert_eq!(top(&[None, None], false), Top::SignedOut);
+        // Across wallets the totals add up; what was paid in only where
+        // every holding wallet knows it.
+        let mut evm = holding(10_000);
+        evm.paid_cents = Some(9_000);
+        evm.booked = 1;
+        assert_eq!(
+            top(&[Some(Some(evm)), Some(Some(holding(5_000)))], false),
+            Top::Totals {
+                value_cents: 15_000,
+                positions: 2,
+                booked: 1,
+                paid_cents: None
+            }
+        );
+        assert_eq!(
+            top(&[Some(Some(evm)), Some(Some(nothing))], false),
+            Top::Totals {
+                value_cents: 10_000,
+                positions: 1,
+                booked: 1,
+                paid_cents: Some(9_000)
+            }
+        );
+    }
+
+    #[test]
+    fn each_wallet_section_is_headed_by_its_chain_family_app_and_short_address() {
+        use crate::wallet::recent::Family;
+        assert_eq!(
+            wallet_heading(Family::Evm, "Phantom", "0xed47…b3c0"),
+            "EVM · Phantom · 0xed47…b3c0"
+        );
+        assert_eq!(
+            wallet_heading(Family::Solana, "Phantom", "B16P…r9Kp"),
+            "Solana · Phantom · B16P…r9Kp"
+        );
+        let html = View::Many(vec![wallet_section(
+            Family::Evm,
+            "MetaMask",
+            "0xb0b7",
+            "0xb0b7…b448".to_string(),
+            View::Empty,
+        )])
+        .html();
+        assert!(
+            html.contains("aria-label=\"EVM · MetaMask · 0xb0b7…b448\""),
+            "{html}"
+        );
+        assert!(html.contains("data-wallet=\"evm\""), "{html}");
+    }
+
+    #[test]
+    fn an_evm_wallet_holding_nothing_says_so_in_one_quiet_line_beside_its_dollars() {
+        let loaded = Loaded {
+            balances: vec![Balance {
+                chain: "Base Sepolia".to_string(),
+                dollars: "$4,960.00".to_string(),
+            }],
+            ..Loaded::default()
+        };
+        let html = View::Many(vec![evm_content(&loaded)]).html();
+        assert!(
+            html.contains("Nothing in agents from this wallet."),
+            "{html}"
+        );
+        assert!(!html.contains("haven’t deposited"), "{html}");
+        assert!(!html.contains("Browse agents"), "{html}");
+        assert!(html.contains("Dollars in this wallet"), "{html}");
+        assert!(html.contains(">On Base Sepolia<"), "{html}");
+        assert!(html.contains(">$4,960.00<"), "{html}");
+        assert_eq!(summary_of(&loaded), Summary::default());
+    }
+
+    #[test]
+    fn this_browsers_recent_sends_say_paid_or_pending_and_that_they_are_this_browsers_only() {
+        use crate::wallet::recent::{Entry, Family, Kind};
+        let entry = |tx: &str, kind, outcome: Option<&str>| Entry {
+            tx: tx.to_string(),
+            tx_url: Some(format!("https://sepolia.basescan.org/tx/{tx}")),
+            family: Family::Evm,
+            account: "0x7e".to_string(),
+            slug: "base-2".to_string(),
+            title: "Funding basis".to_string(),
+            kind,
+            amount: "12.5 shares".to_string(),
+            at_ms: 1_760_000_000_000.0,
+            outcome: outcome.map(str::to_string),
+        };
+        let html = recent_view(&[
+            entry("0xaa", Kind::Withdrawal, Some("Paid $251.20")),
+            entry("0xbb", Kind::Withdrawal, None),
+        ])
+        .html();
+        assert!(html.contains("Recent in this browser"), "{html}");
+        assert!(
+            html.contains("Only what was sent from this browser."),
+            "{html}"
+        );
+        assert!(
+            html.contains("Withdrawal of 12.5 shares from Funding basis"),
+            "{html}"
+        );
+        assert!(html.contains("Paid $251.20"), "{html}");
+        assert!(
+            html.contains("Pending, priced at the next valuation"),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"https://sepolia.basescan.org/tx/0xaa\""),
+            "{html}"
+        );
+    }
 
     #[test]
     fn a_gain_reads_as_a_share_of_what_was_paid_in() {

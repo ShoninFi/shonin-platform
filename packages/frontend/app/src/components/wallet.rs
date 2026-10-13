@@ -3,8 +3,11 @@
 //! (choosing, connecting, rejected, not installed, locked, the recovery
 //! phrase), the wallet menu, and the wrong-network bar.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use alloy_primitives::Address;
+use chain::solana_ix::Pubkey;
 use futures_signals::signal::{Mutable, SignalExt};
 use ui::icons::Icon;
 
@@ -13,10 +16,11 @@ use crate::atoms::dialog::{self, Dialog};
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::format::short_hash;
-use crate::route::{DOCS, TERMS};
+use crate::route::{DOCS, Route, TERMS};
 use crate::view::{El, View, el, text};
 use crate::wallet::machine::{Connection, WalletId};
-use crate::wallet::{WalletOption, dev, networks};
+use crate::wallet::recent::Family;
+use crate::wallet::{Network, WalletOption, dev, networks};
 
 /// A one-letter tile for a chain or a wallet without an icon.
 pub fn tile(name: &str) -> El {
@@ -32,43 +36,171 @@ pub fn tile(name: &str) -> El {
         )
 }
 
+/// A small mark naming a wallet's chain family: "EVM", "SOL".
+pub fn chain_mark(family: Family) -> El {
+    el("span")
+        .class("sh-chainmark")
+        .attr("aria-hidden", "true")
+        .text(match family {
+            Family::Evm => "EVM",
+            Family::Solana => "SOL",
+        })
+}
+
+// The vault the page acts on -------------------------------------------------
+
+thread_local! {
+    /// The EVM chains that elements now on the page act on (a deposit or
+    /// withdraw panel or sheet, a claim, the publish flow once its chain is
+    /// chosen), newest last, by a token per element.
+    static ACTING: Mutable<Vec<(u64, u64)>> = Mutable::new(Vec::new());
+    static NEXT_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Drops an element's entry when the element goes.
+struct Acting(u64);
+
+impl Drop for Acting {
+    fn drop(&mut self) {
+        let token = self.0;
+        ACTING.with(|acting| acting.lock_mut().retain(|(held, _)| *held != token));
+    }
+}
+
+/// For as long as the returned future runs (an element that acts on a vault
+/// holds it with `.future(...)`), the header's network chip compares the
+/// wallet's chain with `chain_id`'s, and cautions when they differ.
+pub async fn acting_on(chain_id: impl futures_signals::signal::Signal<Item = Option<u64>>) {
+    let token = NEXT_TOKEN.with(|next| {
+        let token = next.get();
+        next.set(token + 1);
+        token
+    });
+    let _held = Acting(token);
+    chain_id
+        .for_each(move |chain_id| {
+            ACTING.with(|acting| {
+                let mut acting = acting.lock_mut();
+                acting.retain(|(held, _)| *held != token);
+                if let Some(chain_id) = chain_id {
+                    acting.push((token, chain_id));
+                }
+            });
+            async {}
+        })
+        .await;
+    // A chain that never changes still holds for as long as the element is
+    // on the page.
+    std::future::pending::<()>().await;
+}
+
+/// The chain the newest element on the page acts on.
+fn acting_signal() -> impl futures_signals::signal::Signal<Item = Option<u64>> {
+    ACTING.with(|acting| acting.signal_ref(|acting| acting.last().map(|(_, chain)| *chain)))
+}
+
+/// The agent a route is about, when the page acts on its vault: the agent
+/// page, a claim, manage and activate.
+fn route_slug(route: &Route) -> Option<String> {
+    match route {
+        Route::Agent { slug, .. }
+        | Route::Claim { slug, .. }
+        | Route::Manage { slug }
+        | Route::Activate { slug } => (!slug.is_empty()).then(|| slug.clone()),
+        _ => None,
+    }
+}
+
+/// The EVM chain id of `slug`'s vault, once the store and the chain's
+/// config have been read; `None` for a Solana vault.
+fn vault_chain_id(slug: &str, networks: &BTreeMap<shared::Chain, Rc<Network>>) -> Option<u64> {
+    let chain = crate::store::get()
+        .agent(slug)?
+        .strategy
+        .lock_ref()
+        .vault
+        .chain;
+    networks.get(&chain).map(|network| network.chain_id)
+}
+
+/// The chain the page acts on: the newest element's, else the route's.
+fn want_signal(route: &Route) -> impl futures_signals::signal::Signal<Item = Option<u64>> + use<> {
+    let slug = route_slug(route);
+    let store = crate::store::get();
+    let session = crate::wallet::get();
+    futures_signals::map_ref! {
+        let acting = acting_signal(),
+        let _loaded = store.loaded.signal(),
+        let networks = session.networks.signal_cloned() =>
+        acting.or_else(|| slug.as_deref().and_then(|slug| vault_chain_id(slug, networks)))
+    }
+    .dedupe()
+}
+
+// The header ------------------------------------------------------------------
+
 /// The header's wallet control: "Connect wallet" signed out ("Connect" on
 /// phone). Connected, one account button whatever is connected (an EVM
-/// wallet, a Solana wallet or both), beside the network chip of a browser
-/// EVM wallet. The button opens the wallet sheet, which lists both kinds
-/// and offers to connect the one that isn't.
-pub fn header_control() -> View {
+/// wallet, a Solana wallet or both), each with its chain's mark, beside the
+/// network chip of a browser EVM wallet. The button opens the wallet sheet,
+/// which lists both kinds and offers to connect the one that isn't.
+pub fn header_control(route: &Route) -> View {
     let session = crate::wallet::get();
     let solana = crate::wallet::solana::get();
-    let now = control(&session.connection.lock_ref(), solana.account());
+    let want = Mutable::new(None::<u64>);
+    let now = control(&session.connection.lock_ref(), solana.account(), None);
     el("div")
         .class("sh-walletctl")
         .child_signal(
             Some(now),
             futures_signals::map_ref! {
                 let evm = session.connection.signal_cloned(),
-                let solana = solana.connection.signal_cloned() => control(evm, solana.account())
+                let solana = solana.connection.signal_cloned(),
+                let _evm_name = session.wallet_name.signal_cloned(),
+                let _solana_name = solana.wallet_name.signal_cloned(),
+                let want = want.signal() => control(evm, solana.account(), *want)
             }
             .map(Some),
         )
+        .hook({
+            let route = route.clone();
+            move |dom| {
+                dom.future(want_signal(&route).for_each(move |chain| {
+                    want.set_neq(chain);
+                    async {}
+                }))
+            }
+        })
         .into()
 }
 
-/// What the header holds for a pair of connections.
-fn control(evm: &Connection, solana: Option<chain::solana_ix::Pubkey>) -> View {
-    let evm = match evm {
-        Connection::Connected {
-            account, chain_id, ..
-        } => Some((*account, *chain_id)),
+/// What the header holds for a pair of connections, where the page acts on
+/// a vault on `want` (an EVM chain id), if it does.
+fn control(evm: &Connection, solana: Option<Pubkey>, want: Option<u64>) -> View {
+    let session = crate::wallet::get();
+    let evm_account = evm.account();
+    let chain_id = match evm {
+        Connection::Connected { chain_id, .. } => *chain_id,
         _ => None,
     };
-    match (evm, solana) {
+    match (evm_account, solana) {
         (None, None) => connect_button().into(),
-        (Some((account, chain_id)), solana) => View::Many(vec![
-            network_chip(chain_id),
-            account_button(Some(account), solana).into(),
+        (Some(account), solana) => View::Many(vec![
+            match chain_id.filter(|_| session.is_browser()) {
+                Some(chain_id) => chip(chain_id, want, solana.is_some()),
+                None => View::Empty,
+            },
+            account_button(
+                Some((account, session.app_name())),
+                solana.map(|account| (account, crate::wallet::solana::get().app_name())),
+            )
+            .into(),
         ]),
-        (None, Some(solana)) => account_button(None, Some(solana)).into(),
+        (None, Some(solana)) => account_button(
+            None,
+            Some((solana, crate::wallet::solana::get().app_name())),
+        )
+        .into(),
     }
 }
 
@@ -92,65 +224,39 @@ fn connect_button() -> El {
     )
 }
 
-/// The chain a browser EVM wallet is on; a local signer has none to show.
-/// A network no vault is on is marked as such, in the caution style, and
-/// offers the switch to one that is.
-fn network_chip(chain_id: Option<u64>) -> View {
-    let session = crate::wallet::get();
-    match chain_id.filter(|_| session.is_browser()) {
-        Some(chain_id) => {
-            let now = chip(chain_id, ours(&session.app_chains(), chain_id));
-            el("span")
-                .class("sh-contents")
-                .child_signal(
-                    Some(now),
-                    session
-                        .networks
-                        .signal_ref(move |networks| {
-                            let chains: Vec<u64> =
-                                networks.values().map(|network| network.chain_id).collect();
-                            ours(&chains, chain_id)
-                        })
-                        .dedupe()
-                        .map(move |ours| Some(chip(chain_id, ours))),
-                )
-                .into()
-        }
-        None => View::Empty,
-    }
-}
-
-/// Whether `chain_id` is one of the app's vault chains; `None` until the
-/// app has read which those are.
-fn ours(app_chains: &[u64], chain_id: u64) -> Option<bool> {
-    (!app_chains.is_empty()).then(|| app_chains.contains(&chain_id))
-}
-
-fn chip(chain_id: u64, ours: Option<bool>) -> View {
+/// The chain a browser EVM wallet is on, by name, as a quiet button that
+/// offers the switch. It cautions only where the page acts on a vault on
+/// another chain (`want`); a network no vault is on is otherwise just named.
+/// With a Solana wallet connected too, it says it is the EVM wallet's.
+fn chip(chain_id: u64, want: Option<u64>, both: bool) -> View {
     let name = networks::network_name(chain_id);
-    if ours != Some(false) {
-        return el("span")
-            .class("sh-netchip")
-            .attr("aria-label", format!("Your wallet is on {name}"))
-            .child(tile(&name))
-            .child(el("span").class("sh-netchip__name").text(name))
-            .into();
-    }
+    let caution = want.filter(|want| *want != chain_id);
+    let label = match caution {
+        Some(want) => format!(
+            "Your EVM wallet is on {name}; this vault is on {}. Switch network",
+            networks::chain_name(want)
+        ),
+        None => format!("Your EVM wallet is on {name}. Change network"),
+    };
     on_click(
         el("button")
             .attr("type", "button")
-            .class("sh-netchip sh-netchip--other")
+            .class("sh-netchip")
+            .class_if(caution.is_some(), "sh-netchip--other")
             .attr("aria-haspopup", "dialog")
-            .attr(
-                "aria-label",
-                format!(
-                    "Your wallet is on {name}, which isn’t one of Shonin’s networks. Switch network"
-                ),
-            )
-            .child(icon(Icon::Concern, 16))
-            .child(el("span").class("sh-netchip__name").text(name))
-            .child(el("span").class("sh-netchip__flag").text("Not on Shonin")),
-        move || open_switch(chain_id),
+            .attr("aria-label", label)
+            // The triangle where it cautions; else the EVM mark beside a
+            // Solana wallet, or the network's initial on its own.
+            .child(match (caution, both) {
+                (Some(_), _) => icon(Icon::Concern, 16).into(),
+                (None, true) => View::from(chain_mark(Family::Evm)),
+                (None, false) => View::from(tile(&name)),
+            })
+            .child(View::from(
+                (caution.is_some() && both).then(|| chain_mark(Family::Evm).into()),
+            ))
+            .child(el("span").class("sh-netchip__name").text(name)),
+        move || open_switch(chain_id, want),
     )
     .into()
 }
@@ -170,67 +276,40 @@ fn switch_targets(page: Option<u64>, app_chains: &[u64]) -> Vec<u64> {
     targets
 }
 
-/// The vault chain of the agent the page is about, if it is about one.
-fn page_chain() -> Option<u64> {
-    use crate::route::Route;
-    let location = crate::web::window()?.location();
-    let route = Route::from_url(&location.pathname().ok()?, &location.search().ok()?);
-    let slug = match route {
-        Route::Agent { slug, .. }
-        | Route::Claim { slug, .. }
-        | Route::Manage { slug }
-        | Route::Activate { slug } => slug,
-        _ => return None,
-    };
-    let chain = crate::store::get()
-        .agent(&slug)?
-        .strategy
-        .lock_ref()
-        .vault
-        .chain;
-    crate::wallet::get()
-        .networks
-        .lock_ref()
-        .get(&chain)
-        .map(|network| network.chain_id)
-}
-
-/// The wallet is on a network no vault is on: offer the page's vault chain
-/// first, then the app's others, through the usual switch (adding the chain
-/// if the wallet doesn't know it). Closes once the wallet is on one.
-fn open_switch(on: u64) {
+/// The switch, from the chip: the vault chain the page acts on first (the
+/// one to switch to, where the wallet is elsewhere), then the app's others.
+/// Closes once the wallet moves.
+fn open_switch(on: u64, want: Option<u64>) {
     let session = crate::wallet::get();
     let app_chains = session.app_chains();
-    let page = page_chain();
-    let targets = switch_targets(page, &app_chains);
+    let targets: Vec<u64> = switch_targets(want, &app_chains)
+        .into_iter()
+        .filter(|id| *id != on)
+        .collect();
     let name = networks::network_name(on);
-    let lead = match page {
-        Some(page) => format!(
-            "Your wallet is on {name}, which isn’t one of Shonin’s networks. This agent’s vault is on {}.",
-            networks::chain_name(page)
+    let caution = want.filter(|want| *want != on);
+    let lead = match caution {
+        Some(want) => format!(
+            "Your EVM wallet is on {name}. This vault is on {}.",
+            networks::chain_name(want)
         ),
-        None => format!(
-            "Your wallet is on {name}, which isn’t one of Shonin’s networks. Switch to one of them to deposit, withdraw or publish."
-        ),
+        None => format!("Your EVM wallet is on {name}."),
     };
-    let watch = {
-        let chains = app_chains.clone();
-        session
-            .connection
-            .signal_ref(|connection| match connection {
-                Connection::Connected { chain_id, .. } => *chain_id,
-                _ => None,
-            })
-            .dedupe()
-            .for_each(move |chain_id| {
-                if chain_id.is_some_and(|id| chains.contains(&id)) {
-                    dialog::close();
-                }
-                async {}
-            })
-    };
+    let watch = session
+        .connection
+        .signal_ref(|connection| match connection {
+            Connection::Connected { chain_id, .. } => *chain_id,
+            _ => None,
+        })
+        .dedupe()
+        .for_each(move |chain_id| {
+            if chain_id != Some(on) {
+                dialog::close();
+            }
+            async {}
+        });
     let buttons = targets.into_iter().enumerate().map(|(index, chain_id)| {
-        let kind = if index == 0 {
+        let kind = if index == 0 && caution.is_some() {
             Kind::Primary
         } else {
             Kind::Secondary
@@ -238,7 +317,11 @@ fn open_switch(on: u64) {
         switch_button_as(chain_id, Size::Medium, kind).class("sh-btn-block")
     });
     dialog::open(Dialog {
-        title: "Switch network".to_string(),
+        title: if caution.is_some() {
+            "Switch network".to_string()
+        } else {
+            "Network".to_string()
+        },
         body: el("div")
             .class("sh-walletmenu")
             .child(el("p").text(lead))
@@ -250,47 +333,70 @@ fn open_switch(on: u64) {
     });
 }
 
-/// The one account button: the EVM address when there is one, else the
-/// Solana address; with both, a small Solana mark says the sheet holds two.
-fn account_button(
-    evm: Option<alloy_primitives::Address>,
-    solana: Option<chain::solana_ix::Pubkey>,
-) -> El {
-    let evm = evm.map(|account| format!("{account:?}"));
-    let solana = solana.map(|account| account.to_string());
-    let label = match (&evm, &solana) {
-        (Some(evm), Some(solana)) => format!("Your wallets: {evm}, and Solana {solana}"),
-        (Some(evm), None) => format!("Wallet {evm}"),
-        (None, Some(solana)) => format!("Solana wallet {solana}"),
-        (None, None) => "Your wallets".to_string(),
-    };
-    let lead: View = match (&evm, &solana) {
-        (Some(evm), _) => View::Many(vec![
-            icon(Icon::Wallet, 16).into(),
-            el("span").class("sh-mono").text(short_hash(evm)).into(),
-        ]),
-        (None, Some(solana)) => View::Many(vec![
-            tile("S").into(),
-            el("span")
-                .class("sh-mono")
-                .text(super::solana::exit::short(solana))
-                .into(),
-        ]),
-        (None, None) => View::Empty,
+/// The one account button: each connected wallet's chain mark and short
+/// address, the EVM one first ("EVM 0xb0b7…b448 · SOL B16P…r9Kp"), with
+/// each wallet's app named beside it on a wide screen and always in its
+/// label. Two wallets stack on a phone.
+fn account_button(evm: Option<(Address, String)>, solana: Option<(Pubkey, String)>) -> El {
+    let evm = evm.map(|(account, app)| (format!("{account:?}"), app));
+    let solana = solana.map(|(account, app)| (account.to_string(), app));
+    let label = account_label(
+        evm.as_ref().map(|(a, n)| (a.as_str(), n.as_str())),
+        solana.as_ref().map(|(a, n)| (a.as_str(), n.as_str())),
+    );
+    let one = |family: Family, app: &str, short: String| -> View {
+        el("span")
+            .class("sh-walletbtn__one")
+            .child(chain_mark(family))
+            .child(el("span").class("sh-walletbtn__app").text(app.to_string()))
+            .child(el("span").class("sh-mono").text(short))
+            .into()
     };
     let both = evm.is_some() && solana.is_some();
+    let mut parts: Vec<View> = Vec::new();
+    if let Some((account, app)) = &evm {
+        parts.push(one(Family::Evm, app, short_hash(account)));
+    }
+    if both {
+        parts.push(
+            el("span")
+                .class("sh-walletbtn__sep")
+                .attr("aria-hidden", "true")
+                .text("·")
+                .into(),
+        );
+    }
+    if let Some((account, app)) = &solana {
+        parts.push(one(
+            Family::Solana,
+            app,
+            super::solana::exit::short(account),
+        ));
+    }
     on_click(
         el("button")
             .attr("type", "button")
             .class("sh-btn sh-btn-secondary sh-btn-sm sh-walletbtn")
-            .attr("aria-label", label)
+            .class_if(both, "sh-walletbtn--both")
+            .attr("aria-label", label.clone())
+            .attr("title", label)
             .attr("aria-haspopup", "dialog")
-            .child(lead)
-            .child(View::from(
-                both.then(|| tile("S").class("sh-walletbtn__also").into()),
-            )),
+            .children(parts),
         wallet_sheet,
     )
+}
+
+/// The account button's label: every connected wallet, by chain family,
+/// app and full address.
+fn account_label(evm: Option<(&str, &str)>, solana: Option<(&str, &str)>) -> String {
+    match (evm, solana) {
+        (Some((evm, evm_app)), Some((solana, solana_app))) => {
+            format!("Your wallets: EVM, {evm_app}, {evm}; Solana, {solana_app}, {solana}")
+        }
+        (Some((evm, app)), None) => format!("Your EVM wallet: {app}, {evm}"),
+        (None, Some((solana, app))) => format!("Your Solana wallet: {app}, {solana}"),
+        (None, None) => "Your wallets".to_string(),
+    }
 }
 
 /// The wallet sheet: each kind of wallet, its full address and Disconnect,
@@ -309,7 +415,8 @@ fn wallet_sheet() {
             Some(now),
             futures_signals::map_ref! {
                 let evm = session.connection.signal_cloned(),
-                let solana = solana.connection.signal_cloned() => (evm.clone(), solana.account())
+                let solana = solana.connection.signal_cloned(),
+                let _cluster = solana.network.signal_ref(Option::is_some) => (evm.clone(), solana.account())
             }
             .map(|(evm, solana)| {
                 // Nothing left connected: the sheet has nothing to list.
@@ -343,13 +450,59 @@ fn wallet_sheet() {
     });
 }
 
+/// A wallet section's heading: its chain family, its app and where it is.
+/// "EVM: MetaMask on Base Sepolia", "Solana: Phantom on devnet".
+pub fn sheet_heading(family: Family, app: Option<&str>, on: Option<&str>) -> String {
+    let family = match family {
+        Family::Evm => "EVM",
+        Family::Solana => "Solana",
+    };
+    match (app, on) {
+        (Some(app), Some(on)) => format!("{family}: {app} on {on}"),
+        (Some(app), None) => format!("{family}: {app}"),
+        (None, _) => format!("{family} wallet"),
+    }
+}
+
+/// The browser wallet to offer instead of the one connected for EVM: the
+/// one this browser used before it, if it is installed; or, where the EVM
+/// side of the connected Solana wallet's app took the slot, the first other
+/// EVM wallet installed.
+pub fn instead(
+    current: &WalletId,
+    current_app: &str,
+    solana_app: Option<&str>,
+    previous: Option<&WalletId>,
+    wallets: &[WalletOption],
+) -> Option<WalletOption> {
+    let installed = |id: &WalletId| {
+        wallets
+            .iter()
+            .find(|option| &option.id == id && option.detected)
+            .cloned()
+    };
+    if let Some(previous) = previous.filter(|previous| *previous != current)
+        && let Some(option) = installed(previous)
+    {
+        return Some(option);
+    }
+    if current.is_browser() && solana_app == Some(current_app) {
+        return wallets
+            .iter()
+            .find(|option| option.detected && &option.id != current && option.name != current_app)
+            .cloned();
+    }
+    None
+}
+
 /// The sheet's two sections, as the connections are now.
-fn sheet_body(evm: &Connection, solana: Option<chain::solana_ix::Pubkey>) -> View {
+fn sheet_body(evm: &Connection, solana: Option<Pubkey>) -> View {
     let session = crate::wallet::get();
-    let section = |title: &'static str, body: View| -> View {
+    let solana_session = crate::wallet::solana::get();
+    let section = |title: String, body: View| -> View {
         el("section")
             .class("sh-walletsheet__kind")
-            .child(el("h3").class("sh-label").text(title))
+            .child(el("h3").class("sh-walletsheet__title").text(title))
             .child(body)
             .into()
     };
@@ -375,58 +528,85 @@ fn sheet_body(evm: &Connection, solana: Option<chain::solana_ix::Pubkey>) -> Vie
         )
         .into()
     };
+    let solana_app = solana.map(|_| solana_session.app_name());
     let evm_part = match evm {
-        Connection::Connected { account, .. } => {
-            let name = session.wallet_name.get_cloned();
+        Connection::Connected {
+            account,
+            chain_id,
+            wallet,
+        } => {
+            let app = session.app_name();
+            let on = chain_id
+                .filter(|_| session.is_browser())
+                .map(networks::network_name);
+            let other = instead(
+                wallet,
+                &app,
+                solana_app.as_deref(),
+                crate::wallet::session::previous_wallet().as_ref(),
+                &session.wallets.lock_ref(),
+            );
+            section(
+                sheet_heading(Family::Evm, Some(&app), on.as_deref()),
+                View::Many(vec![
+                    crate::atoms::hash::hash(&format!("{account:?}"), None, "address").into(),
+                    el("div")
+                        .class("sh-walletsheet__actions")
+                        .child(disconnect("EVM", || crate::wallet::get().disconnect()))
+                        .child(View::from(other.map(|other| {
+                            on_click(
+                                Button::new(Kind::Secondary, format!("Use {} instead", other.name))
+                                    .size(Size::Small)
+                                    .build(),
+                                || {
+                                    crate::wallet::get().disconnect();
+                                    dialog::close();
+                                    open_connect();
+                                },
+                            )
+                            .into()
+                        })))
+                        .into(),
+                ]),
+            )
+        }
+        _ => section(
+            sheet_heading(Family::Evm, None, None),
             View::Many(vec![
                 el("p")
                     .class("sh-muted")
-                    .text(if name.is_empty() {
-                        "Connected".to_string()
-                    } else {
-                        format!("Connected with {name}")
-                    })
+                    .text("For agents whose vault is on an EVM chain.")
                     .into(),
-                crate::atoms::hash::hash(&format!("{account:?}"), None, "address").into(),
-                disconnect("EVM", || crate::wallet::get().disconnect()),
-            ])
-        }
-        _ => View::Many(vec![
-            el("p")
-                .class("sh-muted")
-                .text("For agents whose vault is on an EVM chain.")
-                .into(),
-            add("Connect an EVM wallet"),
-        ]),
+                add("Connect an EVM wallet"),
+            ]),
+        ),
     };
-    let solana_part = match solana {
-        Some(account) => {
-            let name = crate::wallet::solana::get().wallet_name.get_cloned();
+    let solana_part = match (solana, solana_app) {
+        (Some(account), Some(app)) => {
+            let cluster = solana_session
+                .network
+                .get_cloned()
+                .map(|network| network.cluster.clone());
+            section(
+                sheet_heading(Family::Solana, Some(&app), cluster.as_deref()),
+                View::Many(vec![
+                    crate::atoms::hash::hash(&account.to_string(), None, "address").into(),
+                    disconnect("Solana", || crate::wallet::solana::get().disconnect()),
+                ]),
+            )
+        }
+        _ => section(
+            sheet_heading(Family::Solana, None, None),
             View::Many(vec![
                 el("p")
                     .class("sh-muted")
-                    .text(if name.is_empty() {
-                        "Connected".to_string()
-                    } else {
-                        format!("Connected with {name}")
-                    })
+                    .text("For agents whose vault is on Solana.")
                     .into(),
-                crate::atoms::hash::hash(&account.to_string(), None, "address").into(),
-                disconnect("Solana", || crate::wallet::solana::get().disconnect()),
-            ])
-        }
-        None => View::Many(vec![
-            el("p")
-                .class("sh-muted")
-                .text("For agents whose vault is on Solana.")
-                .into(),
-            add("Connect a Solana wallet"),
-        ]),
+                add("Connect a Solana wallet"),
+            ]),
+        ),
     };
-    View::Many(vec![
-        section("EVM wallet", evm_part),
-        section("Solana wallet", solana_part),
-    ])
+    View::Many(vec![evm_part, solana_part])
 }
 
 /// Open the connect dialog (a sheet on phone).
@@ -730,7 +910,7 @@ fn evm_chains(
     if labels.is_empty() {
         "EVM chains".to_string()
     } else {
-        labels.join(", ")
+        format!("EVM: {}", labels.join(", "))
     }
 }
 
@@ -992,7 +1172,7 @@ mod tests {
         } else {
             SolConnection::SignedOut
         });
-        header_control().html()
+        header_control(&Route::Portfolio).html()
     }
 
     #[test]
@@ -1009,72 +1189,132 @@ mod tests {
                 "connected, the header never offers Connect beside an address: {html}"
             );
         }
-        let both = header_with(true, true);
-        assert!(both.contains("aria-label=\"Your wallets: 0x7e7e"), "{both}");
-        assert!(both.contains("sh-walletbtn__also"), "{both}");
         let solana = header_with(false, true);
-        assert!(solana.contains("aria-label=\"Solana wallet "), "{solana}");
+        assert!(
+            solana.contains("aria-label=\"Your Solana wallet: Development wallet, "),
+            "{solana}"
+        );
+        assert!(solana.contains(">SOL<"), "{solana}");
         let none = header_with(false, false);
         assert!(none.contains("Connect wallet"), "{none}");
         assert!(!none.contains("sh-walletbtn"), "{none}");
     }
 
-    /// The header's chip for a browser wallet on `chain_id`, where the app's
-    /// one vault chain is Base Sepolia.
-    fn chip_on(chain_id: u64) -> String {
-        let session = crate::wallet::get();
-        session.networks.lock_mut().insert(
-            shared::Chain::Base,
-            Rc::new(crate::wallet::Network {
-                chain: shared::Chain::Base,
-                chain_id: 84532,
-                label: "Base Sepolia".to_string(),
-                rpc: "https://sepolia.base.org".to_string(),
-                asset: alloy_primitives::Address::repeat_byte(0xdd),
-                asset_symbol: "USDC".to_string(),
-                asset_decimals: 6,
-                dev_account: None,
-            }),
+    #[test]
+    fn the_account_button_names_both_wallets_by_chain_app_and_address() {
+        let both = header_with(true, true);
+        let solana = chain::solana_ix::Pubkey::new_from_array([7; 32]).to_string();
+        // Both short addresses, each after its chain's mark, the EVM one
+        // first.
+        let evm_at = both.find(">EVM<").expect("the EVM mark");
+        let evm_short = both.find(">0x7e7e…7e7e<").expect("the EVM address");
+        let sol_at = both.find(">SOL<").expect("the Solana mark");
+        let sol_short = both
+            .find(&format!(
+                ">{}<",
+                crate::components::solana::exit::short(&solana)
+            ))
+            .expect("the Solana address");
+        assert!(
+            evm_at < evm_short && evm_short < sol_at && sol_at < sol_short,
+            "{both}"
         );
-        session.connection.set(Connection::Connected {
-            wallet: WalletId::Injected,
-            account: alloy_primitives::Address::repeat_byte(0x7e),
-            chain_id: Some(chain_id),
-        });
-        crate::wallet::solana::get()
-            .connection
-            .set(crate::wallet::solana::SolConnection::SignedOut);
-        header_control().html()
+        assert!(both.contains("sh-walletbtn--both"), "{both}");
+        // Its label names each wallet's family, app and full address.
+        assert_eq!(
+            account_label(Some(("0xb0b7", "MetaMask")), Some(("B16P", "Phantom"))),
+            "Your wallets: EVM, MetaMask, 0xb0b7; Solana, Phantom, B16P"
+        );
+        assert!(
+            both.contains(&format!(
+                "Your wallets: EVM, Development wallet, 0x{}; Solana, Development wallet, {solana}",
+                "7e".repeat(20)
+            )),
+            "{both}"
+        );
+        // The network chip of a local signer isn't drawn; a browser
+        // wallet's says it is the EVM wallet's when both are connected.
+        let chip = View::Many(vec![chip(84532, None, true)]).html();
+        assert!(chip.contains(">EVM<"), "{chip}");
+        assert!(
+            chip.contains("Your EVM wallet is on Base Sepolia"),
+            "{chip}"
+        );
     }
 
     #[test]
-    fn a_network_shonin_doesnt_use_is_named_and_marked_with_a_way_to_switch() {
-        let arbitrum = chip_on(42161);
-        assert!(arbitrum.contains(">Arbitrum One<"), "{arbitrum}");
-        assert!(!arbitrum.contains("chain 42161"), "{arbitrum}");
-        assert!(arbitrum.contains("sh-netchip--other"), "{arbitrum}");
-        assert!(arbitrum.contains("Not on Shonin"), "{arbitrum}");
-        assert!(arbitrum.contains("aria-haspopup=\"dialog\""), "{arbitrum}");
-        assert!(
-            arbitrum.contains("which isn’t one of Shonin’s networks"),
-            "{arbitrum}"
-        );
-        let unknown = chip_on(999_999);
-        assert!(unknown.contains(">Network 999999<"), "{unknown}");
-        assert!(unknown.contains("sh-netchip--other"), "{unknown}");
+    fn the_chip_is_neutral_where_the_page_acts_on_no_vault_and_cautions_only_on_another_vaults_chain()
+     {
+        let html = |on: u64, want: Option<u64>| View::Many(vec![chip(on, want, false)]).html();
+        // No vault on the page: a network Shonin doesn't use is just named.
         for (id, name) in [
-            (1, "Ethereum"),
-            (10, "Optimism"),
-            (137, "Polygon"),
-            (8453, "Base"),
+            (11155111, "Ethereum Sepolia"),
+            (42161, "Arbitrum One"),
+            (84532, "Base Sepolia"),
+            (999_999, "Network 999999"),
         ] {
-            assert_eq!(networks::network_name(id), name);
+            let chip = html(id, None);
+            assert!(chip.contains(&format!(">{name}<")), "{chip}");
+            assert!(!chip.contains("sh-netchip--other"), "{chip}");
+            assert!(!chip.contains("Not on Shonin"), "{chip}");
+            assert!(!chip.contains("isn’t one of"), "{chip}");
+            // The switch stays, quietly.
+            assert!(chip.contains("aria-haspopup=\"dialog\""), "{chip}");
         }
-        // Base mainnet is a vault chain, but not this app's: still marked.
-        assert!(chip_on(8453).contains("sh-netchip--other"));
-        let ours = chip_on(84532);
-        assert!(ours.contains(">Base Sepolia<"), "{ours}");
-        assert!(!ours.contains("sh-netchip--other"), "{ours}");
+        // A vault on Base Sepolia: a wallet there is fine, one elsewhere is
+        // cautioned.
+        assert!(!html(84532, Some(84532)).contains("sh-netchip--other"));
+        let elsewhere = html(11155111, Some(84532));
+        assert!(elsewhere.contains("sh-netchip--other"), "{elsewhere}");
+        assert!(
+            elsewhere.contains("this vault is on Base Sepolia"),
+            "{elsewhere}"
+        );
+        // Which pages act on a vault: the agent page, claims, manage and
+        // activate (and, by registering, the deposit and withdraw sheets and
+        // the publish flow once its chain is chosen). None of the others.
+        for route in [
+            Route::Agents { author: None },
+            Route::Portfolio,
+            Route::You,
+            Route::Status,
+            Route::Publish,
+        ] {
+            assert_eq!(route_slug(&route), None, "{route:?}");
+        }
+        assert_eq!(
+            route_slug(&Route::Claim {
+                slug: "base-2".to_string(),
+                id: 1
+            })
+            .as_deref(),
+            Some("base-2")
+        );
+        assert_eq!(
+            route_slug(&Route::Manage {
+                slug: "base-2".to_string()
+            })
+            .as_deref(),
+            Some("base-2")
+        );
+        // "Sepolia" is Ethereum's; Base Sepolia is Shonin's own.
+        assert_eq!(networks::network_name(11155111), "Ethereum Sepolia");
+        assert_eq!(networks::network_name(84532), "Base Sepolia");
+    }
+
+    #[test]
+    fn a_sheet_or_panel_acting_on_a_vault_sets_the_chips_chain_only_while_it_is_open() {
+        use std::task::{Context, Poll};
+        let last = || ACTING.with(|acting| acting.lock_ref().last().map(|(_, chain)| *chain));
+        assert_eq!(last(), None);
+        let mut held = Box::pin(acting_on(futures_signals::signal::always(Some(998))));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(held.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(held.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(last(), Some(998), "held while the element is on the page");
+        drop(held);
+        assert_eq!(last(), None, "gone with the element");
     }
 
     #[test]
@@ -1086,7 +1326,6 @@ mod tests {
         assert_eq!(switch_targets(None, &[84532, 998]), vec![84532, 998]);
         // A page chain the app doesn't read isn't offered.
         assert_eq!(switch_targets(Some(1), &[84532]), vec![84532]);
-        assert_eq!(ours(&[], 42161), None, "unknown until the chains are read");
     }
 
     #[test]
@@ -1099,6 +1338,82 @@ mod tests {
         assert!(html.contains("Connect an EVM wallet"), "{html}");
         assert!(html.contains("Disconnect the Solana wallet"), "{html}");
         assert!(!html.contains("Connect a Solana wallet"), "{html}");
+    }
+
+    #[test]
+    fn each_wallet_section_of_the_sheet_names_its_chain_family_app_and_network() {
+        assert_eq!(
+            sheet_heading(Family::Evm, Some("MetaMask"), Some("Base Sepolia")),
+            "EVM: MetaMask on Base Sepolia"
+        );
+        assert_eq!(
+            sheet_heading(Family::Solana, Some("Phantom"), Some("devnet")),
+            "Solana: Phantom on devnet"
+        );
+        assert_eq!(
+            sheet_heading(Family::Evm, Some("Development wallet"), None),
+            "EVM: Development wallet"
+        );
+        assert_eq!(sheet_heading(Family::Solana, None, None), "Solana wallet");
+    }
+
+    fn option(rdns: &str, name: &str, detected: bool) -> WalletOption {
+        WalletOption {
+            id: WalletId::Announced(rdns.to_string()),
+            name: name.to_string(),
+            icon: None,
+            detected,
+            install: None,
+        }
+    }
+
+    #[test]
+    fn another_app_in_the_evm_slot_is_offered_back_as_use_metamask_instead() {
+        let phantom = WalletId::Announced("app.phantom".to_string());
+        let metamask = WalletId::Announced("io.metamask".to_string());
+        let wallets = [
+            option("io.metamask", "MetaMask", true),
+            option("app.phantom", "Phantom", true),
+            option("io.rabby", "Rabby", false),
+        ];
+        // The one used before, installed: offered back.
+        assert_eq!(
+            instead(&phantom, "Phantom", None, Some(&metamask), &wallets).map(|o| o.name),
+            Some("MetaMask".to_string())
+        );
+        // Phantom's EVM side took the slot beside Phantom on Solana, with
+        // no record of what came before: the other installed EVM wallet.
+        assert_eq!(
+            instead(&phantom, "Phantom", Some("Phantom"), None, &wallets).map(|o| o.name),
+            Some("MetaMask".to_string())
+        );
+        // The same wallet as before, or one not installed: nothing offered.
+        assert_eq!(
+            instead(
+                &metamask,
+                "MetaMask",
+                Some("Phantom"),
+                Some(&metamask),
+                &wallets
+            ),
+            None
+        );
+        let rabby = WalletId::Announced("io.rabby".to_string());
+        assert_eq!(
+            instead(&metamask, "MetaMask", None, Some(&rabby), &wallets),
+            None
+        );
+        // A development or phrase wallet is never second-guessed.
+        assert_eq!(
+            instead(
+                &WalletId::Dev,
+                "Development wallet",
+                Some("Development wallet"),
+                None,
+                &wallets
+            ),
+            None
+        );
     }
 
     #[test]
