@@ -266,7 +266,13 @@ async fn watch(slug: String, load: Mutable<Load>) {
                         dominator::routing::go_to_url(&format!("/agents/{slug}"));
                         return;
                     }
-                    Ok(None) => {}
+                    // Not on the record yet (an agent activated moments
+                    // ago): waiting, never what a signed-out wallet sees.
+                    Ok(None) => {
+                        if !matches!(load.get_cloned(), Load::Ready(_)) {
+                            load.set(Load::Loading);
+                        }
+                    }
                     Err(why) => {
                         if !matches!(load.get_cloned(), Load::Ready(_)) {
                             load.set(Load::Failed(why));
