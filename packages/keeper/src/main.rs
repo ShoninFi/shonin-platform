@@ -590,12 +590,7 @@ async fn keep_vaults(
         };
         // The logs the decisions read, read on before them when due.
         if let (Some(now), Some(observed)) = (&snapshot, &step.observed) {
-            if previous
-                .as_ref()
-                .is_some_and(|before| !now.changed_since(before, &LOGGED).is_empty())
-            {
-                logs.want();
-            }
+            want_logs(&mut logs, previous.as_deref(), now, observed.number);
             match logs.scan(&mut follower, observed, started).await {
                 logs::Scanned::Idle => {}
                 logs::Scanned::Replaced { fork_at } => {
@@ -1561,18 +1556,36 @@ async fn tick(
     // first, for every vault whose window a send made now lands in, before
     // any vault's other sends take their blocks: each such vault's
     // valuation step, as its round would make it.
+    //
+    // A halted vault past its grace is closed by its round (its bill
+    // collected, then its station emptied and the vault valued and closed,
+    // in one go where it can be), so its whole round goes first, before the
+    // other vaults' valuation steps take the window's blocks.
     let ordered = window_first(client, &vaults);
     let windowed: Vec<Address> = ordered
         .iter()
         .copied()
         .take_while(|vault| in_window(client, vault))
         .collect();
-    for vault in windowed {
+    let (closing, running): (Vec<Address>, Vec<Address>) = windowed
+        .into_iter()
+        .partition(|vault| halted_past_grace(client, vault));
+    let steps = closing
+        .iter()
+        .map(|vault| (*vault, true))
+        .chain(running.into_iter().map(|vault| (vault, false)))
+        .chain(
+            ordered
+                .into_iter()
+                .filter(|vault| !closing.contains(vault))
+                .map(|vault| (vault, true)),
+        );
+    for (vault, whole_round) in steps {
         let remembered = memory.entry(vault).or_default();
-        window_step(client, keeper, vault, remembered).await;
-    }
-    for vault in ordered {
-        let remembered = memory.entry(vault).or_default();
+        if !whole_round {
+            window_step(client, keeper, vault, remembered).await;
+            continue;
+        }
         let done = keep_one(client, keeper, deployments, executor, vault, remembered).await;
         steps_worked(client.chain_id, vault, done.is_ok());
         let unkept = (client.chain_id, vault);
@@ -1657,6 +1670,38 @@ fn window_first(client: &Observed, vaults: &[Address]) -> Vec<Address> {
     let (first, rest): (Vec<Address>, Vec<Address>) =
         vaults.iter().partition(|vault| in_window(client, vault));
     first.into_iter().chain(rest).collect()
+}
+
+/// Have the log reader read on, when a look at block `number` shows a
+/// logged view changed since the look before, or follows a round read of
+/// the chain itself (no look to compare with): the change may be logged in
+/// the look's own block, so the reader reads on until that block is read.
+fn want_logs(
+    logs: &mut logs::LogReader,
+    previous: Option<&observed::Snapshot>,
+    now: &observed::Snapshot,
+    number: u64,
+) {
+    if previous.is_none_or(|before| !now.changed_since(before, &LOGGED).is_empty()) {
+        logs.want_through(number);
+    }
+}
+
+/// Whether the vault, read from an observation, halted and its grace is
+/// over: its round may close it.
+fn halted_past_grace(client: &Observed, vault: &Address) -> bool {
+    let Some(snapshot) = client.snapshot() else {
+        return false;
+    };
+    match (
+        client.peek(*vault, IStationVault::haltedAtCall {}),
+        client.peek(*vault, IStationVault::haltGraceCall {}),
+    ) {
+        (Some(Ok(halted)), Some(Ok(grace))) if halted != 0 => {
+            snapshot.timestamp >= halted.saturating_add(grace)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a valuation the vault sent now, read from an observation, would
@@ -6412,6 +6457,7 @@ mod stand_in;
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod holders_on_wake;
     mod refresh;
     mod round_memory;
     mod served;

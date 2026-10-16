@@ -67,6 +67,10 @@ pub struct LogReader {
     last_read: Option<Instant>,
     /// Whether the next look reads on, whatever the backstop.
     wanted: bool,
+    /// The block the reader stays wanted through: a look that showed a
+    /// change reads only to the block below it, so the change's own block is
+    /// read at a later look.
+    wanted_through: u64,
     /// Since when every read on has been left unchecked, while they are.
     unverified_since: Option<Instant>,
 }
@@ -87,6 +91,7 @@ impl LogReader {
             caught_up: false,
             last_read: None,
             wanted: true,
+            wanted_through: 0,
             unverified_since: None,
         }
     }
@@ -128,6 +133,13 @@ impl LogReader {
     /// Read on at the next look.
     pub fn want(&mut self) {
         self.wanted = true;
+    }
+
+    /// Read on at every look until the logs of block `block` are read: a
+    /// look at `block` reads only to the block below it.
+    pub fn want_through(&mut self, block: u64) {
+        self.wanted = true;
+        self.wanted_through = self.wanted_through.max(block);
     }
 
     fn due(&self, now: Instant) -> bool {
@@ -231,7 +243,7 @@ impl LogReader {
         self.unverified_since = None;
         self.logs.through = through;
         self.caught_up |= caught_up;
-        self.wanted = !caught_up;
+        self.wanted = !caught_up || through < self.wanted_through;
         self.last_read = Some(now);
     }
 

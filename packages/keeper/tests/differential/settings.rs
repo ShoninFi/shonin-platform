@@ -100,7 +100,7 @@ impl Profile {
     pub fn most_head_lag(block: BlockTime) -> Profile {
         let lag = match block {
             BlockTime::TwoSeconds => 30_000,
-            _ => SLOT_LEAD * 1_000 - block.millis() - 1,
+            _ => SLOT_LEAD * 1_000 - checked_millis(block) - 1,
         };
         Profile::new(
             "most head lag accepted",
@@ -113,7 +113,7 @@ impl Profile {
     /// exactly: `2 * (active + read budget) = slotLead +
     /// slotWindow - block interval`.
     pub fn two_observations_exactly(block: BlockTime) -> Profile {
-        let room = (SLOT_LEAD + SLOT_WINDOW) * 1_000 - block.millis();
+        let room = (SLOT_LEAD + SLOT_WINDOW) * 1_000 - checked_millis(block);
         let active = 2_000;
         let budget = room / 2 - active;
         let mut profile = Profile::new(
@@ -123,8 +123,8 @@ impl Profile {
                 ("read_budget_ms", budget),
             ],
             &format!(
-                "2 * ({active} + {budget}) = {room} ms = slotLead 5 s + slotWindow 3 s - a {} ms block",
-                block.millis()
+                "2 * ({active} + {budget}) = {room} ms = slotLead 5 s + slotWindow 3 s - a {} ms block, as the keeper measures it",
+                checked_millis(block)
             ),
         );
         if block == BlockTime::TwoSeconds && budget == 1_000 {
@@ -139,13 +139,13 @@ impl Profile {
     /// with a millisecond to spare: `head_lag_max_ms + block
     /// interval < slotLead`.
     pub fn bounded_head_exactly(block: BlockTime) -> Profile {
-        let lag = SLOT_LEAD * 1_000 - block.millis() - 1;
+        let lag = SLOT_LEAD * 1_000 - checked_millis(block) - 1;
         Profile::new(
             "head lag a millisecond inside the slot lead",
             vec![("head_lag_max_ms", lag)],
             &format!(
-                "head_lag_max_ms {lag} + a {} ms block = slotLead 5 s - 1 ms",
-                block.millis()
+                "head_lag_max_ms {lag} + a {} ms block, as the keeper measures it = slotLead 5 s - 1 ms",
+                checked_millis(block)
             ),
         )
     }
@@ -255,4 +255,10 @@ pub fn candidate_rpc_tables(config: &str, chain_id: u64, profile: &Profile) -> S
         }
     }
     text
+}
+
+/// The block interval the keeper's startup checks use: it measures block
+/// times in whole seconds, so a quarter-second block counts as one.
+fn checked_millis(block: BlockTime) -> u64 {
+    block.measured_seconds() * 1_000
 }
