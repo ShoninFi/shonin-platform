@@ -1556,36 +1556,18 @@ async fn tick(
     // first, for every vault whose window a send made now lands in, before
     // any vault's other sends take their blocks: each such vault's
     // valuation step, as its round would make it.
-    //
-    // A halted vault past its grace is closed by its round (its bill
-    // collected, then its station emptied and the vault valued and closed,
-    // in one go where it can be), so its whole round goes first, before the
-    // other vaults' valuation steps take the window's blocks.
     let ordered = window_first(client, &vaults);
     let windowed: Vec<Address> = ordered
         .iter()
         .copied()
         .take_while(|vault| in_window(client, vault))
         .collect();
-    let (closing, running): (Vec<Address>, Vec<Address>) = windowed
-        .into_iter()
-        .partition(|vault| halted_past_grace(client, vault));
-    let steps = closing
-        .iter()
-        .map(|vault| (*vault, true))
-        .chain(running.into_iter().map(|vault| (vault, false)))
-        .chain(
-            ordered
-                .into_iter()
-                .filter(|vault| !closing.contains(vault))
-                .map(|vault| (vault, true)),
-        );
-    for (vault, whole_round) in steps {
+    for vault in windowed {
         let remembered = memory.entry(vault).or_default();
-        if !whole_round {
-            window_step(client, keeper, vault, remembered).await;
-            continue;
-        }
+        window_step(client, keeper, vault, remembered).await;
+    }
+    for vault in ordered {
+        let remembered = memory.entry(vault).or_default();
         let done = keep_one(client, keeper, deployments, executor, vault, remembered).await;
         steps_worked(client.chain_id, vault, done.is_ok());
         let unkept = (client.chain_id, vault);
@@ -1684,23 +1666,6 @@ fn want_logs(
 ) {
     if previous.is_none_or(|before| !now.changed_since(before, &LOGGED).is_empty()) {
         logs.want_through(number);
-    }
-}
-
-/// Whether the vault, read from an observation, halted and its grace is
-/// over: its round may close it.
-fn halted_past_grace(client: &Observed, vault: &Address) -> bool {
-    let Some(snapshot) = client.snapshot() else {
-        return false;
-    };
-    match (
-        client.peek(*vault, IStationVault::haltedAtCall {}),
-        client.peek(*vault, IStationVault::haltGraceCall {}),
-    ) {
-        (Some(Ok(halted)), Some(Ok(grace))) if halted != 0 => {
-            snapshot.timestamp >= halted.saturating_add(grace)
-        }
-        _ => false,
     }
 }
 
@@ -4199,6 +4164,10 @@ async fn units(
     halted: u64,
     memory: &mut Memory,
 ) -> Result<bool> {
+    // The vault's units total is read every round, so every look holds it:
+    // its change is what tells a look that a holder took units, and the log
+    // that names them is read on (see `want_logs`).
+    let _ = client.read(vault, IVault::unitsCall {}).await;
     // The holders already known are served even if the log can't be read
     // this round.
     let read_to_head = match find_holders(client, vault, from_block, memory).await {
@@ -6457,9 +6426,9 @@ mod stand_in;
 #[cfg(test)]
 mod tests {
     use super::*;
-    mod holders_on_wake;
     mod refresh;
     mod round_memory;
+    mod round_order_and_logs;
     mod served;
 
     use std::sync::Arc;
@@ -8936,6 +8905,16 @@ mod tests {
         answers(node, VAULT, IStationVault::haltedAtCall {}, 0);
         answers(node, VAULT, IVault::homeStationCall {}, STATION);
         answers(node, STATION, IStation::specCall {}, a_spec(vec![]));
+        // No holder has taken units.
+        answers(
+            node,
+            VAULT,
+            IVault::unitsCall {},
+            IVault::unitsReturn {
+                total: U256::ZERO,
+                reserve: U256::ZERO,
+            },
+        );
         answers(node, VAULT, IVault::valuationCountCall {}, U256::ZERO);
         answers(node, VAULT, IStationVault::unsettledCall {}, false);
         answers(node, VAULT, IVault::claimCountCall {}, U256::ZERO);
@@ -12604,6 +12583,16 @@ mod tests {
         answers(node, VAULT, IStationVault::haltedAtCall {}, 0);
         answers(node, VAULT, IVault::homeStationCall {}, STATION);
         answers(node, STATION, IStation::specCall {}, a_spec(vec![local]));
+        // No holder has taken units.
+        answers(
+            node,
+            VAULT,
+            IVault::unitsCall {},
+            IVault::unitsReturn {
+                total: U256::ZERO,
+                reserve: U256::ZERO,
+            },
+        );
         answers(
             node,
             STATION,
