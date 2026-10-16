@@ -7,4 +7,5 @@ pub mod header;
 pub mod solana;
 pub mod strip;
 pub mod tabbar;
+pub mod testnet;
 pub mod wallet;

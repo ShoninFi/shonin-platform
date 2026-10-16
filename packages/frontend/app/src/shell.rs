@@ -1,7 +1,7 @@
-//! The frame every page sits in: the skip link, the header, the freshness
-//! bar, the page, the footer and the phone tab bar.
+//! The frame every page sits in: the skip link, the test-network line, the
+//! header, the freshness bar, the page, the footer and the phone tab bar.
 
-use crate::components::{footer, freshness, header, tabbar};
+use crate::components::{footer, freshness, header, tabbar, testnet};
 use crate::pages;
 use crate::route::Route;
 use crate::view::{El, View, el};
@@ -40,6 +40,7 @@ pub fn frame(route: &Route, page: pages::Page) -> El {
                 .attr("href", "#content")
                 .text("Skip to content"),
         )
+        .child(testnet::line())
         .child(header::header(route))
         .child(freshness::bar())
         .child(page.top.unwrap_or(View::Empty))

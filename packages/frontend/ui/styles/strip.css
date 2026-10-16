@@ -1,6 +1,7 @@
 /* The first-visit strip on /agents: slim, dismissible, never returns once
    dismissed. And the freshness bar: 36px under the header once figures fall
-   more than a minute behind. */
+   more than a minute behind. And the test-network line: one quiet sentence
+   above the header on a test-network build, scrolling away with the page. */
 .sh-strip { background: var(--paper-sunk); border-bottom: var(--border-hairline) solid var(--line); }
 .sh-strip__inner { display: flex; align-items: center; gap: var(--space-3); padding: 4px 0; }
 .sh-strip__inner > .sh-icon { color: var(--brand); }
@@ -22,3 +23,13 @@
 .sh-stalebar .sh-icon { color: var(--caution); }
 .sh-appheader + .sh-stalebar { position: sticky; top: 64px; z-index: 99; }
 @media (max-width: 599px) { .sh-appheader + .sh-stalebar { top: 56px; } }
+
+.sh-testnet { background: var(--paper-sunk); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-testnet__inner { display: flex; align-items: center; justify-content: center; gap: var(--space-2); padding: 6px 0; }
+.sh-testnet__inner > .sh-icon { flex: none; color: var(--ink-muted); }
+.sh-testnet p { min-width: 0; font: 400 13px/20px var(--font-sans); color: var(--ink); text-align: center; }
+@media (max-width: 599px) {
+  .sh-testnet__inner { align-items: flex-start; justify-content: flex-start; width: auto; margin: 0 var(--space-4); }
+  .sh-testnet__inner > .sh-icon { margin-top: 2px; }
+  .sh-testnet p { text-align: left; }
+}
