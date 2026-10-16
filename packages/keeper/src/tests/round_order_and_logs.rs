@@ -468,3 +468,144 @@ async fn holder_found_at_the_next_look() {
 async fn a_holder_who_took_units_is_found_at_the_next_look_from_the_round_s_own_reads() {
     holder_found_at_the_next_look().await;
 }
+
+/// The holder fixture (a holder takes units in block 20), looked at
+/// `heads` in turn after one live round, the logs read on as the chain's
+/// loop does; whether the holder is known after the last look.
+async fn holder_known_after(heads: &[(u64, u64)]) -> bool {
+    let node = stand_in::node(BETWEEN_SLOTS);
+    let holder = Address::repeat_byte(0x44);
+    an_open_vault_with_nothing_due(&node, BETWEEN_SLOTS);
+    let units_total = |total: u64| {
+        answers(
+            &node,
+            VAULT,
+            IVault::unitsCall {},
+            IVault::unitsReturn {
+                total: U256::from(total),
+                reserve: U256::ZERO,
+            },
+        );
+    };
+    units_total(0);
+    let client = connect_with_a_log(&node, VAULT, pro_rata_taken(VAULT, holder, 10, 20)).await;
+    let policy = RpcPolicy::default();
+    let mut follower = Follower::new(client.deref().clone(), policy.clone());
+    let mut reader = LogReader::new(1, &policy);
+    reader.watch(vec![VAULT, STATION]);
+    let learned = observed::Shared::default();
+    let mut memory = Memory {
+        daily_at: Some(BETWEEN_SLOTS),
+        ..Memory::default()
+    };
+    let live = Observed::live(client.deref().clone(), learned.clone());
+    keep_one(
+        &live,
+        KEEPER,
+        &deployments(),
+        "http://127.0.0.1:1",
+        VAULT,
+        &mut memory,
+    )
+    .await
+    .unwrap();
+    assert_eq!(live.sends(), 0);
+    let mut previous: Option<Arc<Snapshot>> = None;
+    for &(head, total) in heads {
+        {
+            let mut node = node.lock().unwrap();
+            node.head = head;
+            node.timestamp += 2;
+        }
+        units_total(total);
+        let (observed, snapshot) = look(&client, &learned, &node).await;
+        want_logs(&mut reader, previous.as_deref(), &snapshot, observed.number);
+        let scanned = reader.scan(&mut follower, &observed, Instant::now()).await;
+        assert!(
+            matches!(scanned, Scanned::Idle | Scanned::Read),
+            "the logs were not taken at block {head}: {scanned:?}"
+        );
+        let reads = served(&client, &learned, &snapshot, reader.view());
+        find_holders(&reads, VAULT, 1, &mut memory).await.unwrap();
+        previous = Some(snapshot);
+    }
+    memory.holders.contains(&holder)
+}
+
+/// The first served look after rounds that read the chain itself has no
+/// look to compare with: a holder who took units in that look's own block
+/// is still found at the next look.
+#[tokio::test]
+async fn a_holder_who_took_units_in_the_block_of_the_first_served_look_is_found_at_the_next_look() {
+    assert!(holder_known_after(&[(20, 10), (21, 10)]).await);
+}
+
+/// A reader wanted through a block asks the node for nothing more while the
+/// head stays at that block, reads the block once the head has passed it,
+/// and is then no longer due.
+#[tokio::test]
+async fn a_reader_wanted_through_a_block_asks_nothing_more_while_the_head_stays() {
+    let node = stand_in::node(BETWEEN_SLOTS);
+    let client = stand_in::connect(&node).await;
+    let policy = RpcPolicy::default();
+    let mut follower = Follower::new(client.deref().clone(), policy.clone());
+    let mut reader = LogReader::new(1, &policy);
+    reader.watch(vec![VAULT]);
+    let observed_at = |number: u64| follow::Observed {
+        endpoint: 0,
+        path: Path::ViewReads,
+        number,
+        timestamp: BETWEEN_SLOTS,
+        parent_hash: B256::ZERO,
+        hash: Some(B256::ZERO),
+        hashes: Default::default(),
+        zero: Vec::new(),
+        balances: Vec::new(),
+        items: Vec::new(),
+        wall_ms: 0,
+        gas_at_entry: None,
+        requests: 1,
+    };
+    let log_reads = || node.lock().unwrap().log_reads.len();
+    node.lock().unwrap().head = 20;
+    reader.want_through(20);
+    assert_eq!(
+        reader
+            .scan(&mut follower, &observed_at(20), Instant::now())
+            .await,
+        Scanned::Read
+    );
+    let asked = log_reads();
+    assert!(asked > 0, "the first look read no logs");
+    assert_eq!(reader.view().map(|view| view.through), Some(19));
+    for _ in 0..5 {
+        let scanned = reader
+            .scan(&mut follower, &observed_at(20), Instant::now())
+            .await;
+        assert!(
+            matches!(scanned, Scanned::Idle | Scanned::Read),
+            "{scanned:?}"
+        );
+    }
+    assert_eq!(
+        log_reads(),
+        asked,
+        "a stalled head was asked for logs again"
+    );
+    node.lock().unwrap().head = 21;
+    assert_eq!(
+        reader
+            .scan(&mut follower, &observed_at(21), Instant::now())
+            .await,
+        Scanned::Read
+    );
+    assert_eq!(reader.view().map(|view| view.through), Some(20));
+    assert_eq!(log_reads(), asked + 1, "block 20 was read in one request");
+    assert_eq!(
+        reader
+            .scan(&mut follower, &observed_at(21), Instant::now())
+            .await,
+        Scanned::Idle,
+        "block 20 is read: nothing more is wanted"
+    );
+}
