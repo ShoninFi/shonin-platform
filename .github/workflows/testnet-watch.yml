@@ -1,0 +1,53 @@
+# Every six hours, and on demand: whether the testnets can keep running
+# unattended for another week. It fails, so GitHub notifies whoever watches
+# the repository's scheduled runs, when any role's gas or a funder would run
+# out within a week at its recent rate, when the keeper has sent nothing on a
+# chain for over a day (it settles every vault daily), or when the API's
+# health check fails or a chain's reading has stalled.
+#
+# Public endpoints only, no secret. The accounts watched are the repository
+# variable TESTNET_WATCH (testnet addresses stay out of the repository; its
+# shape is in .github/scripts/testnet-watch.py). Public endpoints keep no
+# history, so each run's sample is carried to the next in the Actions cache,
+# and a rate is judged only once the history spans twelve hours.
+name: Testnet watch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testnet-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore the history
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: testnet-watch-history.json
+          key: testnet-watch-${{ github.run_id }}
+          restore-keys: testnet-watch-
+
+      - name: Gas, keeper and API
+        env:
+          TESTNET_WATCH: ${{ vars.TESTNET_WATCH }}
+        run: python3 .github/scripts/testnet-watch.py testnet-watch-history.json
+
+      - name: Keep the history
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: testnet-watch-history.json
+          key: testnet-watch-${{ github.run_id }}-${{ github.run_attempt }}
