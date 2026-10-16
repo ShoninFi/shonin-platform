@@ -105,9 +105,22 @@ async fn a_chain_whose_node_cannot_simulate_is_not_kept_and_is_said() {
     let rpc = serve_node(node.clone()).await;
     let keeper = start_keeper("cannot-simulate", &rpc, "http://127.0.0.1:1");
 
-    let health = keeper
-        .health_until(Duration::from_secs(20), |status| status != 200)
-        .await;
+    // The chain is "not connected" until the keeper's first check of it, which
+    // also answers 503: wait for the check's own answer.
+    let health = {
+        let started = std::time::Instant::now();
+        loop {
+            let health = keeper.health().await;
+            if health
+                .as_ref()
+                .is_some_and(|(_, said)| said.contains("can't simulate"))
+                || started.elapsed() >= Duration::from_secs(20)
+            {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
     tokio::time::sleep(Duration::from_secs(8)).await;
     let (rounds, sent) = {
         let locked = node.lock().unwrap();
