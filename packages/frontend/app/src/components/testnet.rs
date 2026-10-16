@@ -1,6 +1,6 @@
 //! The test-network line: one quiet sentence above the header on every page
-//! of a build that names a test network, saying that nothing here is real
-//! money and no result here is a track record. Not dismissible, and never on
+//! of a build that names a test network, saying that this is a beta, nothing
+//! here is real money, and anything here may be wiped. Not dismissible, and never on
 //! a build for a real network: the build decides, not the data.
 
 use ui::icons::Icon;
@@ -9,8 +9,7 @@ use crate::atoms::icon;
 use crate::view::{View, el};
 
 /// What the line says.
-pub const TEXT: &str =
-    "Test networks: nothing here is real money, and no result here is a track record.";
+pub const TEXT: &str = "Testnet beta: nothing here is real money, and agents, vaults and test tokens may be wiped at any time.";
 
 /// Whether this build shows the line: one that names a test network
 /// (`SHONIN_APP_NETWORK=testnet` or `local` at build time), a development
