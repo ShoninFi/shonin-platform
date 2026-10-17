@@ -14,7 +14,9 @@
 //! are from each other for that duty (or have been in any run recorded
 //! before at that block time), and no more. Each keeper reaches its anvil
 //! through a [`proxy::Proxy`] that counts its requests, and whose knobs can
-//! make the node misbehave.
+//! make the node misbehave. A run whose baseline leaves out a send the
+//! scenario is built to have made (`World::expected`) fails as not tested,
+//! however alike the keepers' sends are.
 //!
 //! The baseline binary is named by `SHONIN_BASELINE_KEEPER`; the candidate is
 //! this crate's keeper, or `SHONIN_CANDIDATE_KEEPER`'s (set it to the
@@ -150,6 +152,11 @@ pub async fn differs_no_more_than_the_baseline_with(
         .unwrap_or_else(|error| panic!("the run did not complete: {error:#}"));
     println!("{}", report.table);
     println!("tables, logs and counts: {}", report.out.display());
+    assert!(
+        report.comparison.missing.is_empty(),
+        "the baseline did not send what the scenario is built to test, so the run tested none of it: {:?}",
+        report.comparison.missing
+    );
     assert!(
         report.comparison.passed,
         "the candidate's sends differ from the baseline's beyond its own jitter; see the table above"
@@ -415,7 +422,9 @@ pub async fn run(block: BlockTime, profile: &Profile, faults: &[Fault]) -> Resul
     table.push_str(&comparison.table(&world));
     table.push_str(&format!(
         "\nverdict: {}\n",
-        if comparison.passed {
+        if !comparison.missing.is_empty() {
+            "NOT TESTED: the baseline did not send what the scenario expects"
+        } else if comparison.passed {
             "the candidate sends what the baseline sends"
         } else {
             "DIFFERENT"

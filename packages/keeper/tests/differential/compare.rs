@@ -339,6 +339,9 @@ pub struct Comparison {
     /// its first (measured this run, and the most recorded before), and the
     /// candidate's.
     pub duties: BTreeMap<&'static str, DutyBlocks>,
+    /// What the scenario expects the baseline to send that it sent too few
+    /// of (see `World::expected`): the run did not test it.
+    pub missing: Vec<String>,
     pub passed: bool,
 }
 
@@ -496,9 +499,26 @@ pub fn compare(
         }
         passed &= row.fault.is_none();
     }
+    // What the scenario is built to have sent must have been: otherwise
+    // the keepers agree only in leaving it out.
+    let mut missing = Vec::new();
+    for expected in &world.expected {
+        let sent = baseline
+            .iter()
+            .filter(|tx| describe(world, tx).label.starts_with(&expected.label))
+            .count();
+        if sent < expected.count {
+            missing.push(format!(
+                "{} ({}): the baseline sent {sent}, the scenario expects {}",
+                expected.label, expected.what, expected.count
+            ));
+        }
+    }
+    passed &= missing.is_empty();
     Comparison {
         rows,
         duties,
+        missing,
         passed,
     }
 }
@@ -588,6 +608,12 @@ impl Comparison {
             None => format!("{:>21}", "-"),
         };
         let mut text = String::new();
+        for missing in &self.missing {
+            let _ = writeln!(text, "NOT TESTED: {missing}");
+        }
+        if !self.missing.is_empty() {
+            let _ = writeln!(text);
+        }
         let _ = writeln!(
             text,
             "{:<26} {:<58} {:>21} {:>21} {:>21} {:>5} {:>5}  verdict",

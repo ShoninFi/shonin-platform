@@ -156,6 +156,18 @@ pub struct Noticed {
     pub at: u64,
 }
 
+/// Sends the scenario is built to make the baseline send, at least `count`
+/// times: a run whose baseline sends fewer no longer tests them (a stand-in
+/// the keeper can no longer read, say), however alike the keepers' sends are.
+#[derive(Clone, Debug)]
+pub struct Expected {
+    /// The sends it counts: those whose label starts with this.
+    pub label: String,
+    pub count: usize,
+    /// What the sends are, for the failure.
+    pub what: &'static str,
+}
+
 /// The executor's answer for a vault: a signed total and the time it was
 /// signed as of, or `None` for a 404.
 pub type Answer = Option<(U256, u64)>;
@@ -190,6 +202,8 @@ pub struct World {
     pub names: BTreeMap<Address, String>,
     pub executor: ExecutorScript,
     pub noticed: Vec<Noticed>,
+    /// What the baseline must send for the run to test what it is built to.
+    pub expected: Vec<Expected>,
     /// The vaults whose restricted list a `refreshRestricted` would add to,
     /// once: the drivers name more codes than it holds from the start. Every
     /// vault's does but V13's, listed last, so the keepers' first rounds send
@@ -391,6 +405,7 @@ impl World {
             names,
             executor: ExecutorScript::default(),
             noticed: Vec::new(),
+            expected: Vec::new(),
             restricted_grows: Vec::new(),
             costly_view: false,
             withheld: Vec::new(),
@@ -405,6 +420,7 @@ impl World {
             .collect();
         world.executor = world.executor_script(&keys);
         world.noticed = world.noticed_changes();
+        world.expected = world.expected_sends();
         world
     }
 
@@ -530,6 +546,25 @@ impl World {
             Noticed {
                 label: format!("{} revokeKey(plain, skipped key", station("V1")),
                 at: t.at(33),
+            },
+        ]
+    }
+
+    fn expected_sends(&self) -> Vec<Expected> {
+        vec![
+            // The close staged at t0+36 is proved and swept once its settle
+            // delay has passed, and delivered once its dollars have landed.
+            Expected {
+                label: format!("{} settleClose", self.name_of(self.vault("V11").station)),
+                count: 2,
+                what: "the staged close's proof and its delivery",
+            },
+            // Its money in a venue vault is reclaimed in the keepers' first
+            // rounds.
+            Expected {
+                label: format!("{} reclaim", self.name_of(self.vault("V11").station)),
+                count: 1,
+                what: "the venue vault's reclaim",
             },
         ]
     }

@@ -72,11 +72,17 @@ contract StandInDriver is Scripted, IDriver, IDelayedDriver {
 
     function exposure(address) external pure returns (int256[] memory) {}
 
+    function snapshot(address) external pure returns (int256[] memory) {}
+
     function ledger(address) external pure returns (int256) {}
 
     function closedPart(address, int256[] calldata, uint256, uint64) external pure returns (uint256, bool) {}
 
-    function measure(address, int256, int256[] calldata, uint256, uint256, uint16) external pure returns (int256) {}
+    function measure(address, int256, int256[] calldata, uint256, uint256, uint16)
+        external
+        pure
+        returns (int256, int256)
+    {}
 
     function deliveryWindow() external pure returns (uint64) {
         return 600;

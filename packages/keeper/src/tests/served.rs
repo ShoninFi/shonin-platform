@@ -187,7 +187,7 @@ async fn a_waiting_claim_read_from_observations_is_tried_in_the_same_slots_as_be
                     sweptBlock: 0,
                     window: 0,
                     delay: 0,
-                    provedBy: 0,
+                    provedBy: u64::MAX,
                     forVault: false,
                 },
             );
@@ -501,7 +501,7 @@ fn a_vault_wanting_a_valuation(
             sweptBlock: 0,
             window: 0,
             delay: 0,
-            provedBy: 0,
+            provedBy: u64::MAX,
             forVault: false,
         },
     );

@@ -24,7 +24,7 @@
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
-use chain::bindings::station::{IStation, IStationVault};
+use chain::bindings::station::{IStation, IStationVault, Stage};
 use chain::bindings::vault::{ClaimState, IVault, ValuationStatus, VaultState};
 
 use crate::observed::Observed;
@@ -307,27 +307,32 @@ pub fn dues(client: &Observed, vault: Address, memory: &Memory, out: &mut Dues) 
                 && let Some(Ok(stage)) = client.peek(station, IStation::stageCall {})
                 && stage.stagedAt != 0
             {
-                let placed = stage.stagedAt;
-                out.at(
-                    placed.saturating_add(stage.delay),
-                    "a staged close may be proved",
-                );
-                out.at(
-                    placed
-                        .saturating_add(stage.delay)
-                        .saturating_add(stage.window),
-                    "a staged close's proving window ends",
-                );
-                out.at(stage.provedBy, "a staged close's proving deadline passes");
-                if stage.sweptAt != 0 {
-                    out.at(
-                        stage.sweptAt.saturating_add(stage.window),
-                        "a staged close's delivery window ends",
-                    );
-                }
+                staged_close(&stage, out);
             }
         }
         _ => {}
+    }
+}
+
+/// A staged close's due times, as the station's `settleClose` takes them: it
+/// may first be proved once its settle delay has passed (wholly closed); a
+/// partly filled one once its window, counted from the stage, is over too;
+/// it lapses from its deadline; and once swept, the part that landed is
+/// delivered a window after the ask.
+fn staged_close(stage: &Stage, out: &mut Dues) {
+    let placed = stage.stagedAt;
+    let provable = placed.saturating_add(stage.delay);
+    out.at(provable, "a staged close may be proved");
+    out.at(
+        placed.saturating_add(stage.window).max(provable),
+        "a staged close's proving window ends",
+    );
+    out.at(stage.provedBy, "a staged close's proving deadline passes");
+    if stage.sweptAt != 0 {
+        out.at(
+            stage.sweptAt.saturating_add(stage.window),
+            "a staged close's delivery window ends",
+        );
     }
 }
 
@@ -603,5 +608,83 @@ mod tests {
         let start = Instant::now();
         let next = next(&dues, 2, ACTIVE, NOTICE, start, start, |_| None);
         assert!(within(next.at - start, 2));
+    }
+
+    fn stage(staged_at: u64, swept_at: u64) -> Stage {
+        Stage {
+            fraction: U256::from(1u64),
+            owed: U256::ZERO,
+            estimate: U256::ZERO,
+            fetched: U256::ZERO,
+            cost: U256::ZERO,
+            part: U256::ZERO,
+            arrivedAt: U256::ZERO,
+            stagedAt: staged_at,
+            stagedBlock: 1,
+            sweptAt: swept_at,
+            sweptBlock: u64::from(swept_at != 0),
+            window: 600,
+            delay: 6,
+            provedBy: staged_at + 2 * 600,
+            forVault: false,
+        }
+    }
+
+    #[test]
+    fn a_staged_close_is_looked_at_when_it_may_be_proved_when_its_window_ends_and_at_its_deadline()
+    {
+        let mut dues = Dues {
+            head: 1_000_000,
+            ..Dues::default()
+        };
+        staged_close(&stage(1_000_000, 0), &mut dues);
+        // A partly filled close is proved once the window from the stage is
+        // over, with no settle delay on top.
+        assert_eq!(
+            dues.chain,
+            vec![
+                (1_000_006, "a staged close may be proved"),
+                (1_000_600, "a staged close's proving window ends"),
+                (1_001_200, "a staged close's proving deadline passes"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_staged_close_s_window_never_ends_before_its_settle_delay() {
+        let mut dues = Dues {
+            head: 1_000_000,
+            ..Dues::default()
+        };
+        let mut staged = stage(1_000_000, 0);
+        staged.window = 4;
+        staged.provedBy = 1_000_008;
+        staged_close(&staged, &mut dues);
+        assert_eq!(
+            dues.chain,
+            vec![
+                (1_000_006, "a staged close may be proved"),
+                (1_000_006, "a staged close's proving window ends"),
+                (1_000_008, "a staged close's proving deadline passes"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_swept_staged_close_is_looked_at_when_its_delivery_window_ends() {
+        let mut dues = Dues {
+            head: 1_000_700,
+            ..Dues::default()
+        };
+        staged_close(&stage(1_000_000, 1_000_650), &mut dues);
+        // Its proving times have passed; its deadline and the delivery
+        // window's end are ahead.
+        assert_eq!(
+            dues.chain,
+            vec![
+                (1_001_200, "a staged close's proving deadline passes"),
+                (1_001_250, "a staged close's delivery window ends"),
+            ]
+        );
     }
 }

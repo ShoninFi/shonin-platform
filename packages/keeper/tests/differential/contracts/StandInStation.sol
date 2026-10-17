@@ -18,8 +18,9 @@ import {Scripted} from "./Scripted.sol";
 /// `approvedKey`/driver, `reclaimed`/driver, `heldInCount`/driver,
 /// `heldIn`/driver/i, `stopped`, `stoppedAt`, `stoppedBand`, `value.mark`,
 /// `value.exit`, `value.burn` (hashes `value()` spends first), `outsideBand`, `unwind.blocked`, `stage.*` (each field of
-/// `Stage`), `stage.deliverAfter` (how long after its sweep a staged close
-/// may be delivered).
+/// `Stage`; `stage.provedBy` unscripted is two windows after the stage, as
+/// the station sets it), `stage.deliverAfter` (how long after its sweep a
+/// staged close may be delivered).
 contract StandInStation is Scripted, IStation {
     /// The key still stands: its blessing for the vault holds, it is an
     /// executor's, its driver trades, and the station runs.
@@ -80,13 +81,19 @@ contract StandInStation is Scripted, IStation {
         emit Unwound(fraction, sentHome, blocked);
     }
 
-    /// Prove and sweep the staged close once its settle delay has passed;
-    /// deliver it once `stage.deliverAfter` has passed since the sweep.
+    /// Prove and sweep the staged close once its settle delay has passed, or
+    /// end it, unpaid, from its deadline on; deliver it once
+    /// `stage.deliverAfter` has passed since the sweep.
     function settleClose() external {
         uint256 stagedAt = _get("stage.stagedAt");
         if (stagedAt == 0) revert Nothing();
         if (_get("stage.sweptBlock") == 0) {
             if (block.timestamp < stagedAt + _get("stage.delay")) revert NotYet();
+            if (block.timestamp >= _provedBy()) {
+                _set("stage.stagedAt", 0);
+                emit CloseLapsed(_get("stage.fraction"));
+                return;
+            }
             _set("stage.sweptAt", block.timestamp);
             _set("stage.sweptBlock", block.number);
             emit CloseSwept(_get("stage.fraction"), 0, 0);
@@ -197,7 +204,17 @@ contract StandInStation is Scripted, IStation {
         s.sweptBlock = uint64(_get("stage.sweptBlock"));
         s.window = uint64(_get("stage.window"));
         s.delay = uint64(_get("stage.delay"));
+        s.provedBy = _provedBy();
         s.forVault = _get("stage.forVault") != 0;
+    }
+
+    /// The staged close's deadline: as scripted, or two windows after the
+    /// stage; zero with nothing staged.
+    function _provedBy() private view returns (uint64) {
+        uint256 stagedAt = _get("stage.stagedAt");
+        if (stagedAt == 0) return 0;
+        uint256 scripted = _get("stage.provedBy");
+        return uint64(scripted != 0 ? scripted : stagedAt + 2 * _get("stage.window"));
     }
 
     function isHome() external pure returns (bool) {
