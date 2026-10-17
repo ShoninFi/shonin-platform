@@ -317,8 +317,8 @@ pub fn dues(client: &Observed, vault: Address, memory: &Memory, out: &mut Dues) 
 /// A staged close's due times, as the station's `settleClose` takes them: it
 /// may first be proved once its settle delay has passed (wholly closed); a
 /// partly filled one once its window, counted from the stage, is over too;
-/// it lapses from its deadline; and once swept, the part that landed is
-/// delivered a window after the ask.
+/// unswept, it lapses from its deadline; and once swept, the part that
+/// landed is delivered a window after the ask (a swept close never lapses).
 fn staged_close(stage: &Stage, out: &mut Dues) {
     let placed = stage.stagedAt;
     let provable = placed.saturating_add(stage.delay);
@@ -327,8 +327,9 @@ fn staged_close(stage: &Stage, out: &mut Dues) {
         placed.saturating_add(stage.window).max(provable),
         "a staged close's proving window ends",
     );
-    out.at(stage.provedBy, "a staged close's proving deadline passes");
-    if stage.sweptAt != 0 {
+    if stage.sweptAt == 0 {
+        out.at(stage.provedBy, "a staged close's proving deadline passes");
+    } else {
         out.at(
             stage.sweptAt.saturating_add(stage.window),
             "a staged close's delivery window ends",
@@ -677,14 +678,11 @@ mod tests {
             ..Dues::default()
         };
         staged_close(&stage(1_000_000, 1_000_650), &mut dues);
-        // Its proving times have passed; its deadline and the delivery
-        // window's end are ahead.
+        // Its proving times have passed, and a swept close never lapses:
+        // only the delivery window's end is ahead.
         assert_eq!(
             dues.chain,
-            vec![
-                (1_001_200, "a staged close's proving deadline passes"),
-                (1_001_250, "a staged close's delivery window ends"),
-            ]
+            vec![(1_001_250, "a staged close's delivery window ends")]
         );
     }
 }

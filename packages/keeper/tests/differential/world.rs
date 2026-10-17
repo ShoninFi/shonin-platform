@@ -550,6 +550,18 @@ impl World {
         ]
     }
 
+    /// The staged close's expected sends when it lapses before the keepers
+    /// first look: one settle, which ends it.
+    pub fn expect_the_staged_close_to_lapse(&mut self) {
+        let settle = format!("{} settleClose", self.name_of(self.vault("V11").station));
+        for expected in &mut self.expected {
+            if expected.label == settle {
+                expected.count = 1;
+                expected.what = "the staged close's lapse at its deadline";
+            }
+        }
+    }
+
     fn expected_sends(&self) -> Vec<Expected> {
         vec![
             // The close staged at t0+36 is proved and swept once its settle

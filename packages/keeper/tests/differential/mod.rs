@@ -230,6 +230,15 @@ pub async fn run(block: BlockTime, profile: &Profile, faults: &[Fault]) -> Resul
     if faults.contains(&Fault::CostlyView) {
         world.costly_view = true;
     }
+    // A clock that runs fast from the keepers' start passes the staged
+    // close's proving deadline before they first look: its first settle ends
+    // it unpaid, and nothing is proved or delivered.
+    if faults
+        .iter()
+        .any(|fault| matches!(fault, Fault::FastClock(_)))
+    {
+        world.expect_the_staged_close_to_lapse();
+    }
     for fault in faults {
         if let Fault::LogWithheld { at, until } = fault {
             world.late_holder = Some(timing.at(*at));
