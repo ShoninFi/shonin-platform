@@ -98,7 +98,7 @@ async fn a_replaced_factory_whose_vaults_cannot_be_listed_still_has_them_kept() 
     let keeper = start_keeper("old-factory-unlisted", &rpc, &executor);
 
     let refused = keeper
-        .health_until(Duration::from_secs(60), |status| status == 503)
+        .health_saying(Duration::from_secs(60), "bills refused")
         .await;
     assert!(
         refused

@@ -1,0 +1,297 @@
+{
+  "Vault": {
+    "length": 17821,
+    "normalized_hash": "0xda5ba97fec95d9b0b6cbc821c25dd577d2ffce77b42a14a6f774aebd904ba39d",
+    "masks": [
+      {
+        "role": "Claims",
+        "start": 2190,
+        "length": 20
+      },
+      {
+        "role": "Claims",
+        "start": 2749,
+        "length": 20
+      },
+      {
+        "role": "Claims",
+        "start": 4956,
+        "length": 20
+      },
+      {
+        "role": "Claims",
+        "start": 6831,
+        "length": 20
+      },
+      {
+        "role": "Claims",
+        "start": 14747,
+        "length": 20
+      },
+      {
+        "role": "Posts",
+        "start": 3354,
+        "length": 20
+      },
+      {
+        "role": "Posts",
+        "start": 8829,
+        "length": 20
+      },
+      {
+        "role": "Posts",
+        "start": 9156,
+        "length": 20
+      },
+      {
+        "role": "Posts",
+        "start": 10865,
+        "length": 20
+      },
+      {
+        "role": "Posts",
+        "start": 14543,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 1289,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 1787,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 1944,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 2075,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 2412,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 2634,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 3041,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 3639,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 3860,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 4461,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 5062,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 5269,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 5509,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 6982,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 7293,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 7452,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 8230,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 8367,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 9264,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 9352,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 10327,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 10514,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 10620,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 10742,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 11425,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 11576,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 11964,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 13078,
+        "length": 20
+      },
+      {
+        "role": "Upkeep",
+        "start": 14294,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 1450,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 1643,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 2519,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 3574,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 4577,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 5615,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 6714,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 7150,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 7533,
+        "length": 20
+      },
+      {
+        "role": "Valuations",
+        "start": 11838,
+        "length": 20
+      }
+    ]
+  },
+  "Upkeep": {
+    "length": 22904,
+    "normalized_hash": "0xb58ddb818ecda11e4aa73ea339bae913d1bed3a77b6e49c528cc7f1271449ebe",
+    "masks": [
+      {
+        "role": "self",
+        "start": 7,
+        "length": 32
+      }
+    ]
+  },
+  "Claims": {
+    "length": 13385,
+    "normalized_hash": "0xb90b9e7b4522f685208dd3b8c273b7eb3c67ac9028dab8dde7e9720ae6913092",
+    "masks": [
+      {
+        "role": "self",
+        "start": 7,
+        "length": 32
+      }
+    ]
+  },
+  "Posts": {
+    "length": 8672,
+    "normalized_hash": "0x2083551241d999012323ef855d7296d74e06b341da7ef829caed0cf7416a0998",
+    "masks": [
+      {
+        "role": "self",
+        "start": 7,
+        "length": 32
+      }
+    ]
+  },
+  "Valuations": {
+    "length": 20591,
+    "normalized_hash": "0xebc9d35e85700bef4fcb8c13c058f22ca00e4fff0e728c1a945097ab9e0d680f",
+    "masks": [
+      {
+        "role": "self",
+        "start": 7,
+        "length": 32
+      }
+    ]
+  }
+}

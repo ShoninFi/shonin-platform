@@ -162,6 +162,9 @@ pub struct Client {
     log_endpoints: Endpoints,
     /// The most blocks one log query may span, both ends included.
     log_range: Option<u64>,
+    /// Whether log queries go to the `rpc` endpoints (no `logs_rpc`), so an
+    /// `rpc` endpoint's place in its list is its place in `log_endpoints`.
+    logs_share_rpc: bool,
     /// The `rpc` endpoints, each on its own: for sends, and for reads pinned
     /// to a past block, which only an endpoint that honours the block
     /// answers.
@@ -1287,6 +1290,37 @@ fn rate_limited(error: &alloy::transports::TransportError) -> bool {
     }
 }
 
+/// Whether a request's failure is the endpoint turning it away for now
+/// rather than not answering at all: a rate limit, however it arrived
+/// ([`rate_limited`]), or an HTTP server error (a 5xx status). The endpoint
+/// is there and did nothing with the request; asked again later, it may
+/// answer.
+pub(crate) fn turned_away(error: &alloy::transports::TransportError) -> bool {
+    use alloy::transports::RpcError;
+    rate_limited(error)
+        || matches!(
+            error,
+            RpcError::Transport(kind) if kind.as_http_error().is_some_and(|http| http.status >= 500)
+        )
+}
+
+/// [`turned_away`], for a failure carried only as its text (as
+/// `follow::capabilities::CallError` carries one): a rate limit's wording,
+/// or an HTTP error whose status is 429 or 5xx, as the transport writes it.
+pub(crate) fn turned_away_text(text: &str) -> bool {
+    if text.contains(RATE_LIMITED) || is_rate_limit(0, text) {
+        return true;
+    }
+    text.match_indices("HTTP error ").any(|(at, prefix)| {
+        let rest = &text[at + prefix.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        rest[digits.len()..].starts_with(" with")
+            && digits
+                .parse::<u16>()
+                .is_ok_and(|status| status == 429 || (500..600).contains(&status))
+    })
+}
+
 /// What became of a transaction handed to a list's endpoints.
 enum Handed {
     /// Taken, or it may have been: watched for by its hash.
@@ -1646,6 +1680,10 @@ impl Client {
             ),
             Signing::ReadOnly => (Vec::new(), None),
         };
+        let logs_share_rpc = config
+            .logs_rpc
+            .as_deref()
+            .is_none_or(|list| list.trim().is_empty());
         let (logs, log_endpoints) = match config
             .logs_rpc
             .as_deref()
@@ -1672,6 +1710,7 @@ impl Client {
             logs,
             log_endpoints,
             log_range: config.log_range,
+            logs_share_rpc,
             endpoints,
             signing: signing_provider,
             label: config.label.clone(),
@@ -2306,6 +2345,50 @@ impl Client {
     /// and its logs may come from different ones: the check is exact per
     /// endpoint, not per node behind it.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
+        let windows = self
+            .logs_with(
+                filter,
+                Heads::new(self.log_endpoints.each.len()),
+                Ends::Unread,
+            )
+            .await?;
+        Ok(windows.into_iter().flat_map(|window| window.logs).collect())
+    }
+
+    /// The logs `filter` matches over its numbered range, read as
+    /// [`Client::logs`] reads them, window by window, each with the hash its
+    /// last block has on the branch of the endpoint that answered it: that
+    /// endpoint's header for the block, read just after the window's logs.
+    /// A window's logs are then known to be that branch's, whatever list or
+    /// endpoint gave them, and the caller compares the hash with the branch
+    /// it follows: a log that branch has and the endpoint's has not is
+    /// otherwise simply absent.
+    ///
+    /// When the caller has just seen `rpc` endpoint `seen.0` (its place in
+    /// the list, from [`Client::each_endpoint`]) at block `seen.1`, that
+    /// endpoint is asked first and not asked for its head again for a
+    /// window ending at or below that block. A window it answers is still
+    /// given its end's hash as it has it just after the logs: the endpoint
+    /// may have moved to another branch since the caller saw it. Every
+    /// other endpoint is still asked for its head before it reads a window.
+    /// When log queries go to `logs_rpc`, `seen` names another list and is
+    /// not used.
+    pub async fn logs_by_window(
+        &self,
+        filter: &Filter,
+        seen: Option<(usize, u64)>,
+    ) -> Result<Vec<LogWindow>> {
+        let heads = Heads::new(self.log_endpoints.each.len());
+        let seen =
+            seen.filter(|(at, _)| self.logs_share_rpc && *at < self.log_endpoints.each.len());
+        if let Some((at, head)) = seen {
+            heads.saw(at, head);
+            self.log_endpoints.answered(at);
+        }
+        self.logs_with(filter, heads, Ends::Read).await
+    }
+
+    async fn logs_with(&self, filter: &Filter, heads: Heads, ends: Ends) -> Result<Vec<LogWindow>> {
         use alloy::eips::BlockNumberOrTag;
         use alloy::rpc::types::FilterBlockOption;
         let from = filter.get_from_block();
@@ -2317,7 +2400,6 @@ impl Client {
                 ..
             }
         );
-        let heads = Heads::new(self.log_endpoints.each.len());
         if self.log_range.is_some() && from.is_some() && to_the_head {
             to = Some(
                 logs_head(&self.log_endpoints, &heads)
@@ -2326,14 +2408,23 @@ impl Client {
             );
         }
         let Some((from, to)) = from.zip(to).filter(|(from, to)| from <= to) else {
-            return self.logs.get_logs(filter).await.context("reading logs");
+            if matches!(ends, Ends::Read) {
+                bail!("logs are read by window only over a numbered range");
+            }
+            let logs = self.logs.get_logs(filter).await.context("reading logs")?;
+            return Ok(vec![LogWindow {
+                from: from.unwrap_or_default(),
+                to: to.unwrap_or_default(),
+                logs,
+                end_hash: None,
+            }]);
         };
 
         let mut windows = LogWindows::new(from, to, self.log_range);
         let mut running = tokio::task::JoinSet::new();
         // Windows read but not yet handed on, because an earlier one hasn't
         // come back yet: at most the number in flight.
-        let mut read: std::collections::BTreeMap<usize, Vec<Log>> = Default::default();
+        let mut read: std::collections::BTreeMap<usize, LogWindow> = Default::default();
         let (mut started, mut handed_on) = (0usize, 0usize);
         let mut found = Vec::new();
         loop {
@@ -2345,10 +2436,34 @@ impl Client {
                 let window = filter.clone();
                 let index = started;
                 running.spawn(async move {
-                    (
-                        index,
-                        read_window(&endpoints, &heads, &window, from, to).await,
-                    )
+                    let read = match read_window(&endpoints, &heads, &window, from, to).await {
+                        Ok((logs, at)) => match ends {
+                            Ends::Read => {
+                                end_hash(&endpoints.each[at].provider, to)
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "block {to} on log endpoint {}, which gave the logs from block {from}",
+                                            at + 1
+                                        )
+                                    })
+                                    .map(|hash| LogWindow {
+                                        from,
+                                        to,
+                                        logs,
+                                        end_hash: Some(hash),
+                                    })
+                            }
+                            Ends::Unread => Ok(LogWindow {
+                                from,
+                                to,
+                                logs,
+                                end_hash: None,
+                            }),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    (index, read)
                 });
                 started += 1;
             }
@@ -2360,8 +2475,8 @@ impl Client {
             // A window that failed fails the whole read; the rest are
             // stopped as the set is dropped.
             read.insert(index, logs?);
-            while let Some(logs) = read.remove(&handed_on) {
-                found.extend(logs);
+            while let Some(window) = read.remove(&handed_on) {
+                found.push(window);
                 handed_on += 1;
             }
         }
@@ -3292,8 +3407,45 @@ enum Passed {
     Over(anyhow::Error),
 }
 
+/// One window of a log read ([`Client::logs_by_window`]).
+#[derive(Clone, Debug)]
+pub struct LogWindow {
+    pub from: u64,
+    pub to: u64,
+    /// The logs in `from..=to`.
+    pub logs: Vec<Log>,
+    /// The hash of block `to` as the endpoint that answered the window gave
+    /// it, read there just after the logs. Every window of
+    /// [`Client::logs_by_window`] has it.
+    pub end_hash: Option<B256>,
+}
+
+/// Whether a log read also reads each window's last block on the endpoint
+/// that answered it, every window and every endpoint alike.
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+    Unread,
+    Read,
+}
+
+/// The hash of block `number` on `endpoint`'s branch.
+async fn end_hash(endpoint: &DynProvider, number: u64) -> Result<B256> {
+    let block = endpoint
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(number))
+        .await
+        .context("reading the header")?
+        .ok_or_else(|| anyhow!("the endpoint has no block {number}"))?;
+    if block.header.number != number {
+        bail!(
+            "asked for block {number}, the endpoint gave block {}",
+            block.header.number
+        );
+    }
+    Ok(block.header.hash)
+}
+
 /// The logs `filter` matches from `from` to `to`, read whole by an endpoint
-/// that had reached `to` ([`Client::logs`]).
+/// that had reached `to` ([`Client::logs`]), and which endpoint that was.
 ///
 /// Endpoints of one list may cap a log query's width very differently, so
 /// the window goes first to those not known to refuse it whole, and an
@@ -3310,7 +3462,7 @@ async fn read_window(
     filter: &Filter,
     from: u64,
     to: u64,
-) -> Result<Vec<Log>> {
+) -> Result<(Vec<Log>, usize)> {
     let mut last = None;
     let mut behind_tries = 0;
     let mut limits = RateLimits::default();
@@ -3371,7 +3523,7 @@ async fn read_window(
             match read_range(endpoint, filter, from, to, parts).await {
                 Ok(logs) => {
                     endpoints.answered(at);
-                    return Ok(logs);
+                    return Ok((logs, at));
                 }
                 Err(Passed::TooWide(error)) => {
                     too_wide = true;
@@ -4074,5 +4226,32 @@ mod tests {
         let refused =
             anyhow::Error::new(Reverted).context("the registry would not take the registration");
         assert!(!node_trouble(&refused));
+    }
+
+    #[test]
+    fn a_request_turned_away_is_told_from_one_never_answered() {
+        use alloy::transports::TransportErrorKind;
+        for status in [429, 500, 502, 503, 504] {
+            let error = TransportErrorKind::http_error(status, "try again later".into());
+            assert!(turned_away(&error), "{status}");
+            assert!(turned_away_text(&error.to_string()), "{status}");
+            let empty = TransportErrorKind::http_error(status, String::new());
+            assert!(turned_away_text(&empty.to_string()), "{status}");
+        }
+        for status in [400, 401, 403, 404] {
+            let error = TransportErrorKind::http_error(status, "no".into());
+            assert!(!turned_away(&error), "{status}");
+            assert!(!turned_away_text(&error.to_string()), "{status}");
+        }
+        assert!(turned_away(&TransportErrorKind::custom_str(RATE_LIMITED)));
+        assert!(turned_away_text(RATE_LIMITED));
+        assert!(turned_away_text(
+            "no answer: 25/second request limit reached"
+        ));
+        let unanswered =
+            TransportErrorKind::custom_str("error sending request: connection refused");
+        assert!(!turned_away(&unanswered));
+        assert!(!turned_away_text(&unanswered.to_string()));
+        assert!(!turned_away_text("operation timed out"));
     }
 }

@@ -131,7 +131,8 @@ async fn main() -> Result<()> {
         connections.expected.clone(),
         args.store.clone(),
         args.builder_url.clone(),
-    );
+    )
+    .with_service_rpc_policy(connections.service_rpc_policy.clone())?;
     if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
         indexer = indexer.with_store_url(url);
     }

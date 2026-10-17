@@ -17,6 +17,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use shared::Chain;
 
+use crate::rpc_policy::{RpcPolicies, RpcPolicy, ServiceRpcPolicy};
+
 /// What kind of chain it is, which decides how it is spoken to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChainKind {
@@ -314,6 +316,7 @@ impl Network {
 pub struct ChainConfigs {
     chains: BTreeMap<ChainKey, ChainConfig>,
     networks: BTreeMap<NetworkName, Network>,
+    rpc: RpcPolicies,
 }
 
 /// The file, as written.
@@ -323,6 +326,9 @@ struct File {
     chains: BTreeMap<String, ChainConfig>,
     #[serde(default)]
     networks: BTreeMap<String, BTreeMap<String, String>>,
+    /// The checked-in defaults and no overrides when absent.
+    #[serde(default)]
+    rpc: RpcPolicies,
 }
 
 impl ChainConfigs {
@@ -444,7 +450,35 @@ impl ChainConfigs {
             );
         }
 
-        Ok(Self { chains, networks })
+        // The RPC settings: the service polls, the defaults, and each
+        // chain's overrides, which must name a configured chain.
+        let rpc = file.rpc;
+        rpc.service.validate()?;
+        rpc.defaults.validate("defaults")?;
+        for key in rpc.chains.keys() {
+            if !chains.contains_key(key) {
+                return Err(ConfigError::new(format!(
+                    "RPC settings name {key}, which has no chain configuration"
+                )));
+            }
+            rpc.for_chain(key).validate(&key.to_string())?;
+        }
+
+        Ok(Self {
+            chains,
+            networks,
+            rpc,
+        })
+    }
+
+    /// The RPC defaults with only this chain's overrides applied.
+    pub fn rpc_policy(&self, key: &ChainKey) -> RpcPolicy {
+        self.rpc.for_chain(key)
+    }
+
+    /// The process-wide polls, which no chain overrides.
+    pub fn service_rpc_policy(&self) -> &ServiceRpcPolicy {
+        &self.rpc.service
     }
 
     /// Read the file at `path`, with overrides from the process environment.
@@ -495,7 +529,7 @@ impl ChainConfigs {
 pub struct ConfigError(String);
 
 impl ConfigError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }

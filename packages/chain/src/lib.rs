@@ -20,11 +20,14 @@ pub mod config;
 pub mod deployments;
 pub mod digest;
 #[cfg(feature = "rpc")]
+pub mod follow;
+#[cfg(feature = "rpc")]
 mod http_retry;
 #[cfg(feature = "args")]
 pub mod logs;
 #[cfg(feature = "rpc")]
 pub mod rpc_counts;
+pub mod rpc_policy;
 #[cfg(feature = "solana")]
 pub mod solana;
 #[cfg(feature = "solana-ix")]
