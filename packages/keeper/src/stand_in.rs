@@ -83,6 +83,13 @@ pub struct Node {
     refuses_block_time: bool,
     /// How many times it was asked the block's time with a time set.
     pub block_time_probes: usize,
+    /// How many blocks behind the node answering reads by number is, while
+    /// `latest` is answered at the head: a load-balanced endpoint whose next
+    /// request reaches a node behind, which has no such block.
+    pub numbers_behind: u64,
+    /// Every request it was asked, by method, with the contract and
+    /// selector of each plain `eth_call`.
+    pub asked: Vec<(String, Option<(Address, Selector)>)>,
 }
 
 pub type Shared = Arc<Mutex<Node>>;
@@ -124,10 +131,33 @@ fn answer(node: &Shared, request: &Value) -> Value {
     let method = request["method"].as_str().unwrap_or_default();
     let params = &request["params"];
     let mut node = node.lock().unwrap();
+    let plain_call = (method == "eth_call"
+        && params.get(2).is_none_or(Value::is_null)
+        && params.get(3).is_none_or(Value::is_null)
+        && params[0].get("to").is_some_and(|to| !to.is_null()))
+    .then(|| {
+        let (to, data) = tx_fields(params);
+        (
+            to,
+            data.get(..4)
+                .and_then(|four| four.try_into().ok())
+                .unwrap_or_default(),
+        )
+    });
+    node.asked.push((method.to_string(), plain_call));
     let result: Result<Value, String> = match method {
         "eth_chainId" => Ok(json!(format!("0x{:x}", node.chain_id))),
         "eth_accounts" => Ok(json!([])),
         "eth_blockNumber" => Ok(json!(format!("0x{:x}", node.head))),
+        "eth_getBlockByNumber"
+            if params[0]
+                .as_str()
+                .and_then(|asked| asked.strip_prefix("0x"))
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                .is_some_and(|number| number + node.numbers_behind > node.head) =>
+        {
+            Ok(Value::Null)
+        }
         "eth_getBlockByNumber" => {
             let number = params[0]
                 .as_str()
@@ -440,7 +470,7 @@ async fn handle(State(node): State<Shared>, Json(body): Json<Value>) -> axum::re
     .into_response()
 }
 
-pub async fn connect(node: &Shared) -> Client {
+pub async fn connect(node: &Shared) -> crate::Observed {
     let app = Router::new()
         .route("/", post(handle))
         .with_state(node.clone());
@@ -460,15 +490,19 @@ pub async fn connect(node: &Shared) -> Client {
         logs_rpc: None,
         log_range: None,
     };
-    Client::connect(&config, Signing::ReadOnly).await.unwrap()
+    Client::connect(&config, Signing::ReadOnly)
+        .await
+        .unwrap()
+        .into()
 }
 
-/// A client whose every mined transaction moves the stand-in's clock on by
-/// one block, as a real chain's next block does: the keeper's next read of
+/// A client whose every mined transaction moves the stand-in's head on by
+/// one block, and its clock by a block's time, as a real chain's next block
+/// does: the keeper's next read of
 /// the head sees the block its own transaction landed in. A proxy in front of
 /// the stand-in moves the clock before it answers the send, and the blocks
 /// before the head are as far apart.
-pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> Client {
+pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> crate::Observed {
     node.lock().unwrap().block_time = seconds;
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     let state = (node.clone(), behind, seconds);
@@ -492,7 +526,11 @@ pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> Client {
                             .count(),
                         (asked, answered) => usize::from(mined(asked, answered)),
                     } as u64;
-                    node.lock().unwrap().timestamp += seconds * blocks;
+                    {
+                        let mut node = node.lock().unwrap();
+                        node.timestamp += seconds * blocks;
+                        node.head += blocks;
+                    }
                     Json(answer)
                 },
             ),
@@ -514,7 +552,10 @@ pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> Client {
         logs_rpc: None,
         log_range: None,
     };
-    Client::connect(&config, Signing::ReadOnly).await.unwrap()
+    Client::connect(&config, Signing::ReadOnly)
+        .await
+        .unwrap()
+        .into()
 }
 
 /// The stand-in behind a proxy, asked over one pool of connections: a new
@@ -676,6 +717,17 @@ pub fn sent_at<C: SolCall>(node: &Shared, to: Address) -> Vec<u64> {
         .collect()
 }
 
+/// Every transaction taken, as [`everything_sent`] says it, with the
+/// head's time it was sent at and its whole calldata.
+pub fn everything_sent_when(node: &Shared) -> Vec<(String, u64)> {
+    node.lock()
+        .unwrap()
+        .sent
+        .iter()
+        .map(|(to, data, at)| (format!("{to} {}", alloy::hex::encode_prefixed(data)), *at))
+        .collect()
+}
+
 pub fn everything_sent(node: &Shared) -> Vec<String> {
     node.lock()
         .unwrap()
@@ -770,7 +822,11 @@ pub fn sent_calls<C: SolCall>(node: &Shared, to: Address) -> Vec<C> {
 
 /// A client whose log reads naming `address` answer with `logs`, whatever
 /// range they ask for; everything else goes to the stand-in.
-pub async fn connect_with_logs_of(node: &Shared, address: Address, logs: Vec<Value>) -> Client {
+pub async fn connect_with_logs_of(
+    node: &Shared,
+    address: Address,
+    logs: Vec<Value>,
+) -> crate::Observed {
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     let state = (behind, address, logs);
     async fn one((behind, address, logs): &(Behind, Address, Vec<Value>), asked: &Value) -> Value {
@@ -824,7 +880,10 @@ pub async fn connect_with_logs_of(node: &Shared, address: Address, logs: Vec<Val
         logs_rpc: None,
         log_range: None,
     };
-    Client::connect(&config, Signing::ReadOnly).await.unwrap()
+    Client::connect(&config, Signing::ReadOnly)
+        .await
+        .unwrap()
+        .into()
 }
 
 /// A log `address` wrote of `event`, whose indexed fields are `topics`.
@@ -850,7 +909,7 @@ pub type Hook = Arc<dyn Fn(&Shared, Address, &[u8]) + Send + Sync>;
 
 /// A client in front of the stand-in that calls `hook` for each send the
 /// node took.
-pub async fn connect_with_hook(node: &Shared, hook: Hook) -> Client {
+pub async fn connect_with_hook(node: &Shared, hook: Hook) -> crate::Observed {
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     let state = (node.clone(), behind, hook);
     let app = Router::new()
@@ -881,7 +940,7 @@ pub async fn connect_with_hook(node: &Shared, hook: Hook) -> Client {
             ),
         )
         .with_state(state);
-    serve_in_front(app, "stand-in with a hook").await
+    serve_in_front(app, "stand-in with a hook").await.into()
 }
 
 /// Which reads a client fails, by their contract and full calldata.
@@ -891,7 +950,7 @@ pub type Failing = Arc<dyn Fn(Address, &[u8]) -> bool + Send + Sync>;
 /// with an error, as a node that drops one request does; everything else
 /// goes to the stand-in. The stand-in answers by selector alone, so this is
 /// how one claim or one holder is made unreadable while the rest are not.
-pub async fn connect_failing(node: &Shared, failing: Failing) -> Client {
+pub async fn connect_failing(node: &Shared, failing: Failing) -> crate::Observed {
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     let state = (behind, failing);
     async fn one((behind, failing): &(Behind, Failing), asked: &Value) -> Value {
@@ -922,7 +981,9 @@ pub async fn connect_failing(node: &Shared, failing: Failing) -> Client {
             ),
         )
         .with_state(state);
-    serve_in_front(app, "stand-in failing some reads").await
+    serve_in_front(app, "stand-in failing some reads")
+        .await
+        .into()
 }
 
 /// A client in front of the stand-in whose node answers a send of `C` with
@@ -935,7 +996,7 @@ pub async fn connect_turning_away<C: SolCall>(
     node: &Shared,
     refusal: Value,
     turning_away: Arc<std::sync::atomic::AtomicBool>,
-) -> Client {
+) -> crate::Observed {
     type TurningAway = (Behind, Value, Arc<std::sync::atomic::AtomicBool>);
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     let state: TurningAway = (behind, refusal, turning_away);
@@ -970,7 +1031,9 @@ pub async fn connect_turning_away<C: SolCall>(
             ),
         )
         .with_state(state);
-    serve_in_front(app, "stand-in turning sends away").await
+    serve_in_front(app, "stand-in turning sends away")
+        .await
+        .into()
 }
 
 /// Serve a proxy in front of the stand-in, and connect to it.
@@ -1000,7 +1063,7 @@ async fn serve_in_front(app: Router, label: &str) -> Client {
 pub async fn connect_turning_away_then_reverting(
     node: &Shared,
     reverting: Arc<std::sync::atomic::AtomicBool>,
-) -> Client {
+) -> crate::Observed {
     type Reverting = (Behind, Arc<std::sync::atomic::AtomicBool>);
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     async fn one((behind, reverting): &Reverting, asked: &Value) -> Value {
@@ -1033,7 +1096,9 @@ pub async fn connect_turning_away_then_reverting(
             ),
         )
         .with_state((behind, reverting));
-    serve_in_front(app, "stand-in turning sends away, then reverting them").await
+    serve_in_front(app, "stand-in turning sends away, then reverting them")
+        .await
+        .into()
 }
 
 /// A client in front of the stand-in whose node, while `reverting` holds,
@@ -1041,7 +1106,7 @@ pub async fn connect_turning_away_then_reverting(
 pub async fn connect_reverting(
     node: &Shared,
     reverting: Arc<std::sync::atomic::AtomicBool>,
-) -> Client {
+) -> crate::Observed {
     type Reverting = (Behind, Arc<std::sync::atomic::AtomicBool>);
     let behind = Behind::new(connect(node).await.rpc_url.clone());
     async fn one((behind, reverting): &Reverting, asked: &Value) -> Value {
@@ -1070,7 +1135,7 @@ pub async fn connect_reverting(
             ),
         )
         .with_state((behind, reverting));
-    serve_in_front(app, "stand-in reverting sends").await
+    serve_in_front(app, "stand-in reverting sends").await.into()
 }
 
 /// An executor that answers a 404 (it hasn't taken the vault on yet), then

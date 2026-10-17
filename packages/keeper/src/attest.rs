@@ -42,9 +42,11 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
+use chain::Deployments;
 use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
 use chain::bindings::vault::{IVault, VaultState};
-use chain::{Client, Deployments};
+
+use crate::observed::Observed;
 use serde::Deserialize;
 
 /// What the executor publishes about its attestation, as far as the keeper
@@ -207,10 +209,10 @@ pub(crate) struct Memory {
 }
 
 impl Memory {
-    /// Whether the chain is due a look.
-    pub fn due(&self, now: Instant) -> bool {
+    /// Whether the chain is due a look, looked at every `every`.
+    pub fn due_every(&self, now: Instant, every: Duration) -> bool {
         self.last
-            .is_none_or(|last| now.duration_since(last) >= EVERY)
+            .is_none_or(|last| now.duration_since(last) >= every)
     }
 
     /// The chain was looked at, or would have been had the executor
@@ -520,7 +522,7 @@ pub(crate) async fn published(http: &reqwest::Client, source: &str) -> Result<Pu
 
 /// The registry and the keeper's account on one chain.
 pub(crate) struct OnChain<'a> {
-    pub client: &'a Client,
+    pub client: &'a Observed,
     pub deployments: &'a Deployments,
     pub keeper: Address,
 }
@@ -813,7 +815,7 @@ const ONE_SEND_GAS: u128 = 300_000;
 /// How long a stake that was sent is waited for before it is taken for lost.
 const STAKE_LANDING: Duration = Duration::from_secs(600);
 
-fn gas_stake(chain: &Client) -> u128 {
+fn gas_stake(chain: &Observed) -> u128 {
     if chain.is_development() {
         GAS_STAKE_DEVELOPMENT
     } else {
@@ -841,7 +843,7 @@ fn top_up_below(stake: u128, worst_send: Option<u128>) -> u128 {
 }
 
 /// What one of the key's larger sends can cost at most at today's fees.
-async fn worst_send(chain: &Client) -> Result<u128> {
+async fn worst_send(chain: &Observed) -> Result<u128> {
     let per_gas = match chain.provider().estimate_eip1559_fees().await {
         Ok(fees) => fees.max_fee_per_gas,
         Err(_) => chain
@@ -853,12 +855,34 @@ async fn worst_send(chain: &Client) -> Result<u128> {
     Ok(per_gas.saturating_mul(ONE_SEND_GAS))
 }
 
+/// How long a fee reading tells a key far above its line from one near it.
+const FEE_FRESH: Duration = Duration::from_secs(10 * 60);
+
+/// The last worst-case send read on each chain, by chain id, and when.
+static FEES: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, (u128, Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The worst-case send read on the chain within [`FEE_FRESH`], if any.
+fn fee_lately(chain_id: u64) -> Option<u128> {
+    FEES.lock().ok().and_then(|fees| {
+        fees.get(&chain_id)
+            .filter(|(_, at)| at.elapsed() < FEE_FRESH)
+            .map(|(send, _)| *send)
+    })
+}
+
+fn fee_read(chain_id: u64, send: u128) {
+    if let Ok(mut fees) = FEES.lock() {
+        fees.insert(chain_id, (send, Instant::now()));
+    }
+}
+
 /// Keep a key stocked with gas from the keeper's account: when it holds
 /// less than half a stake (see [`top_up_below`]), send it what brings it back
 /// up to a whole one. A stake sent and not yet seen to land is waited for, not sent
 /// again; the key's pending balance counts too.
 async fn fund_gas(
-    chain: &Client,
+    chain: &Observed,
     keeper: Address,
     stakes: &mut Stakes,
     key: Address,
@@ -876,14 +900,26 @@ async fn fund_gas(
         stakes.remove(&key);
     }
 
-    let send = worst_send(chain).await.ok();
-    let stake = stake_at(gas_stake(chain), send.unwrap_or(0));
-    let below = U256::from(top_up_below(stake, send));
-    let stake = U256::from(stake);
     let latest = chain
         .balance(key)
         .await
         .context("reading what gas the key holds")?;
+    // A key twice as far above its line as the last fee read puts it needs
+    // nothing, and the fee is not read again for it; nearer the line, the
+    // fee is read now and the key judged by it.
+    if let Some(send) = fee_lately(chain.chain_id) {
+        let far = top_up_below(stake_at(gas_stake(chain), send), Some(send)).saturating_mul(2);
+        if latest >= U256::from(far) {
+            return Ok(true);
+        }
+    }
+    let send = worst_send(chain).await.ok();
+    if let Some(send) = send {
+        fee_read(chain.chain_id, send);
+    }
+    let stake = stake_at(gas_stake(chain), send.unwrap_or(0));
+    let below = U256::from(top_up_below(stake, send));
+    let stake = U256::from(stake);
     if latest >= below {
         return Ok(true);
     }
