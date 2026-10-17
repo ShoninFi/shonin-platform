@@ -64,9 +64,6 @@ use crate::{DAY, MINUTE, Said, chain_kept, waited};
 
 /// How long the keeper waits between one round of a cluster and the next.
 const ROUND_PAUSE: Duration = Duration::from_secs(2);
-/// The most rounds a vault's requests go unread for their rent: they are
-/// read again sooner whenever settlement has moved.
-const RENT_EVERY: u64 = 30;
 /// The most records closed in one transaction.
 const CLOSES_AT_ONCE: usize = 8;
 /// The least an unwind must bring home to be paid for: a cent.
@@ -86,8 +83,14 @@ const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
 /// for an answer.
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Keep one Solana vault chain, round after round, for good.
-pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<String>) {
+/// Keep one Solana vault chain, round after round, for good, with the
+/// cluster's checked RPC settings.
+pub async fn keep_chain(
+    served: SolanaServed,
+    policy: chain::rpc_policy::RpcPolicy,
+    executor: String,
+    services: Vec<String>,
+) {
     let chain = served.vault_chain;
     let keeper = match served.client.role(chain::Role::Keeper) {
         Ok(keeper) => keeper.insecure_clone(),
@@ -129,6 +132,7 @@ pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<St
         platform: served.platform.clone(),
         keeper,
         executor,
+        rent_poll_rounds: policy.solana_rent_poll_rounds,
     };
     let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
     let mut scan = VaultScan::for_cluster(&served.client.cluster);
@@ -194,6 +198,9 @@ struct Keeping {
     platform: Platform,
     keeper: Keypair,
     executor: String,
+    /// The most rounds a vault's requests go unread for their rent: they
+    /// are read again sooner whenever settlement has moved.
+    rent_poll_rounds: u64,
 }
 
 /// What the keeper remembers about one vault between rounds.
@@ -1244,7 +1251,8 @@ impl Keeping {
         let vault = self.platform.vault(&self.client, address).await?;
         let read_at = (vault.request_cursor, memory.rounds);
         if memory.rent_read.is_some_and(|(cursor, round)| {
-            cursor == vault.request_cursor && memory.rounds < round + RENT_EVERY
+            cursor == vault.request_cursor
+                && memory.rounds < round.saturating_add(self.rent_poll_rounds)
         }) {
             return Ok(());
         }
@@ -3130,3 +3138,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "solana_rent_tests.rs"]
+mod rent_tests;

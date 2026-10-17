@@ -213,6 +213,8 @@ async fn main() -> Result<()> {
     } else {
         tokio::sync::mpsc::unbounded_channel().1
     };
+    // Each chain's RPC settings: how often it is looked at, and how.
+    let configs = chain::ChainConfigs::load(&args.chain_args.chains)?;
     // Each Solana vault chain is kept on its own, as it connects.
     let mut chains = tokio::task::JoinSet::new();
     if !solana_targets.is_empty() {
@@ -224,11 +226,14 @@ async fn main() -> Result<()> {
             .map(|url| url.trim().to_string())
             .filter(|url| !url.is_empty())
             .collect();
+        let configs = configs.clone();
         chains.spawn(async move {
             let mut kept = tokio::task::JoinSet::new();
             while let Some(served) = clusters.recv().await {
+                let policy = configs.rpc_policy(&served.key);
                 kept.spawn(solana::keep_chain(
                     served,
+                    policy,
                     executor.clone(),
                     services.clone(),
                 ));
@@ -244,8 +249,6 @@ async fn main() -> Result<()> {
     // The chain whose registry records the root key: the executor's
     // `setRootKey` is relayed there alone.
     let root_chain = args.chain_args.root_chain()?;
-    // Each chain's RPC settings: how often it is looked at, and how.
-    let configs = chain::ChainConfigs::load(&args.chain_args.chains)?;
 
     // Every vault chain turns on its own, from the moment it is connected,
     // so a slow chain, or one out of reach, holds up no other.
