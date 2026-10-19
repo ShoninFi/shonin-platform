@@ -24,6 +24,8 @@
 //!   driver's group, Orca's instructions, and a position's maths.
 //! - [`platform`]: every instruction the platform sends, built from the
 //!   deployment's accounts.
+//! - [`observe`] and [`served`]: one read of every account a service
+//!   needs on a cluster, and its decision code's reads answered from it.
 //! - [`upkeep`]: what keeps a vault going (the bill, rent back, held
 //!   payouts, a closed vault's doors), and finding every vault, request and
 //!   claim.
@@ -33,11 +35,13 @@ pub mod client;
 pub mod events;
 pub mod executor;
 pub mod keys;
+pub mod observe;
 pub mod orca;
 pub mod platform;
 pub mod pro_rata;
 pub mod rpc;
 pub mod scan;
+pub mod served;
 pub mod tables;
 pub mod upkeep;
 

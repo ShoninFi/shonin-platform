@@ -229,8 +229,13 @@ impl Keeper {
 
 fn start(test: &str, rpc: &str) -> Keeper {
     let dir = std::env::temp_dir().join(format!(
-        "keeper-rate-limited-vault-{test}-{}",
-        std::process::id()
+        "keeper-rate-limited-vault-{test}-{}-{}",
+        std::process::id(),
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -291,11 +296,13 @@ fn start(test: &str, rpc: &str) -> Keeper {
 }
 
 /// Whether, within `limit`, the keeper's health named the vault as not kept;
-/// and how many times the vault's round read the clock meanwhile.
+/// how many times the vault's round read the clock meanwhile; the health
+/// last read; and the keeper's log, read once `linger` has passed after.
 async fn vault_named_not_kept(
     limited: bool,
     limit: Duration,
-) -> (bool, u64, Option<(u16, String)>) {
+    linger: Duration,
+) -> (bool, u64, Option<(u16, String)>, String) {
     let strategy_id = 3;
     let vault_address = vs::vault_address(strategy_id).0;
     let mut factory: Factory = zeroed(Factory::INIT_SPACE);
@@ -326,17 +333,21 @@ async fn vault_named_not_kept(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    tokio::time::sleep(linger).await;
+    let said = std::fs::read_to_string(keeper.dir.join("keeper.log")).unwrap_or_default();
     (
         named.load(Ordering::SeqCst),
         cluster.clock_reads.load(Ordering::SeqCst),
         last,
+        said,
     )
 }
 
 /// A vault whose round fails on an ordinary error is named.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vault_whose_round_keeps_failing_is_named_in_the_health() {
-    let (named, reads, last) = vault_named_not_kept(false, Duration::from_secs(90)).await;
+    let (named, reads, last, _) =
+        vault_named_not_kept(false, Duration::from_secs(90), Duration::ZERO).await;
     assert!(reads > 0, "the vault's round never ran: {last:?}");
     assert!(named, "after {reads} clock reads the health was {last:?}");
 }
@@ -345,7 +356,8 @@ async fn a_vault_whose_round_keeps_failing_is_named_in_the_health() {
 /// as well, with why.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vault_whose_round_keeps_ending_in_the_rate_limit_is_named_in_the_health() {
-    let (named, reads, last) = vault_named_not_kept(true, Duration::from_secs(90)).await;
+    let (named, reads, last, _) =
+        vault_named_not_kept(true, Duration::from_secs(90), Duration::ZERO).await;
     assert!(reads > 0, "the vault's round never ran: {last:?}");
     assert!(
         named,
@@ -355,4 +367,40 @@ async fn a_vault_whose_round_keeps_ending_in_the_rate_limit_is_named_in_the_heal
     let (status, said) = last.expect("the health answered");
     assert_eq!(status, 503, "{said}");
     assert!(said.contains("the node's rate limit"), "{said}");
+}
+
+/// A vault whose round waits on the node's rate limit says so at info, with
+/// why, at once and then no more than once in a few minutes, however many
+/// rounds it waits: a wait is never silent, and never a flood.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vault_whose_round_waits_on_the_rate_limit_says_why_at_info_once_per_throttle() {
+    let (named, reads, last, said) =
+        vault_named_not_kept(true, Duration::from_secs(90), Duration::from_secs(10)).await;
+    assert!(named, "the health was {last:?}");
+    assert!(reads >= 4, "the vault's round waited only {reads} times");
+    let waits: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("a due duty waits"))
+        .collect();
+    let limited: Vec<&&str> = waits
+        .iter()
+        .filter(|line| line.contains("the node limits the rate"))
+        .collect();
+    assert_eq!(
+        limited.len(),
+        1,
+        "after {reads} rounds that waited on the rate limit, it was said {} times:\n{said}",
+        limited.len()
+    );
+    assert!(
+        limited[0].contains("INFO"),
+        "not said at info: {}",
+        limited[0]
+    );
+    let vault = vs::vault_address(3).0.to_string();
+    assert!(
+        limited[0].contains(&vault),
+        "the vault is not named: {}",
+        limited[0]
+    );
 }
