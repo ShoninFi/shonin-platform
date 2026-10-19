@@ -154,6 +154,7 @@ pub async fn one(
     publish_only: bool,
     take_on: u64,
 ) -> Result<()> {
+    crate::deploy::require_stand_ins(deployments, "the seed's reference agents")?;
     let agents = agents
         .map(Path::to_path_buf)
         .or_else(guess_agents)
@@ -220,6 +221,7 @@ pub async fn on_strategy(
     strategy: u64,
     take_on: u64,
 ) -> Result<()> {
+    crate::deploy::require_stand_ins(deployments, "the seed's reference agents")?;
     use chain::bindings::strategies::IStrategyRegistry;
     let id = U256::from(strategy);
     let registered = client
@@ -270,6 +272,7 @@ pub async fn run(
     agents: Option<&Path>,
     take_on: u64,
 ) -> Result<()> {
+    crate::deploy::require_stand_ins(deployments, "the seed's reference agents")?;
     let agents = agents
         .map(Path::to_path_buf)
         .or_else(guess_agents)
@@ -381,6 +384,7 @@ pub async fn demo(
     deployments: &Deployments,
     demo: &Demo<'_>,
 ) -> Result<()> {
+    crate::deploy::require_stand_ins(deployments, "the seed's reference agents")?;
     use chain::bindings::prices::IPrices;
     use chain::bindings::strategies::IStrategyRegistry;
 

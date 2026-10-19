@@ -2,8 +2,9 @@
 # unattended for another week. It fails, so GitHub notifies whoever watches
 # the repository's scheduled runs, when any role's gas or a funder would run
 # out within a week at its recent rate, when the keeper has sent nothing on a
-# chain for over a day (it settles every vault daily), or when the API's
-# health check fails or a chain's reading has stalled.
+# chain for over a day (it settles every vault daily), when the API's
+# health check fails or a chain's reading has stalled, or when a mirror feed
+# has missed its mainnet feed's latest round (testnet-market has stopped).
 #
 # Public endpoints only, no secret. The accounts watched are the repository
 # variable TESTNET_WATCH (testnet addresses stay out of the repository; its

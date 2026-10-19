@@ -14,6 +14,7 @@ members = [
     "packages/machines/unwinder",
     "packages/keeper",
     "packages/devnet",
+    "packages/testnet-market",
     "packages/fuelbench",
     "packages/fuelbench/guest",
     "packages/strategy-sdk",
@@ -43,6 +44,7 @@ publish = false
 shared = { path = "packages/shared", package = "shonin-shared" }
 hyperliquid = { path = "packages/drivers/hyperliquid", package = "shonin-hyperliquid" }
 robinhood = { path = "packages/drivers/robinhood", package = "shonin-robinhood" }
+testnet-market = { path = "packages/testnet-market", package = "shonin-testnet-market" }
 lighter = { path = "packages/drivers/lighter", package = "shonin-lighter" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }

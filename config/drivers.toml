@@ -26,7 +26,9 @@
 [drivers.local]
 label = "Local venue"
 chain = "vault"
-networks = ["local", "testnet"]
+# A stand-in for the local chains and their tests: no public test network
+# deploys it.
+networks = ["local"]
 restricted = []
 custody = "venue"
 exit = "contract"
@@ -78,7 +80,7 @@ valuation = "on-chain"
 
 [bridges.local-bridge]
 label = "Local bridge"
-networks = ["local", "testnet"]
+networks = ["local"]
 
 [bridges.cctp]
 label = "Circle CCTP"

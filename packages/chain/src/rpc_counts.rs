@@ -78,6 +78,7 @@ pub(crate) fn evm(chain: Option<u64>, method: &str) {
     );
 }
 
+#[cfg(feature = "solana")]
 pub(crate) fn solana(cluster: &'static str, method: &str) {
     note(format!("solana:{cluster}"), method);
 }

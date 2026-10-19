@@ -135,6 +135,42 @@ tasks:
     cmds:
       - "{{.DEVNET}} fund"
 
+  testnet-market-setup:
+    desc: "Set up what testnet-market needs on the testnets, from the funder (STEPS=feeds,gas,inventory by default; also pools and driver): the mirror feeds of the mainnet feeds the Robinhood Chain testnet's stocks are priced by (recorded in the deployments directory as mirror-feeds-evm-<chain>.json), the market account's gas (GAS=<coin>, or the funding file's market amount), its inventory (STOCK_TOKENS=10 of each stock token, WETH=0.01, USDC=50, from what the funder holds), POOL_TOKENS=<n> of each token added to its pool full-range (each time it runs), and the Robinhood driver built from the listings (PROPOSE=1 proposes it as robinhood); ON_FORK=1 refuses any endpoint but a local fork. Each step but pools is safe to run again; VAULT_CHAIN=<name> for one chain (NETWORK=testnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "testnet-market is for the testnets (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "${SHONIN_TESTNET_EVM_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env: the funder and the market's account are its keys."
+    cmds:
+      - task: :contracts:build
+      - >-
+        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} testnet-market-setup
+        --steps {{.STEPS | default "feeds,gas,inventory"}}
+        {{if .GAS}}--gas {{.GAS}}{{end}}
+        {{if .STOCK_TOKENS}}--stock-tokens {{.STOCK_TOKENS}}{{end}}
+        {{if .WETH}}--weth {{.WETH}}{{end}}
+        {{if .USDC}}--usdc {{.USDC}}{{end}}
+        {{if .POOL_TOKENS}}--pool-tokens {{.POOL_TOKENS}}{{end}}
+        {{if .PROPOSE}}--propose{{end}}
+        {{if .ON_FORK}}--on-fork{{end}}
+
+  testnet-market:
+    desc: "Run testnet-market here, with its key derived from the mnemonic: every EVERY seconds (60) the mainnet feeds posted to their mirrors and every testnet pool brought to its feed's price (DRY_RUN=1 sends nothing, ONCE=1 runs one round, ONLY=evm:<id> keeps one chain; NETWORK=testnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "testnet-market keeps the testnets' pools alone (NETWORK={{.NETWORK}})."
+    cmds:
+      - >-
+        cargo run -p shonin-testnet-market --
+        --network "{{.NETWORK}}"
+        --chains "{{.PATH_CHAINS}}"
+        --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
+        {{if .EVERY}}--every {{.EVERY}}{{end}}
+        {{if .ONLY}}--only {{.ONLY}}{{end}}
+        {{if .DRY_RUN}}--dry-run{{end}}
+        {{if .ONCE}}--once{{end}}
+
   fund-wallet:
     desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the stand-in dollar (minted on each EVM chain for a 0x address, on Solana devnet for a Solana one), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
     requires:

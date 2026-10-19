@@ -7,7 +7,8 @@
 #   reads, and refusing outright anything that looks like a secret or
 #   build output;
 # - `_deployments/`: the network's public deployment files alone (each
-#   chain's addresses and its checkers'), never a deploy's progress records;
+#   chain's addresses, its checkers' and its mirror feeds'), never a deploy's
+#   progress records;
 # - `_guest/`: the prover's reproducibly built guest, when given;
 # - `_sealed/`: the reviewer's model key as sealed to its purpose
 #   (`sealed.json`, the ciphertext alone), when given. Nothing else is taken
@@ -37,7 +38,7 @@ for file in "$deployments"/*.json; do
   case "$(basename "$file")" in
     *.partial.json | *.run-*) continue ;;
   esac
-  if basename "$file" | grep -qE '^(evm-[0-9]+|attestation-evm-[0-9]+|solana-[a-z-]+)\.json$'; then
+  if basename "$file" | grep -qE '^(evm-[0-9]+|attestation-evm-[0-9]+|mirror-feeds-evm-[0-9]+|solana-[a-z-]+)\.json$'; then
     cp "$file" "$stage/_deployments/"
     found=$((found + 1))
   fi

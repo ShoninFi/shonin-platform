@@ -243,9 +243,14 @@ vars:
   GCP_SERVICES_SERVICE_ACCOUNT: "shonin-services"
   # The service account of the prover's VM: it pulls images and writes logs.
   GCP_PROVER_SERVICE_ACCOUNT: "shonin-prover"
+  # The service account of testnet-market's VM: it pulls its image, writes
+  # logs, and reads its own key and the paid endpoints.
+  GCP_TESTNET_MARKET_SERVICE_ACCOUNT: "shonin-testnet-market"
   # The VMs, one each per network: shonin-<role>-<network>.
   GCP_SERVICES_MACHINE_TYPE: "e2-small"
   GCP_PROVER_MACHINE_TYPE: "c3-standard-8"
+  # testnet-market: one small process reading a few contracts a minute.
+  GCP_TESTNET_MARKET_MACHINE_TYPE: "e2-micro"
   # Public names of the testnet: the API through a Cloudflare tunnel from the
   # services VM, and the content store (an R2 bucket, read-only to the world).
   URL_API_TESTNET: "https://testnet-api.shonin.fi"
@@ -253,8 +258,11 @@ vars:
   R2_BUCKET_STORE_TESTNET: "shonin-testnet-store"
   # The keeper's testnet keys alone (its EVM key, and its Solana devnet key
   # as its keypair's JSON; never a mnemonic) and the tunnel's token: the only
-  # secrets in the cloud (read by the services VM's account).
+  # secrets the services VM's account reads.
   GCP_SECRET_TESTNET_KEEPER_KEY: "shonin-testnet-keeper-key"
   GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY: "shonin-testnet-keeper-solana-key"
   GCP_SECRET_TESTNET_TUNNEL_TOKEN: "shonin-testnet-tunnel-token"
   GCP_SECRET_TESTNET_RPC: "shonin-testnet-rpc"
+  # testnet-market's own test network key (account 101 of the EVM mnemonic,
+  # never the mnemonic), read by its VM's account alone.
+  GCP_SECRET_TESTNET_MARKET_KEY: "shonin-testnet-market-key"

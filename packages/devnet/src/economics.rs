@@ -235,6 +235,10 @@ fn units(value: alloy::primitives::I256) -> f64 {
 }
 
 pub async fn report(client: &Client, deployments: &Deployments, options: &Options) -> Result<()> {
+    crate::deploy::require_stand_ins(
+        deployments,
+        "the economics report (its venue is the stand-in's)",
+    )?;
     let vault = options.vault;
     let state = client.read(vault, IVault::stateCall {}).await?;
     let share_price = client.read(vault, IVault::sharePriceCall {}).await?;
