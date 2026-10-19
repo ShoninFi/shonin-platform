@@ -16,6 +16,7 @@
 mod attestation;
 mod ceilings;
 mod data;
+mod factories;
 mod feed;
 mod handover;
 mod health;
@@ -53,7 +54,6 @@ use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
 use axum::response::IntoResponse;
 use chain::bindings::attestation::IAttestationRegistry;
-use chain::bindings::factory::IVaultFactory;
 use chain::bindings::station::IStation;
 use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{IVault, VaultState};
@@ -403,9 +403,12 @@ struct Book {
     /// How many blocks deep the chain's vaults are read for what they have
     /// collected (see [`usage`]).
     confirmations: u64,
-    /// Every vault the factory has made, as last read, and when.
+    /// Every vault the deployment's factory, and every factory it replaces,
+    /// has made, as last read, and when.
     vaults: Vec<Address>,
     vaults_read: Option<Instant>,
+    /// What each of those factories listed when last read.
+    factories: factories::Factories,
     /// The vaults taken on.
     running: HashMap<Address, Served>,
     /// Each vault's home station, read once: a vault's station is set when
@@ -706,18 +709,19 @@ async fn sweep(
     attestation: &attestation::Attestation,
     book: &mut Book,
 ) -> Result<()> {
-    // The factory's list of every vault it ever made is read whole, so it is
-    // read again only every so often: a vault made since is taken on within
-    // [`VAULT_LIST_EVERY`]. While a fresh read fails, the vaults already
-    // known are swept on, and the failure is said once they have been.
+    // Each factory's list of every vault it ever made is read whole, so the
+    // lists are read again only every so often: a vault made since is taken
+    // on within [`VAULT_LIST_EVERY`]. The deployment's factory is read, and
+    // every factory it replaces, whose vaults are served alike (see
+    // [`factories::every_vault`]). While the deployment's own list fails,
+    // the vaults already known are swept on, and the failure is said once
+    // they have been.
     let mut listing = Ok(());
     if book
         .vaults_read
         .is_none_or(|at| at.elapsed() >= VAULT_LIST_EVERY)
     {
-        match client
-            .read(deployments.factory, IVaultFactory::vaultsCall {})
-            .await
+        match factories::every_vault(chain, client, deployments.factory, &mut book.factories).await
         {
             Ok(vaults) => {
                 book.vaults = vaults;
@@ -3361,6 +3365,147 @@ mod tests {
         book.vaults_read = book.vaults_read.map(|at| at - VAULT_LIST_EVERY);
         sweep_now(&mut book).await;
         assert_eq!(reads(), 2, "the list was never read again");
+    }
+
+    /// The deployment's factory, one it replaces, and the first factory,
+    /// which the one it replaces replaces: each a stand-in factory.
+    const NEWEST: Address = Address::repeat_byte(0xf3);
+    const REPLACED: Address = Address::repeat_byte(0xf2);
+    const FIRST: Address = Address::repeat_byte(0xf1);
+
+    /// The stand-in's deployments, with `NEWEST` the deployment's factory.
+    fn deployed_with_newest() -> Deployments {
+        let mut deployments = stand_in::deployments();
+        deployments.factory = NEWEST;
+        deployments
+    }
+
+    /// A node whose factories go `NEWEST`, `REPLACED`, `FIRST`, with
+    /// `vault` made by `FIRST` and the others listing none.
+    fn three_factories(vault: Address) -> stand_in::serving::Shared {
+        let node = stand_in::serving::node(VaultState::Open);
+        {
+            let mut node = node.lock().unwrap();
+            node.factories.insert(NEWEST, (Vec::new(), Some(REPLACED)));
+            node.factories.insert(REPLACED, (Vec::new(), Some(FIRST)));
+            // Made before factories named the one they replace.
+            node.factories.insert(FIRST, (vec![vault], None));
+        }
+        node
+    }
+
+    /// A vault made by a factory the deployment's factory replaces (two
+    /// factories back) is taken on, as one made by the deployment's own is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_of_a_replaced_factory_is_taken_on() {
+        let vault = Address::repeat_byte(0x11);
+        let node = three_factories(vault);
+        let bundle = node.lock().unwrap().bundle;
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let store =
+            std::env::temp_dir().join(format!("executor-replaced-factory-{}", std::process::id()));
+        let component = bundle_path(&store, bundle);
+        std::fs::create_dir_all(component.parent().unwrap()).unwrap();
+        std::fs::write(&component, b"").unwrap();
+        let mut book = Book::default();
+
+        sweep(
+            shared::Chain::Base,
+            &client,
+            &deployed_with_newest(),
+            Some(2_500.0),
+            &runner::engine().unwrap(),
+            &args(&store),
+            &Default::default(),
+            &crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
+            &mut book,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+
+        assert_eq!(book.vaults, [vault]);
+        assert!(
+            book.running.contains_key(&vault),
+            "a vault of a replaced factory was never taken on"
+        );
+    }
+
+    /// An earlier factory whose list can't be read this time (a node's gas
+    /// cap on a long list, say) keeps the vaults it last listed, and so does
+    /// the factory behind it, reached through the `previous` last read.
+    #[tokio::test]
+    async fn an_earlier_factory_that_cannot_be_read_keeps_the_vaults_it_last_listed() {
+        let first = Address::repeat_byte(0x11);
+        let replaced = Address::repeat_byte(0x22);
+        let node = three_factories(first);
+        node.lock()
+            .unwrap()
+            .factories
+            .insert(REPLACED, (vec![replaced], Some(FIRST)));
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let mut factories = factories::Factories::default();
+        let read = async |factories: &mut factories::Factories| {
+            factories::every_vault(shared::Chain::Base, &client, NEWEST, factories)
+                .await
+                .unwrap()
+        };
+        assert_eq!(read(&mut factories).await, [replaced, first]);
+
+        node.lock().unwrap().unreadable.insert(REPLACED);
+        assert_eq!(
+            read(&mut factories).await,
+            [replaced, first],
+            "an earlier factory that could not be read dropped its vaults"
+        );
+
+        // Never read before, an earlier factory that can't be read ends the
+        // walk there, and the deployment's own list still stands.
+        let mut fresh = factories::Factories::default();
+        assert_eq!(read(&mut fresh).await, Vec::<Address>::new());
+    }
+
+    /// The deployment's own factory must be read: its list failing is the
+    /// sweep's error, as it was before earlier factories were read, and
+    /// while the vaults already known are swept on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deployments_own_factory_unreadable_is_the_sweeps_error() {
+        let vault = Address::repeat_byte(0x11);
+        let node = three_factories(vault);
+        node.lock().unwrap().unreadable.insert(NEWEST);
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        assert!(
+            factories::every_vault(
+                shared::Chain::Base,
+                &client,
+                NEWEST,
+                &mut factories::Factories::default()
+            )
+            .await
+            .is_err()
+        );
+
+        let store =
+            std::env::temp_dir().join(format!("executor-own-factory-{}", std::process::id()));
+        let engine = runner::engine().unwrap();
+        let attestation =
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap();
+        let mut book = Book::default();
+        let swept = sweep(
+            shared::Chain::Base,
+            &client,
+            &deployed_with_newest(),
+            None,
+            &engine,
+            &args(&store),
+            &Default::default(),
+            &attestation,
+            &mut book,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&store);
+        assert!(swept.is_err(), "a sweep went on with no list at all");
+        assert!(book.vaults_read.is_none());
     }
 
     /// Take vault 0x11 on, as a sweep does.

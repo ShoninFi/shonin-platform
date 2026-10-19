@@ -237,6 +237,12 @@ async fn rpc(State(state): State<Shared>, Json(request): Json<Value>) -> Respons
                     .or_else(|| tx["data"].as_str())
                     .expect("a call carries data");
                 let input = alloy::hex::decode(data).unwrap();
+                // The factory replaces none, as one made before factories
+                // named the one they replace: its `previous` reverts.
+                if input.starts_with(&crate::factories::IReplacesFactory::previousCall::SELECTOR) {
+                    return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": 3, "message": "execution reverted"}}))
+                        .into_response();
+                }
                 if input.starts_with(&IVaultFactory::vaultsCall::SELECTOR) {
                     state.vault_list_reads += 1;
                     let none = IVaultFactory::vaultsCall::abi_encode_returns(&Vec::new());
@@ -384,7 +390,7 @@ pub async fn signed_total(
 /// (the strategy's id, say) reverts, which ends a serve right after the
 /// key's blessing and approval are settled.
 pub mod serving {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
@@ -396,10 +402,13 @@ pub mod serving {
     use axum::response::{IntoResponse, Response};
     use axum::{Json, Router, routing::post};
     use chain::bindings::attestation::{IAttestationRegistry, ImageKind, KeyInfo};
+    use chain::bindings::factory::IVaultFactory;
     use chain::bindings::station::{IStation, IStationVault};
     use chain::bindings::vault::{IVault, Tank, VaultState};
     use chain::bindings::venue::ILocalVenue;
     use serde_json::{Value, json};
+
+    use crate::factories::IReplacesFactory;
 
     pub const TTL: u64 = 72 * 3_600;
     pub const NOW: u64 = 1_700_000_000;
@@ -444,6 +453,13 @@ pub mod serving {
         /// How many times the allowances were read: once for every start of
         /// the agent, and every two seconds while one runs or waits.
         pub agent_starts: usize,
+        /// Vault factories, by address: the vaults each lists, and the
+        /// factory it replaces (`None`: its `previous` reverts, as one made
+        /// before factories named the one they replace).
+        pub factories: HashMap<Address, (Vec<Address>, Option<Address>)>,
+        /// Factories whose every read the node drops with an error of its
+        /// own, as a node does a read past its `eth_call` gas cap.
+        pub unreadable: HashSet<Address>,
     }
 
     pub type Shared = Arc<Mutex<Node>>;
@@ -468,6 +484,8 @@ pub mod serving {
             reverted: HashSet::new(),
             tank_reads: 0,
             agent_starts: 0,
+            factories: HashMap::new(),
+            unreadable: HashSet::new(),
         }))
     }
 
@@ -695,6 +713,28 @@ pub mod serving {
                 }
                 if input.starts_with(&IVault::allowancesCall::SELECTOR) {
                     node.agent_starts += 1;
+                }
+                let to: Option<Address> = tx["to"].as_str().and_then(|to| to.parse().ok());
+                if let Some(to) = to
+                    && node.unreadable.contains(&to)
+                {
+                    return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "the node dropped this read"}}))
+                        .into_response();
+                }
+                if let Some((vaults, previous)) = to.and_then(|to| node.factories.get(&to)) {
+                    if input.starts_with(&IVaultFactory::vaultsCall::SELECTOR) {
+                        let out = IVaultFactory::vaultsCall::abi_encode_returns(vaults);
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": alloy::hex::encode_prefixed(out)}))
+                            .into_response();
+                    }
+                    if input.starts_with(&IReplacesFactory::previousCall::SELECTOR) {
+                        let Some(previous) = previous else {
+                            return reverted(id);
+                        };
+                        let out = IReplacesFactory::previousCall::abi_encode_returns(previous);
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": alloy::hex::encode_prefixed(out)}))
+                            .into_response();
+                    }
                 }
                 match answer_call(&node, &input) {
                     Some(out) => json!(alloy::hex::encode_prefixed(out)),
