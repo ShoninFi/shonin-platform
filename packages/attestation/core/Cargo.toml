@@ -19,6 +19,9 @@ hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 rsa = { version = "0.9.9", default-features = false, features = ["sha2"] }
 sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
 sha3 = { version = "0.10.8", default-features = false }
+# The certificates of a PKI token's chain, parsed as strict DER (on the same
+# `der` / `spki` 0.7 line as `rsa` 0.9).
+x509-cert = { version = "0.2.5", default-features = false }
 # The fixture's test key, generated from a fixed seed so no private key is
 # ever written down.
 rand_chacha = { version = "0.3.1", optional = true }

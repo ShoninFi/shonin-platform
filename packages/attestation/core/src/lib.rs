@@ -1,12 +1,14 @@
 //! What the attestation proof checks, and what it says when it passes.
 //!
 //! An instance running in Confidential Space asks Google for an attestation
-//! token: a JWT, signed with RS256 by a key Google publishes, whose claims
-//! describe the hardware, the boot, the container image and the project the
-//! instance runs in, and carry a nonce the instance chose. The zkVM guest
-//! runs [`verify`] over that token and commits the [`Journal`] it returns, so
-//! a chain can believe the claims without checking an RSA signature or
-//! parsing JSON itself.
+//! token: a JWT, signed with RS256, whose claims describe the hardware, the
+//! boot, the container image and the project the instance runs in, and carry
+//! a nonce the instance chose. An OIDC token is signed by a key Google
+//! publishes in its JWKS; a PKI token by a short-lived key whose certificate
+//! chain, up to Google's Confidential Space Root CA, travels in its header
+//! (see [`pki`]). The zkVM guest runs [`verify`] over that token and commits
+//! the [`Journal`] it returns, so a chain can believe the claims without
+//! checking an RSA signature or parsing JSON itself.
 //!
 //! The same code runs natively, which is how its checks are unit-tested.
 //!
@@ -23,13 +25,13 @@
 //! | 96 | 8 | issued at (the token's `iat`, seconds, big-endian) |
 //! | 104 | 20 | the instance's EVM key (an address; zero if it has none) |
 //! | 124 | 32 | the instance's Solana key (ed25519; zero if it has none) |
-//! | 156 | 32 | the hash of the Google key that signed the token ([`Jwk::key_hash`]) |
+//! | 156 | 32 | what the token's signature is trusted by: the Google key that signed it ([`Jwk::key_hash`]), or a PKI token's root certificate ([`pki::root_hash`]) |
 //!
 //! Each chain's registry hands its checker its own journal (160 bytes of
 //! `abi.encode` on an EVM chain, 136 bytes of Borsh on Solana). The checker
-//! rebuilds the canonical journal from it, with the other chain's key and the
-//! Google key's hash carried after the seal, checks that hash against the
-//! keys it trusts, and verifies the seal against `sha256` of the result. So
+//! rebuilds the canonical journal from it, with the other chain's key and
+//! that last hash carried after the seal, checks the hash against the ones
+//! it trusts, and verifies the seal against `sha256` of the result. So
 //! neither registry changes, and the extra bytes on the wire are 52 on
 //! Solana and 64 on an EVM chain.
 
@@ -77,6 +79,29 @@ pub const NONCE_TAG: &[u8] = b"shonin-attestation-nonce:v1";
 /// Google rotates these keys; a checker is deployed with the keys published
 /// when it is.
 pub const GOOGLE_JWKS_2026_10_06: &str = include_str!("../testdata/google-jwks-2026-10-06.json");
+
+/// The Google key set pinned now: what a checker is deployed trusting (on
+/// every EVM chain and on Solana) and what the prover checks tokens against
+/// by default. Pinning a newer set is a new `google-jwks-<date>.json` beside
+/// this one and this line naming it; the scheduled key check reads every
+/// such file.
+pub const PINNED_GOOGLE_JWKS: &str = include_str!("../testdata/google-jwks-2026-10-06.json");
+
+/// Google's Confidential Space Root CA (RSA-4096, valid from 19 January
+/// 2024 to 16 January 2034), as Google publishes it at
+/// `https://confidentialcomputing.googleapis.com/.well-known/confidential_space_root.crt`.
+/// A PKI token's chain ends in it; a checker pins its hash
+/// ([`confidential_space_root_hash`]).
+pub const CONFIDENTIAL_SPACE_ROOT: &str = include_str!("../testdata/confidential-space-root.crt");
+
+/// What a checker pins to accept PKI tokens whose chain ends in Google's
+/// Confidential Space Root CA: `sha256` of the certificate's DER
+/// ([`pki::root_hash`]).
+pub fn confidential_space_root_hash() -> [u8; 32] {
+    pki::root_hash(
+        &pki::pem_der(CONFIDENTIAL_SPACE_ROOT).expect("the pinned root is a PEM certificate"),
+    )
+}
 
 /// One of Google's signing keys, as published in its JWKS.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -169,9 +194,10 @@ impl Binding {
 pub struct Input {
     /// The attestation token, as the compact JWT the instance was given.
     pub token: String,
-    /// The signing keys to check it against: Google's JWKS at the time.
-    /// The one that signed is named in the journal by its hash, and only a
-    /// checker that trusts that hash accepts the proof.
+    /// The signing keys to check an OIDC token against: Google's JWKS at
+    /// the time. The one that signed is named in the journal by its hash,
+    /// and only a checker that trusts that hash accepts the proof. A PKI
+    /// token carries its own chain, and these are not used for it.
     pub keys: Vec<Jwk>,
     /// The prover's clock, in seconds. The token must be valid at it. The
     /// chain judges freshness by the token's `iat` against its own clock.
@@ -188,6 +214,10 @@ pub struct Journal {
     pub issued_at: u64,
     pub evm_signer: [u8; 20],
     pub solana_signer: [u8; 32],
+    /// What the token's signature is trusted by: the signing key's
+    /// [`Jwk::key_hash`] (an OIDC token), or its chain's root certificate's
+    /// [`pki::root_hash`] (a PKI token). The two hash different kinds of
+    /// bytes, so neither can pass for the other.
     pub key_hash: [u8; 32],
 }
 
@@ -260,7 +290,7 @@ impl Journal {
     }
 
     /// What an EVM checker reads after the seal: the Solana key and the
-    /// Google key's hash.
+    /// hash the token is trusted by.
     pub fn evm_seal_tail(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&self.solana_signer);
@@ -309,7 +339,7 @@ impl Journal {
     }
 
     /// What the Solana checker reads after the seal: the EVM key and the
-    /// Google key's hash.
+    /// hash the token is trusted by.
     pub fn solana_seal_tail(&self) -> [u8; 52] {
         let mut out = [0u8; 52];
         out[..20].copy_from_slice(&self.evm_signer);
@@ -365,7 +395,7 @@ pub enum Error {
     Malformed(&'static str),
     /// Not signed with RS256.
     Algorithm,
-    /// No key with the token's `kid` was given.
+    /// No key with the OIDC token's `kid` was given.
     UnknownKey,
     /// The key is too small, or not a valid RSA key.
     WeakKey,
@@ -376,6 +406,8 @@ pub enum Error {
     NotFresh,
     /// The nonce doesn't bind these keys and this root.
     Nonce,
+    /// A PKI token's certificate chain is refused: the reason named.
+    Chain(&'static str),
 }
 
 impl core::fmt::Display for Error {
@@ -389,6 +421,7 @@ impl core::fmt::Display for Error {
             Error::Claim(claim) => write!(f, "the token's `{claim}` claim is not accepted"),
             Error::NotFresh => write!(f, "the token is not valid at the given time"),
             Error::Nonce => write!(f, "the token's nonce does not bind the given keys and root"),
+            Error::Chain(why) => write!(f, "the token's certificate chain is refused: {why}"),
         }
     }
 }
@@ -416,38 +449,63 @@ pub fn verify(input: &Input) -> Result<Journal, Error> {
     if header.get("alg").and_then(Value::as_str) != Some("RS256") {
         return Err(Error::Algorithm);
     }
-    let kid = header
-        .get("kid")
-        .and_then(Value::as_str)
-        .ok_or(Error::Malformed("header"))?;
-    let key = input
-        .keys
-        .iter()
-        .find(|key| key.kid == kid)
-        .ok_or(Error::UnknownKey)?;
-
-    let public = RsaPublicKey::new(
-        BigUint::from_bytes_be(&key.n),
-        BigUint::from_bytes_be(&key.e),
-    )
-    .map_err(|_| Error::WeakKey)?;
-    if rsa::traits::PublicKeyParts::n(&public).bits() < MIN_KEY_BITS {
-        return Err(Error::WeakKey);
-    }
-    let signature =
-        Signature::try_from(b64(signature_b64)?.as_slice()).map_err(|_| Error::BadSignature)?;
     let signed = &input.token[..header_b64.len() + 1 + payload_b64.len()];
-    VerifyingKey::<Sha256>::new(public)
-        .verify(signed.as_bytes(), &signature)
-        .map_err(|_| Error::BadSignature)?;
+    let signature = b64(signature_b64)?;
+
+    // A PKI token carries its signing key's certificate chain, and is trusted
+    // by the chain's root; any other is signed by one of the keys given.
+    let (anchor, chain) = match header.get("x5c") {
+        Some(x5c) => {
+            let chain = pki::check_chain(&pki::decode_x5c(x5c)?)?;
+            verify_rs256(&chain.leaf, signed, &signature)?;
+            (chain.root, Some(chain))
+        }
+        None => {
+            let kid = header
+                .get("kid")
+                .and_then(Value::as_str)
+                .ok_or(Error::Malformed("header"))?;
+            let key = input
+                .keys
+                .iter()
+                .find(|key| key.kid == kid)
+                .ok_or(Error::UnknownKey)?;
+            let public = RsaPublicKey::new(
+                BigUint::from_bytes_be(&key.n),
+                BigUint::from_bytes_be(&key.e),
+            )
+            .map_err(|_| Error::WeakKey)?;
+            if rsa::traits::PublicKeyParts::n(&public).bits() < MIN_KEY_BITS {
+                return Err(Error::WeakKey);
+            }
+            verify_rs256(&public, signed, &signature)?;
+            (key.key_hash(), None)
+        }
+    };
 
     let claims: Value =
         serde_json::from_slice(&b64(payload_b64)?).map_err(|_| Error::Malformed("claims"))?;
+    // Every certificate valid when the token was issued; checked before the
+    // claims, so the nonce stays the last check of all (a token without an
+    // `iat` is refused by the claims' check).
+    if let Some(chain) = chain
+        && let Some(iat) = claims.pointer("/iat").and_then(Value::as_u64)
+    {
+        chain.check_time(iat)?;
+    }
     let journal = check_claims(&claims, input.now, &input.binding)?;
     Ok(Journal {
-        key_hash: key.key_hash(),
+        key_hash: anchor,
         ..journal
     })
+}
+
+/// An RS256 (PKCS#1 v1.5, SHA-256) signature over `signed` by `key`.
+fn verify_rs256(key: &RsaPublicKey, signed: &str, signature: &[u8]) -> Result<(), Error> {
+    let signature = Signature::try_from(signature).map_err(|_| Error::BadSignature)?;
+    VerifyingKey::<Sha256>::new(key.clone())
+        .verify(signed.as_bytes(), &signature)
+        .map_err(|_| Error::BadSignature)
 }
 
 fn string<'a>(claims: &'a Value, pointer: &'static str) -> Result<&'a str, Error> {
@@ -558,6 +616,8 @@ fn check_claims(claims: &Value, now: u64, binding: &Binding) -> Result<Journal, 
         key_hash: [0; 32],
     })
 }
+
+pub mod pki;
 
 #[cfg(any(test, feature = "fixture"))]
 pub mod fixture;

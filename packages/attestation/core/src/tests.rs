@@ -285,6 +285,19 @@ fn a_token_that_is_not_three_parts_is_refused() {
 }
 
 #[test]
+fn the_pinned_key_set_is_one_of_the_dated_sets_the_scheduled_check_reads() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata");
+    let dated: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("google-jwks-") && name.ends_with(".json"))
+        .map(|name| std::fs::read_to_string(format!("{dir}/{name}")).unwrap())
+        .collect();
+    assert!(dated.iter().any(|set| set == PINNED_GOOGLE_JWKS));
+    assert!(!Jwk::from_jwks(PINNED_GOOGLE_JWKS).unwrap().is_empty());
+}
+
+#[test]
 fn google_s_published_keys_parse_and_hash_by_their_material_alone() {
     let keys = Jwk::from_jwks(fixture::GOOGLE_JWKS_2026_10_06).unwrap();
     assert_eq!(keys.len(), 2);
@@ -366,4 +379,5 @@ fn each_chain_rebuilds_the_canonical_journal_from_its_own_journal_and_the_seal_s
     assert_eq!(Journal::from_evm(&journal.evm(), &[0; 63]), None);
 }
 
+mod pki;
 mod real_token;

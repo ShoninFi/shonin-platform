@@ -45,3 +45,21 @@ jobs:
             echo "::error::Google serves signing keys nothing pins: $(echo $new). Deploy a checker trusting them beside the current one, and give the prover the new key set, before tokens signed with them arrive."
             exit 1
           fi
+
+      # PKI tokens are trusted by Google's Confidential Space Root CA, whose
+      # hash the checkers pin (packages/attestation/core/testdata/
+      # confidential-space-root.crt). A different root served means a checker
+      # pinning it is due beside the current one.
+      - name: The served root certificate is the pinned one
+        run: |
+          set -eu
+          url=https://confidentialcomputing.googleapis.com/.well-known/confidential_space_root.crt
+          curl -fsS --retry 3 --retry-delay 10 "$url" -o "$RUNNER_TEMP/served-root.crt"
+          served=$(openssl x509 -in "$RUNNER_TEMP/served-root.crt" -outform der | sha256sum | cut -d' ' -f1)
+          pinned=$(openssl x509 -in packages/attestation/core/testdata/confidential-space-root.crt -outform der | sha256sum | cut -d' ' -f1)
+          echo "served: $served"
+          echo "pinned: $pinned"
+          if [ "$served" != "$pinned" ]; then
+            echo "::error::Google serves a Confidential Space root certificate nothing pins. Deploy a checker trusting it beside the current one before tokens chained to it arrive."
+            exit 1
+          fi

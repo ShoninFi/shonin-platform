@@ -804,6 +804,220 @@ async fn a_google_key_the_chains_checkers_do_not_trust_signs_nothing() {
     );
 }
 
+/// A PKI token from `kind`'s image under `chain` (the test chain's shape,
+/// issued 30 seconds ago), its nonce `nonce`, signed by the leaf's key.
+fn pki_token(nonce: &str, kind: ImageKind, chain: &[Vec<u8>]) -> String {
+    let mut claims = fixture::claims(&Binding::default(), NOW - 30);
+    claims["eat_nonce"] = json!([nonce]);
+    claims["submods"]["container"]["image_digest"] = json!(image_claim(digest_of(kind)));
+    fixture::chain::token(
+        chain,
+        &fixture::chain::key(fixture::chain::LEAF_SEED),
+        &claims,
+    )
+}
+
+/// The checkers as they stand after a rotation to the root: Google's keys
+/// as pinned, and the test chain's root.
+fn trusting_the_root() -> StandIn {
+    let mut chain = StandIn::new();
+    chain.trusted = Jwk::from_jwks(fixture::GOOGLE_JWKS_2026_10_06)
+        .unwrap()
+        .iter()
+        .map(Jwk::key_hash)
+        .chain([fixture::chain::root_hash(NOW - 30)])
+        .collect();
+    chain
+}
+
+#[test]
+fn the_genuine_pki_token_is_accepted_by_the_exchange_s_check_under_google_s_root() {
+    use shonin_attestation_core::confidential_space_root_hash;
+    let token = fixture::REAL_PKI_TOKEN.trim();
+    let nonce = fixture::real_binding().nonce();
+    let now = fixture::REAL_PKI_IAT + 60;
+    // No published Google key is needed: the chain is the token's own.
+    let attested =
+        crate::exchange::check_token(token, &[], &[confidential_space_root_hash()], now, &nonce)
+            .unwrap();
+    assert_eq!(attested.key_hash, confidential_space_root_hash());
+    assert_eq!(attested.issued_at, fixture::REAL_PKI_IAT);
+    assert_eq!(
+        hex::encode(attested.image_digest),
+        fixture::REAL_IMAGE_DIGEST.trim_start_matches("sha256:")
+    );
+    assert_eq!(
+        attested.project_id,
+        B256::from(shonin_attestation_core::project_id(fixture::REAL_PROJECT))
+    );
+    // Checkers that trust only Google's signing keys do not vouch for it.
+    let keys_only: Vec<[u8; 32]> = Jwk::from_jwks(fixture::GOOGLE_JWKS_2026_10_06)
+        .unwrap()
+        .iter()
+        .map(Jwk::key_hash)
+        .collect();
+    assert_eq!(
+        crate::exchange::check_token(token, &google_keys(), &keys_only, now, &nonce).unwrap_err(),
+        Error::UntrustedRoot
+    );
+    // Nor for a request whose nonce it does not bind.
+    assert_eq!(
+        crate::exchange::check_token(
+            token,
+            &[],
+            &[confidential_space_root_hash()],
+            now,
+            &"00".repeat(32)
+        )
+        .unwrap_err(),
+        Error::Nonce
+    );
+}
+
+#[tokio::test]
+async fn a_pki_token_under_a_trusted_root_obtains_what_its_image_may_have() {
+    let root = Root::for_tests(7);
+    let requester = Requester::new(Purpose::platform(DUMMY).unwrap()).unwrap();
+    let token = pki_token(
+        &requester.nonce(),
+        ImageKind::Reviewer,
+        &fixture::chain::chain(NOW - 30),
+    );
+    assert!(
+        ask(&trusting_the_root(), &root, &requester, token, None)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_chain_the_guest_refuses_is_refused_by_the_exchange() {
+    use fixture::chain::{INTERMEDIATE_SEED, LEAF_SEED, OTHER_ROOT_SEED, ROOT_SEED, Spec, key};
+    use shonin_attestation_core::Error as Guest;
+    let root = Root::for_tests(7);
+    let iat = NOW - 30;
+    let (leaf, intermediate, top) = (Spec::leaf(iat), Spec::intermediate(iat), Spec::root(iat));
+    let refused = [
+        (
+            fixture::chain::chain_of(
+                &leaf,
+                &Spec {
+                    not_after: iat - 1,
+                    ..intermediate.clone()
+                },
+                &top,
+            ),
+            Error::Token(Guest::Chain("validity")),
+        ),
+        (
+            fixture::chain::chain_of(
+                &Spec {
+                    not_before: iat + 1,
+                    ..leaf.clone()
+                },
+                &intermediate,
+                &top,
+            ),
+            Error::Token(Guest::Chain("validity")),
+        ),
+        (
+            fixture::chain::chain_of(
+                &leaf,
+                &Spec {
+                    basic: Some((false, None)),
+                    ..intermediate.clone()
+                },
+                &top,
+            ),
+            Error::Token(Guest::Chain("not a CA")),
+        ),
+        (
+            {
+                // The leaf signed by the root's key, not the intermediate's.
+                let mut chain = fixture::chain::chain(iat);
+                chain[0] = fixture::chain::certificate(
+                    &leaf,
+                    &key(LEAF_SEED).to_public_key(),
+                    &key(ROOT_SEED),
+                );
+                chain
+            },
+            Error::Token(Guest::Chain("signature")),
+        ),
+        (
+            {
+                // A self-consistent chain under a root no checker pins.
+                let other = key(OTHER_ROOT_SEED);
+                let intermediate_key = key(INTERMEDIATE_SEED);
+                vec![
+                    fixture::chain::certificate(
+                        &leaf,
+                        &key(LEAF_SEED).to_public_key(),
+                        &intermediate_key,
+                    ),
+                    fixture::chain::certificate(
+                        &intermediate,
+                        &intermediate_key.to_public_key(),
+                        &other,
+                    ),
+                    fixture::chain::certificate(&top, &other.to_public_key(), &other),
+                ]
+            },
+            Error::UntrustedRoot,
+        ),
+    ];
+    for (chain, refusal) in refused {
+        let requester = Requester::new(Purpose::platform(DUMMY).unwrap()).unwrap();
+        let token = pki_token(&requester.nonce(), ImageKind::Reviewer, &chain);
+        assert_eq!(
+            ask(&trusting_the_root(), &root, &requester, token, None)
+                .await
+                .unwrap_err(),
+            refusal
+        );
+    }
+    // A token signed by a key other than its leaf's.
+    let requester = Requester::new(Purpose::platform(DUMMY).unwrap()).unwrap();
+    let mut claims = fixture::claims(&Binding::default(), iat);
+    claims["eat_nonce"] = json!([requester.nonce()]);
+    claims["submods"]["container"]["image_digest"] =
+        json!(image_claim(digest_of(ImageKind::Reviewer)));
+    let forged = fixture::chain::token(
+        &fixture::chain::chain(iat),
+        &key(INTERMEDIATE_SEED),
+        &claims,
+    );
+    assert_eq!(
+        ask(&trusting_the_root(), &root, &requester, forged, None)
+            .await
+            .unwrap_err(),
+        Error::Token(Guest::BadSignature)
+    );
+}
+
+#[tokio::test]
+async fn after_google_rotates_its_key_an_oidc_token_is_refused_and_a_pki_token_accepted() {
+    // Google now signs OIDC tokens with a key it publishes (the test key,
+    // among the keys fetched) that no checker pins; the checkers pin the
+    // earlier keys and the root.
+    let root = Root::for_tests(7);
+    let chain = trusting_the_root();
+    let dummy = Purpose::platform(DUMMY).unwrap();
+    assert_eq!(
+        ask_as(&chain, &root, ImageKind::Reviewer, &dummy, None)
+            .await
+            .unwrap_err(),
+        Error::UntrustedGoogleKey
+    );
+    let requester = Requester::new(dummy).unwrap();
+    let token = pki_token(
+        &requester.nonce(),
+        ImageKind::Reviewer,
+        &fixture::chain::chain(NOW - 30),
+    );
+    assert!(ask(&chain, &root, &requester, token, None).await.is_ok());
+}
+
 #[tokio::test]
 async fn a_vaults_key_needs_a_proof_from_a_key_blessed_for_that_vault() {
     let root = Root::for_tests(7);

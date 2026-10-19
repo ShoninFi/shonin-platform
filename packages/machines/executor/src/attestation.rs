@@ -517,8 +517,10 @@ fn claims(token: &str) -> Result<Claims> {
     })
 }
 
-/// Ask Confidential Space's launcher for a token whose nonce is `nonce`, over
-/// its unix socket.
+/// Ask Confidential Space's launcher for a PKI token whose nonce is
+/// `nonce`, over its unix socket: its header carries its signing key's
+/// certificate chain, and its proof is trusted by Google's Confidential
+/// Space Root CA, so it outlasts Google's rotation of its signing keys.
 pub async fn request_token(socket: &Path, nonce: &str) -> Result<String> {
     use http_body_util::BodyExt;
 
@@ -534,7 +536,7 @@ pub async fn request_token(socket: &Path, nonce: &str) -> Result<String> {
     }));
     let body = serde_json::json!({
         "audience": AUDIENCE,
-        "token_type": "OIDC",
+        "token_type": shonin_rootkey::launcher::TOKEN_TYPE,
         "nonces": [nonce],
     })
     .to_string();
@@ -2832,7 +2834,7 @@ mod tests {
         attestation.hold(token).unwrap();
         let asked = asked.lock().unwrap().clone().unwrap();
         assert_eq!(asked["audience"], AUDIENCE);
-        assert_eq!(asked["token_type"], "OIDC");
+        assert_eq!(asked["token_type"], "PKI");
         assert_eq!(asked["nonces"], serde_json::json!([nonce]));
         assert_eq!(attestation.status().token_issued_at, Some(NOW));
         let _ = std::fs::remove_dir_all(&dir);

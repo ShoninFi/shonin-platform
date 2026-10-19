@@ -190,9 +190,17 @@ pub fn input(binding: &Binding, iat: u64, now: u64) -> Input {
 /// root ([`real_binding`]). Proof that the checks accept what Confidential
 /// Space really issues, not only what its documentation describes.
 pub const REAL_TOKEN: &str = include_str!("../testdata/cs-token-oidc-2026-10-06.jwt");
-/// The same claims from the same VM in Google's PKI format (an `x5c` chain
-/// in the header, no `kid` among Google's published keys).
+/// The same claims from the same VM in Google's PKI format: an `x5c` chain
+/// in the header (leaf, intermediate, Google's Confidential Space Root CA),
+/// signed by the leaf's key, whose `kid` is among no published keys.
 pub const REAL_PKI_TOKEN: &str = include_str!("../testdata/cs-token-pki-2026-10-06.jwt");
+/// The real PKI token's `iat` (a second after the OIDC token's); it
+/// expires an hour later.
+pub const REAL_PKI_IAT: u64 = 1_791_320_212;
+/// `sha256` of Google's Confidential Space Root CA certificate (DER), as
+/// `openssl x509 -outform der | sha256sum` gives it.
+pub const CONFIDENTIAL_SPACE_ROOT_HASH: &str =
+    "148b293821bb0c6a317f413c8ba475814091cb22d49b9e3c94198db8e8f86c39";
 /// The real token's `iat`; it expires an hour later, at [`REAL_EXP`].
 pub const REAL_IAT: u64 = 1_791_320_211;
 pub const REAL_EXP: u64 = REAL_IAT + 3600;
@@ -242,5 +250,282 @@ pub fn real_input(now: u64) -> Input {
         keys: Jwk::from_jwks(GOOGLE_JWKS_2026_10_06).expect("Google's JWKS parses"),
         now,
         binding: real_binding(),
+    }
+}
+
+/// A certificate chain of the test's own, in the shape Google's PKI tokens
+/// carry (a leaf, an intermediate CA, a root CA), its keys generated from
+/// fixed public seeds like the test key. A checker deployed for real pins
+/// Google's root, never this one.
+pub mod chain {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::str::FromStr;
+    use core::time::Duration;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::EncodePublicKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use serde_json::{Value, json};
+    use sha2::Sha256;
+    use x509_cert::certificate::{Certificate, TbsCertificate, Version};
+    use x509_cert::der::asn1::{Any, BitString, ObjectIdentifier, OctetString, UtcTime};
+    use x509_cert::der::{Decode, Encode};
+    use x509_cert::ext::Extension;
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+    use x509_cert::time::{Time, Validity};
+
+    use crate::{Binding, Input};
+
+    /// The seeds the chain's keys are generated from. Public on purpose:
+    /// they sign nothing but fixtures.
+    pub const ROOT_SEED: [u8; 32] = *b"shonin attestation test root  01";
+    pub const INTERMEDIATE_SEED: [u8; 32] = *b"shonin attestation test interm01";
+    pub const LEAF_SEED: [u8; 32] = *b"shonin attestation test leaf  01";
+    /// Another root, which no checker pins.
+    pub const OTHER_ROOT_SEED: [u8; 32] = *b"shonin attestation other root 01";
+
+    const SEEDS: [[u8; 32]; 4] = [ROOT_SEED, INTERMEDIATE_SEED, LEAF_SEED, OTHER_ROOT_SEED];
+
+    /// The key generated from `seed` (one of the seeds above), the same
+    /// every time and generated once per process.
+    pub fn key(seed: [u8; 32]) -> RsaPrivateKey {
+        use rand_chacha::ChaCha20Rng;
+        use rand_chacha::rand_core::SeedableRng;
+        static KEYS: [std::sync::OnceLock<RsaPrivateKey>; 4] = [
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+        ];
+        let at = SEEDS
+            .iter()
+            .position(|known| *known == seed)
+            .expect("one of the fixture's seeds");
+        KEYS[at]
+            .get_or_init(|| {
+                RsaPrivateKey::new(&mut ChaCha20Rng::from_seed(seed), 2048)
+                    .expect("the test key generates")
+            })
+            .clone()
+    }
+
+    pub const ROOT_NAME: &str = "CN=Shonin Test Root CA,O=Shonin Test";
+    pub const INTERMEDIATE_NAME: &str = "CN=Shonin Test Intermediate CA,O=Shonin Test";
+    pub const LEAF_NAME: &str = "CN=Shonin Test Leaf Certificate,O=Shonin Test";
+
+    /// `sha256WithRSAEncryption`.
+    pub const SHA256_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+    /// An extension no checker knows (a private arc).
+    pub const UNKNOWN_EXTENSION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
+
+    /// What one certificate says.
+    #[derive(Clone, Debug)]
+    pub struct Spec {
+        pub subject: &'static str,
+        pub issuer: &'static str,
+        /// Valid from and until (inclusive), Unix seconds.
+        pub not_before: u64,
+        pub not_after: u64,
+        /// Basic constraints, if present: `cA` and the path length
+        /// constraint.
+        pub basic: Option<(bool, Option<u8>)>,
+        /// Key usage, if present.
+        pub usage: Option<x509_cert::der::flagset::FlagSet<KeyUsages>>,
+        /// An extension no checker knows, marked critical.
+        pub unknown_critical: bool,
+        /// The signature algorithm named (sha256WithRSAEncryption unless
+        /// a test says otherwise).
+        pub algorithm: ObjectIdentifier,
+    }
+
+    impl Spec {
+        /// A root CA, valid for twenty years around `iat`.
+        pub fn root(iat: u64) -> Spec {
+            Spec {
+                subject: ROOT_NAME,
+                issuer: ROOT_NAME,
+                not_before: iat - 10 * 365 * 86_400,
+                not_after: iat + 10 * 365 * 86_400,
+                basic: Some((true, None)),
+                usage: Some(KeyUsages::KeyCertSign | KeyUsages::CRLSign),
+                unknown_critical: false,
+                algorithm: SHA256_WITH_RSA,
+            }
+        }
+
+        /// An intermediate CA, valid for three years around `iat`.
+        pub fn intermediate(iat: u64) -> Spec {
+            Spec {
+                subject: INTERMEDIATE_NAME,
+                issuer: ROOT_NAME,
+                not_before: iat - 365 * 86_400,
+                not_after: iat + 2 * 365 * 86_400,
+                ..Spec::root(iat)
+            }
+        }
+
+        /// A leaf as Google issues them: not a CA, no key usage, valid for
+        /// sixty days from a few days before `iat`.
+        pub fn leaf(iat: u64) -> Spec {
+            Spec {
+                subject: LEAF_NAME,
+                issuer: INTERMEDIATE_NAME,
+                not_before: iat - 3 * 86_400,
+                not_after: iat + 57 * 86_400,
+                basic: Some((false, None)),
+                usage: None,
+                unknown_critical: false,
+                algorithm: SHA256_WITH_RSA,
+            }
+        }
+    }
+
+    fn time(seconds: u64) -> Time {
+        Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(seconds)).expect("a time"))
+    }
+
+    fn extension(oid: ObjectIdentifier, critical: bool, value: Vec<u8>) -> Extension {
+        Extension {
+            extn_id: oid,
+            critical,
+            extn_value: OctetString::new(value).expect("an extension value"),
+        }
+    }
+
+    /// A certificate of `subject`'s key as `spec` says, signed by `issuer`.
+    pub fn certificate(spec: &Spec, subject: &RsaPublicKey, issuer: &RsaPrivateKey) -> Vec<u8> {
+        let algorithm = AlgorithmIdentifierOwned {
+            oid: spec.algorithm,
+            parameters: Some(Any::null()),
+        };
+        let mut extensions = Vec::new();
+        if let Some((ca, path_len_constraint)) = spec.basic {
+            let value = BasicConstraints {
+                ca,
+                path_len_constraint,
+            };
+            extensions.push(extension(
+                ObjectIdentifier::new_unwrap("2.5.29.19"),
+                true,
+                value.to_der().unwrap(),
+            ));
+        }
+        if let Some(usage) = spec.usage {
+            extensions.push(extension(
+                ObjectIdentifier::new_unwrap("2.5.29.15"),
+                true,
+                KeyUsage(usage).to_der().unwrap(),
+            ));
+        }
+        if spec.unknown_critical {
+            extensions.push(extension(UNKNOWN_EXTENSION, true, alloc::vec![0x05, 0x00]));
+        }
+        let spki = subject.to_public_key_der().expect("an RSA key encodes");
+        let tbs = TbsCertificate {
+            version: Version::V3,
+            serial_number: SerialNumber::new(&[0x01, 0x23, 0x45]).unwrap(),
+            signature: algorithm.clone(),
+            issuer: Name::from_str(spec.issuer).unwrap(),
+            validity: Validity {
+                not_before: time(spec.not_before),
+                not_after: time(spec.not_after),
+            },
+            subject: Name::from_str(spec.subject).unwrap(),
+            subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(spki.as_bytes()).unwrap(),
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: Some(extensions),
+        };
+        let signature: Vec<u8> = SigningKey::<Sha256>::new(issuer.clone())
+            .sign(&tbs.to_der().unwrap())
+            .to_vec();
+        Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: algorithm,
+            signature: BitString::from_bytes(&signature).unwrap(),
+        }
+        .to_der()
+        .unwrap()
+    }
+
+    /// The test chain, as Google's: leaf, intermediate, root, each as its
+    /// spec says, each signed by the next (the root by itself).
+    pub fn chain_of(leaf: &Spec, intermediate: &Spec, root: &Spec) -> Vec<Vec<u8>> {
+        let (root_key, intermediate_key, leaf_key) =
+            (key(ROOT_SEED), key(INTERMEDIATE_SEED), key(LEAF_SEED));
+        alloc::vec![
+            certificate(leaf, &leaf_key.to_public_key(), &intermediate_key),
+            certificate(intermediate, &intermediate_key.to_public_key(), &root_key),
+            certificate(root, &root_key.to_public_key(), &root_key),
+        ]
+    }
+
+    /// The test chain for a token issued at `iat`.
+    pub fn chain(iat: u64) -> Vec<Vec<u8>> {
+        chain_of(&Spec::leaf(iat), &Spec::intermediate(iat), &Spec::root(iat))
+    }
+
+    /// What a checker pins to accept tokens chained to the test root.
+    pub fn root_hash(iat: u64) -> [u8; 32] {
+        crate::pki::root_hash(chain(iat).last().unwrap())
+    }
+
+    /// The test root as a PEM certificate, as a prover is given a root.
+    pub fn root_pem(iat: u64) -> String {
+        let der = STANDARD.encode(chain(iat).pop().unwrap());
+        let lines: Vec<&str> = der
+            .as_bytes()
+            .chunks(64)
+            .map(|line| core::str::from_utf8(line).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            lines.join("\n")
+        )
+    }
+
+    /// A PKI token's header carrying `chain`.
+    pub fn header(chain: &[Vec<u8>]) -> Value {
+        let x5c: Vec<String> = chain.iter().map(|der| STANDARD.encode(der)).collect();
+        json!({"alg": "RS256", "kid": "shonin-test-leaf", "typ": "JWT", "x5c": x5c})
+    }
+
+    /// `claims` as a PKI token carrying `chain`, signed by `signer`.
+    pub fn token(chain: &[Vec<u8>], signer: &RsaPrivateKey, claims: &Value) -> String {
+        super::sign_with(signer, &header(chain), claims)
+    }
+
+    /// A guest input that passes: a PKI token issued at `iat` under the test
+    /// chain, checked at `now`. No JWKS key is given: the chain is the
+    /// token's own.
+    pub fn input(binding: &Binding, iat: u64, now: u64) -> Input {
+        Input {
+            token: token(&chain(iat), &key(LEAF_SEED), &super::claims(binding, iat)),
+            keys: Vec::new(),
+            now,
+            binding: *binding,
+        }
+    }
+
+    /// The header's `x5c` of a compact token, decoded.
+    pub fn x5c_of(token: &str) -> Vec<Vec<u8>> {
+        let header = token.split('.').next().unwrap();
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+        header["x5c"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| STANDARD.decode(item.as_str().unwrap()).unwrap())
+            .collect()
     }
 }

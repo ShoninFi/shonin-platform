@@ -1,11 +1,11 @@
 //! The attested path end to end, on a local chain: a launcher that hands out
-//! tokens (in Google's format, signed by the fixture's test key), the
-//! executor's attestation asking it for one that binds its keys, the
-//! attestation prover proving that token with a real Groth16 proof and
+//! PKI tokens (in Google's format, under the fixture's test certificate
+//! chain), the executor's attestation asking it for one that binds its keys,
+//! the attestation prover proving that token with a real Groth16 proof and
 //! posting the seal back, the executor taking the seal only once a `bless`
 //! of it simulates on the chain, and then each key in the tree blessed from
 //! that one seal, as the keeper sends it, through a Confidential Space
-//! checker that trusts the test key.
+//! checker that trusts the test chain's root.
 //!
 //! Ignored: it needs `anvil`, the contracts built (`task contracts:build`),
 //! Docker (for the Groth16 step) and the prover built with the guest:
@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolValue;
-use base64::Engine;
 use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
 use shonin_attestation_core::fixture;
 
@@ -62,18 +61,9 @@ fn creation_code(name: &str) -> Vec<u8> {
     alloy::hex::decode(artifact["bytecode"]["object"].as_str().unwrap()).unwrap()
 }
 
-/// The test key's JWKS, as a key set file the prover reads.
-fn test_jwks() -> String {
-    let key = fixture::test_jwk();
-    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    serde_json::json!({"keys": [{"kty": "RSA", "alg": "RS256", "use": "sig",
-        "kid": key.kid, "n": b64(&key.n), "e": b64(&key.e)}]})
-    .to_string()
-}
-
-/// A launcher on a unix socket that answers every token request with a
-/// token of Google's shape, for the nonce asked, signed by the test key and
-/// dated `iat`.
+/// A launcher on a unix socket that answers every token request, which
+/// must ask for a PKI token, with a PKI token of Google's shape, for the
+/// nonce asked, under the test chain and dated `iat`.
 async fn fake_launcher(socket: &Path, iat: u64) -> crate::AbortOnDrop {
     let _ = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
@@ -83,9 +73,14 @@ async fn fake_launcher(socket: &Path, iat: u64) -> crate::AbortOnDrop {
             move |axum::Json(body): axum::Json<serde_json::Value>| async move {
                 let nonce = body["nonces"][0].as_str().unwrap_or_default().to_string();
                 assert_eq!(body["audience"], crate::attestation::AUDIENCE);
+                assert_eq!(body["token_type"], "PKI");
                 let mut claims = fixture::claims(&fixture::binding(), iat);
                 claims["eat_nonce"] = serde_json::json!(nonce);
-                fixture::sign(&claims)
+                fixture::chain::token(
+                    &fixture::chain::chain(iat),
+                    &fixture::chain::key(fixture::chain::LEAF_SEED),
+                    &claims,
+                )
             },
         ),
     );
@@ -140,8 +135,11 @@ async fn one_real_groth16_proof_of_a_launcher_token_blesses_every_key_in_the_tre
     let (admin, attestor, keeper) = (accounts[0], accounts[1], accounts[2]);
 
     // The registry, its development checker, and a Confidential Space
-    // checker for the pinned guest that trusts the test key; the fixture's
-    // image and project allowed.
+    // checker for the pinned guest that trusts the test chain's root; the
+    // fixture's image and project allowed. The launcher's tokens are dated a
+    // minute before the chain's head (the registry refuses one from after
+    // its block).
+    let iat = client.block_timestamp().await.unwrap() - 60;
     let mut dev = creation_code("DevAttestationVerifier");
     dev.extend(attestor.abi_encode());
     let dev = client.deploy(admin, dev).await.unwrap();
@@ -155,7 +153,7 @@ async fn one_real_groth16_proof_of_a_launcher_token_blesses_every_key_in_the_tre
         registry,
         None,
         shonin_attestation_deploy::GUEST_IMAGE_ID,
-        &[B256::from(fixture::test_jwk().key_hash())],
+        &[B256::from(fixture::chain::root_hash(iat))],
     )
     .await
     .unwrap();
@@ -202,9 +200,7 @@ async fn one_real_groth16_proof_of_a_launcher_token_blesses_every_key_in_the_tre
         );
     }
 
-    // A launcher handing out tokens dated a minute before the chain's head
-    // (the registry refuses one from after its block), and the status port.
-    let iat = client.block_timestamp().await.unwrap() - 60;
+    // The launcher, and the status port.
     let socket = scratch.join("teeserver.sock");
     let _launcher = fake_launcher(&socket, iat).await;
     let _attesting = crate::AbortOnDrop(tokio::spawn(attestation.clone().run(socket)));
@@ -223,17 +219,17 @@ async fn one_real_groth16_proof_of_a_launcher_token_blesses_every_key_in_the_tre
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // The prover, against the test key's key set.
-    let jwks = scratch.join("test-jwks.json");
-    std::fs::write(&jwks, test_jwks()).unwrap();
+    // The prover, against the test chain's root.
+    let root = scratch.join("test-root.crt");
+    std::fs::write(&root, fixture::chain::root_pem(iat)).unwrap();
     let proving = Instant::now();
     let _prover = Running(
         Command::new(&prover)
             .args([
                 "--executor-url",
                 &executor_url,
-                "--keys",
-                jwks.to_str().unwrap(),
+                "--root",
+                root.to_str().unwrap(),
                 "--poll-seconds",
                 "2",
                 "--idle-exit-seconds",

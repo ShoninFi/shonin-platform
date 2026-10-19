@@ -10,9 +10,10 @@
 //!
 //! Given a genuine token instead (one a Confidential Space VM was issued,
 //! with the binding its nonce commits to), it proves that token against
-//! Google's published keys alone and writes `<dir>/<Name>.sol` (a library
-//! `<Name>`, `RealTokenFixture` by default), for a checker that trusts
-//! Google's keys:
+//! Google's published keys alone (an OIDC token) or Google's Confidential
+//! Space Root CA alone (a PKI token), and writes `<dir>/<Name>.sol` (a
+//! library `<Name>`, `RealTokenFixture` by default), for a checker that
+//! trusts them:
 //!
 //! `attestation-fixture --token <token.jwt> --binding <binding.json> [--now <unix seconds>] [--name <Name>] <dir>`
 //!
@@ -29,7 +30,7 @@ use serde_json::{Value, json};
 use shonin_attestation::{
     Binding, Input, Jwk, Proof, evm_seal, image_id, prove, solana_seal, verify,
 };
-use shonin_attestation_core::{GOOGLE_JWKS_2026_10_06, fixture};
+use shonin_attestation_core::{GOOGLE_JWKS_2026_10_06, confidential_space_root_hash, fixture};
 
 /// When the fixture's token was issued; a test warps the chain to after it.
 const IAT: u64 = 1_790_000_000;
@@ -339,7 +340,29 @@ fn real_token(
     let (receipt, proved) = prove(&input, Proof::Groth16)?;
     let seconds = started.elapsed().as_secs();
     anyhow::ensure!(proved == journal, "the guest committed another journal");
-    verify(&receipt, &google, false).context("the fresh receipt does not verify")?;
+    // A PKI token is trusted by Google's root alone, an OIDC token by
+    // Google's keys alone.
+    let root = confidential_space_root_hash();
+    let pki = journal.key_hash == root;
+    let trusted = if pki { vec![root] } else { google.clone() };
+    verify(&receipt, &trusted, false).context("the fresh receipt does not verify")?;
+    let (signed_by, anchor) = if pki {
+        (
+            "a PKI token signed under Google's Confidential\n// Space Root CA, checked against that root alone",
+            format!(
+                "/// The hash of the root certificate the token's chain ends in:\n    /// Google's Confidential Space Root CA.\n    bytes32 internal constant ROOT_HASH = 0x{};",
+                hex::encode(journal.key_hash)
+            ),
+        )
+    } else {
+        (
+            "signed by Google, checked against Google's\n// published keys alone",
+            format!(
+                "/// The hash of Google's key that signed the token.\n    bytes32 internal constant JWK_HASH = 0x{};",
+                hex::encode(journal.key_hash)
+            ),
+        )
+    };
 
     let bytes = |value: &[u8]| format!("hex\"{}\"", hex::encode(value));
     let word = |value: &[u8]| format!("0x{}", hex::encode(value));
@@ -354,13 +377,12 @@ pragma solidity ^0.8.30;
 
 // Written by the attestation-fixture binary of packages/attestation/host
 // (`--token`): a real RISC Zero Groth16 proof of the attestation guest over a
-// genuine Confidential Space token, signed by Google, checked against
-// Google's published keys alone. The guest ran in {cycles} cycles; the
-// Groth16 proof took {seconds} s. Regenerate it whenever the guest changes.
+// genuine Confidential Space token, {signed_by}. The guest ran in {cycles}
+// cycles; the Groth16 proof took {seconds} s. Regenerate it whenever the
+// guest changes.
 library {name} {{
     bytes32 internal constant IMAGE_ID = {image_id};
-    /// The hash of Google's key that signed the token.
-    bytes32 internal constant JWK_HASH = {key_hash};
+    {anchor}
     bytes internal constant SEAL = {seal};
     bytes internal constant JOURNAL = {journal};
     bytes32 internal constant IMAGE_DIGEST = {image_digest};
@@ -378,7 +400,6 @@ library {name} {{
 }}
 "#,
         image_id = word(&image_id()),
-        key_hash = word(&journal.key_hash),
         seal = bytes(&evm_seal(&receipt, &journal)?),
         journal = bytes(&journal.evm()),
         image_digest = word(&journal.image_digest),
