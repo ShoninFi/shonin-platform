@@ -300,8 +300,11 @@ jobs:
       # enough to link quickly and fit the runner's disk.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # Submodules too: the chain crate's tests read the EVM sources (and the
+      # libraries they import) that its helper code was compiled from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: recursive
           persist-credentials: false
 
       # Every test binary of the workspace is large; the runner image's

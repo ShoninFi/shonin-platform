@@ -7396,6 +7396,7 @@ dependencies = [
  "hyper-util",
  "ort",
  "reqwest",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
