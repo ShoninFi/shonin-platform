@@ -44,6 +44,9 @@ tracing-subscriber.workspace = true
 # The call hook times the host's work for each agent, which its fuel budget
 # is charged for.
 wasmtime = { workspace = true, features = ["call-hook"] }
+# The host's work for an agent is timed on the thread's own CPU clock, so time
+# the machine gives to other work is never counted as the agent's.
+rustix = { workspace = true, features = ["time"] }
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
 hyper.workspace = true

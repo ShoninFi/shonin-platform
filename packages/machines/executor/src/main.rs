@@ -3950,7 +3950,9 @@ mod tests {
             place: host::Place::Evm(host::Evm {
                 chain: client,
                 key: shared.key.clone(),
-                vault: Address::repeat_byte(0x11),
+                // A vault of its own: a fuel budget is the vault's, and no
+                // other test's agent has left this one owing.
+                vault: Address::repeat_byte(0x1f),
                 station: Address::repeat_byte(0x55),
                 venue: Address::ZERO,
                 usd: Address::ZERO,
@@ -3963,7 +3965,13 @@ mod tests {
             drivers: vec!["local".to_string()],
             models: None,
             network: false,
-            allowances: shared::Allowances::modest(),
+            // A core's rate: time parked for want of fuel isn't counted
+            // against the limit, so the start function is paid for in full
+            // and runs its time out.
+            allowances: shared::Allowances {
+                fuel_per_sec: shared::manifest::FUEL_PER_CORE_SECOND,
+                ..shared::Allowances::modest()
+            },
             halting_heard: Default::default(),
             running: running.clone(),
             instantiate_within: Duration::from_secs(1),

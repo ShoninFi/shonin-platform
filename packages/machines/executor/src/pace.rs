@@ -8,9 +8,12 @@
 //!
 //! The budget is charged with the fuel the agent burnt, read from its store
 //! at every check of the engine's clock ([`CHECK_EVERY`]), and also when a
-//! run of the agent ends. When the budget runs dry the agent's task is
-//! parked, an async wait between two instructions, until the budget has
-//! filled again; other agents and the host carry on meanwhile. A check sees
+//! run of the agent ends. The clock's thread may be kept waiting on a busy
+//! machine, so a check is also brought forward whenever the agent has burnt
+//! another [`crate::runner::YIELD_FUEL`] and its budget is dry. When the
+//! budget runs dry the agent's task is parked, an async wait between two
+//! instructions, until the budget has filled again; other agents and the
+//! host carry on meanwhile. A check sees
 //! only what the agent burnt since the last one, so an agent can burn past
 //! what is left: that is owed, and repaid out of what fills before it runs
 //! again. So that little is owed, an agent is parked before it starts on a
@@ -54,7 +57,7 @@ pub struct Budget {
     bucket: Mutex<Bucket>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Bucket {
     /// Fuel a second it fills at. Never zero.
     rate: u64,
@@ -176,6 +179,17 @@ impl Budget {
         bucket.charge(used);
         bucket.slice = used;
         !bucket.wait().is_zero()
+    }
+
+    /// Whether, were the agent charged `used` now, it would be parked: what
+    /// [`Budget::spend`] would say, charging nothing.
+    pub fn dry_after(&self, used: u64, now: Instant) -> bool {
+        let mut bucket = self.bucket();
+        bucket.fill(now);
+        let mut after = bucket.clone();
+        after.charge(used);
+        after.slice = used;
+        !after.wait().is_zero()
     }
 
     /// Charge fuel burnt as a run of the agent ended: it is owed like any

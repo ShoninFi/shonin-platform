@@ -264,10 +264,20 @@ pub type OnParked<T> = Box<dyn FnMut(&mut T) + Send + Sync>;
 /// has filled. Whatever was used after the last tick is charged when the
 /// store is dropped, however the run ended.
 ///
+/// The engine's clock is a thread of its own, which a busy machine may not
+/// get round to running. So the budget is also looked at every time the
+/// strategy's fuel passes a multiple of [`YIELD_FUEL`], which it can't do
+/// without the host seeing it (at a yield, if not before): if the budget is
+/// dry, the clock is moved on there and then, and the strategy is parked at
+/// its next check. However the machine is loaded, a strategy runs at most a
+/// slice past what it paid for.
+///
 /// What it used is the fuel its own code burnt and the time the host spent
 /// working for it ([`HostClock`]), a core's second being worth
 /// [`shared::manifest::FUEL_PER_CORE_SECOND`]. The store is driven through
-/// [`Drive`], so that only the time it is being run is counted.
+/// [`Drive`], so that only the time it is being run is counted. The engine's
+/// clock checking on it, and the yield or park that follows, are the host's
+/// own bookkeeping, and are not counted.
 pub struct Paced<T: 'static> {
     store: Store<T>,
     budget: Arc<crate::pace::Budget>,
@@ -279,23 +289,55 @@ pub struct Paced<T: 'static> {
 
 impl<T: 'static> Paced<T> {
     pub fn new(
+        store: Store<T>,
+        budget: Arc<crate::pace::Budget>,
+        parked: OnParked<T>,
+    ) -> Result<Self> {
+        Self::timed(store, budget, parked, thread_cpu)
+    }
+
+    /// As [`Paced::new`], the host's time read from `clock`.
+    fn timed(
         mut store: Store<T>,
         budget: Arc<crate::pace::Budget>,
         mut parked: OnParked<T>,
+        clock: Clock,
     ) -> Result<Self> {
         store.set_fuel(BANK)?;
         store.fuel_async_yield_interval(Some(YIELD_FUEL))?;
         store.set_epoch_deadline(1);
         let seen = Arc::new(std::sync::atomic::AtomicU64::new(BANK));
-        let host = Arc::new(HostClock::default());
+        let host = Arc::new(HostClock::new(clock));
         let parked_for = Arc::new(Parked::default());
         // Every way out of the strategy's code into the host's (an import,
         // a call the runtime makes for it, a return from an export) and
         // back passes through here: what lies between is the host's time.
         let watched = host.clone();
-        store.call_hook(move |_, hook| {
+        let (looked_at, seen_by_hook) = (budget.clone(), seen.clone());
+        // How much fuel the strategy will have burnt when its budget is next
+        // looked at here.
+        let mut next_look = YIELD_FUEL;
+        store.call_hook(move |mut store, hook| {
             if hook.entering_host() {
                 watched.enter();
+                // The store's count of fuel is up to date whenever the
+                // strategy calls out.
+                if matches!(hook, wasmtime::CallHook::CallingHost) {
+                    let left = store.get_fuel()?;
+                    let burnt = BANK.saturating_sub(left);
+                    if burnt >= next_look {
+                        next_look = (burnt / YIELD_FUEL + 1).saturating_mul(YIELD_FUEL);
+                        let unseen = seen_by_hook.load(Ordering::SeqCst).saturating_sub(left);
+                        if looked_at.dry_after(unseen, tokio::time::Instant::now()) {
+                            // Bring the next check forward to now: it charges
+                            // what was burnt, and parks the strategy. The
+                            // clock is the engine's, so other strategies are
+                            // checked early too, which costs them nothing.
+                            store.set_epoch_deadline(0);
+                            store.engine().increment_epoch();
+                        }
+                    }
+                }
             } else {
                 watched.leave();
             }
@@ -310,6 +352,9 @@ impl<T: 'static> Paced<T> {
         );
         store.epoch_deadline_callback(move |mut store| {
             use wasmtime::UpdateDeadline;
+            // The check, and the yield or park it leads to, interrupt the
+            // strategy: no call of its own, so none of it is its time.
+            host_by_checks.interrupted();
             // Fuel is never topped up, so the store holds less of it only
             // for what the strategy burnt.
             let left = store.get_fuel()?;
@@ -321,10 +366,6 @@ impl<T: 'static> Paced<T> {
             let park = charged.spend(used, now);
             if park {
                 parked(store.data_mut());
-            }
-            // The metering's own work is not the strategy's.
-            host_by_checks.skip();
-            if park {
                 yielded = now;
                 let (budget, parked) = (charged.clone(), parked_by_checks.clone());
                 return Ok(UpdateDeadline::YieldCustom(
@@ -360,6 +401,20 @@ impl<T: 'static> Paced<T> {
     }
 }
 
+/// A reading of the clock the host's work for a strategy is timed on. Only
+/// the difference between two readings on one thread means anything.
+pub type Clock = fn() -> Duration;
+
+/// The CPU time the calling thread has had: it stands still while the thread
+/// is waiting for a core, or blocked.
+pub fn thread_cpu() -> Duration {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    Duration::new(
+        u64::try_from(now.tv_sec).unwrap_or(0),
+        u32::try_from(now.tv_nsec).unwrap_or(0),
+    )
+}
+
 /// The time the host spends working for a strategy, outside its own code:
 /// in its imports, lifting and lowering what they take and give, in the
 /// runtime's calls on its behalf, and in polling the work its calls set
@@ -373,100 +428,135 @@ impl<T: 'static> Paced<T> {
 /// back (an import returning, an export called); the runtime switches
 /// between the strategy's tasks only from the host's side, so this holds
 /// however its tasks interleave.
+///
+/// It is timed on the CPU clock of the thread doing it ([`thread_cpu`]), not
+/// the wall clock: a busy machine taking the core away mid-call, or the
+/// thread waiting for one, is not work done for the strategy. Every stretch
+/// counted begins and ends within one poll of the store, so on one thread.
+/// The engine's clock interrupting the strategy (its check, and the yield or
+/// park that follows) is not a call the strategy made, and is not counted.
+/// A yield every [`YIELD_FUEL`] of work can't be told apart from a call, and
+/// is: a few microseconds of the host's work in each hundredth of a
+/// core-second the strategy burns.
 #[derive(Debug)]
 pub struct HostClock {
     state: Mutex<HostState>,
+    clock: Clock,
 }
 
 #[derive(Debug)]
 struct HostState {
     /// Whether the host's code is the one running.
     in_host: bool,
-    /// When the host's latest stretch of running began, while it runs.
-    since: Option<Instant>,
+    /// Whether the store is being driven ([`Drive`]): nothing is counted
+    /// while it isn't.
+    driven: bool,
+    /// When the host's latest stretch of running began, while it runs, and
+    /// on which thread.
+    since: Option<(Duration, std::thread::ThreadId)>,
     /// The host's time not yet charged, in nanoseconds.
     owed: u128,
-}
-
-impl Default for HostClock {
-    fn default() -> Self {
-        // Before the strategy's code first runs, the host is instantiating
-        // it.
-        Self {
-            state: Mutex::new(HostState {
-                in_host: true,
-                since: None,
-                owed: 0,
-            }),
-        }
-    }
+    /// All the host's time charged, as fuel.
+    taken: u64,
 }
 
 impl HostState {
-    fn count(&mut self, now: Instant) {
-        if let Some(since) = self.since.take() {
-            self.owed = self
-                .owed
-                .saturating_add(now.saturating_duration_since(since).as_nanos());
+    fn count(&mut self, now: Duration) {
+        if let Some((since, thread)) = self.since.take() {
+            // A thread's CPU clock says nothing of another's.
+            if thread == std::thread::current().id() {
+                self.owed = self
+                    .owed
+                    .saturating_add(now.saturating_sub(since).as_nanos());
+            }
         }
     }
 }
 
 impl HostClock {
+    fn new(clock: Clock) -> Self {
+        // Before the strategy's code first runs, the host is instantiating
+        // it.
+        Self {
+            state: Mutex::new(HostState {
+                in_host: true,
+                driven: false,
+                since: None,
+                owed: 0,
+                taken: 0,
+            }),
+            clock,
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, HostState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn now(&self) -> (Duration, std::thread::ThreadId) {
+        ((self.clock)(), std::thread::current().id())
+    }
+
     /// The strategy's code handed over to the host's.
     fn enter(&self) {
         let mut state = self.state();
         state.in_host = true;
-        state.since = Some(Instant::now());
+        state.since = state.driven.then(|| self.now());
     }
 
     /// The host's code handed back to the strategy's.
     fn leave(&self) {
         let mut state = self.state();
-        state.count(Instant::now());
+        state.count((self.clock)());
         state.in_host = false;
     }
 
     /// The store is being driven again.
     fn resume(&self) {
         let mut state = self.state();
+        state.driven = true;
         if state.in_host {
-            state.since = Some(Instant::now());
+            state.since = Some(self.now());
         }
     }
 
     /// The store is no longer being driven: it waits, or is parked.
     fn pause(&self) {
-        self.state().count(Instant::now());
+        let mut state = self.state();
+        state.count((self.clock)());
+        state.driven = false;
     }
 
-    /// Leave the time since the latest count out: work that is the host's
-    /// own.
-    fn skip(&self) {
+    /// The engine's clock has interrupted the strategy: none of the time
+    /// from its code handing over until it takes back is counted.
+    fn interrupted(&self) {
         let mut state = self.state();
-        if state.since.is_some() {
-            state.since = Some(Instant::now());
-        }
+        state.since = None;
+        state.in_host = false;
     }
 
     /// The host's time not yet charged, as fuel, counted up to now.
     pub fn take(&self) -> u64 {
         let mut state = self.state();
-        let now = Instant::now();
         if state.since.is_some() {
+            let (now, thread) = self.now();
             state.count(now);
-            state.since = Some(now);
+            state.since = Some((now, thread));
         }
         let owed = std::mem::take(&mut state.owed);
         let fuel =
             owed.saturating_mul(u128::from(shared::manifest::FUEL_PER_CORE_SECOND)) / 1_000_000_000;
-        u64::try_from(fuel).unwrap_or(u64::MAX)
+        let fuel = u64::try_from(fuel).unwrap_or(u64::MAX);
+        state.taken = state.taken.saturating_add(fuel);
+        fuel
+    }
+
+    /// All the host's time charged so far, as fuel.
+    #[cfg(test)]
+    fn taken(&self) -> u64 {
+        self.state().taken
     }
 }
 
@@ -763,12 +853,24 @@ mod tests {
                 (local.set $n (i64.sub (local.get $n) (i64.const 1)))
                 (br_if $on (i64.gt_s (local.get $n) (i64.const 0))))))"#;
 
-    /// The fuel a store metered as an agent's, declared at `rate`, burns
-    /// spinning for `over`, from the turns it made; and what its budget was
-    /// charged.
-    async fn fuel_spun(rate: u64, over: Duration) -> (u64, u64) {
+    /// What a store metered as an agent's did spinning.
+    struct Spun {
+        /// The fuel it burnt, from the turns it made and the call that
+        /// started them.
+        used: u64,
+        /// What its budget was charged for the fuel it burnt.
+        fuel: u64,
+        /// What its budget was charged for the host's time.
+        host: u64,
+    }
+
+    /// What a store metered as an agent's, declared at `rate`, does spinning
+    /// for `over`, with the engine's clock ticking or not.
+    async fn fuel_spun(rate: u64, over: Duration, ticking: bool) -> Spun {
         let engine = engine().unwrap();
-        start_epoch_ticker(&engine);
+        if ticking {
+            start_epoch_ticker(&engine);
+        }
         let module = wasmtime::Module::new(&engine, SPINS).unwrap();
 
         // What a turn of `spin` costs: a turn of `turn` less its own count
@@ -786,6 +888,9 @@ mod tests {
             before - weighing.get_fuel().unwrap()
         };
         let per_turn = (cost(2_001) - cost(1_001)) / 1_000;
+        // What a call costs besides its turns: the same for `spin`, which
+        // like `turn` goes straight into its loop.
+        let call = cost(1_001) - 1_001 * per_turn;
         // `local.get`, `i64.const`, `i64.sub`, `local.set`, `local.get`,
         // `i64.const`, `i64.gt_s` and `br_if` against `br`.
         let per_turn = per_turn - 7;
@@ -809,20 +914,31 @@ mod tests {
             .get(&mut *store)
             .i64()
             .unwrap();
+        let host = store.host.clone();
         drop(store);
-        (turns as u64 * per_turn, budget.used())
+        let host = host.taken();
+        Spun {
+            used: call + turns as u64 * per_turn,
+            fuel: budget.used() - host,
+            host,
+        }
     }
 
     /// An agent that declared ten million fuel a second and spins flat out
     /// uses no more than that over ten seconds, give or take the one slice
     /// of work ([`YIELD_FUEL`]) a loop without calls is seen in, and is
-    /// given at least half of it; all it used is charged to its budget, but
-    /// for the part of that slice it was stopped in.
+    /// given at least half of it; all the fuel it burnt is charged to its
+    /// budget, but for the part of that slice it was stopped in, and the
+    /// host's time on top is a sliver of it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_agent_that_spins_uses_no_more_fuel_a_second_than_it_declared() {
         let rate = 10_000_000;
         let over = Duration::from_secs(10);
-        let (used, charged) = fuel_spun(rate, over).await;
+        let Spun {
+            used,
+            fuel: charged,
+            host,
+        } = fuel_spun(rate, over, true).await;
         let most = rate * over.as_secs() + YIELD_FUEL;
         assert!(
             used <= most,
@@ -835,6 +951,35 @@ mod tests {
         assert!(
             charged <= used && used - charged <= YIELD_FUEL,
             "used {used} fuel, charged {charged}"
+        );
+        // A loop with no calls has the host start it and yield it, and
+        // nothing more: a two-hundredth of its fuel is ample for that.
+        assert!(
+            host <= used / 200,
+            "used {used} fuel, charged {host} more for the host's time"
+        );
+    }
+
+    /// With the engine's clock never ticking (its thread never scheduled on
+    /// a busy machine, say), an agent spinning flat out is still held to its
+    /// rate, give or take a slice of work ([`YIELD_FUEL`]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_is_held_to_its_rate_within_a_slice_when_the_engine_s_clock_never_ticks() {
+        let rate = 10_000_000;
+        let over = Duration::from_secs(3);
+        let Spun { used, fuel, .. } = fuel_spun(rate, over, false).await;
+        let most = rate * over.as_secs() + YIELD_FUEL;
+        assert!(
+            used <= most,
+            "declared {rate} fuel a second, used {used} over {over:?}, past {most}"
+        );
+        assert!(
+            used >= rate * over.as_secs() / 2,
+            "declared {rate} fuel a second, was given only {used} over {over:?}"
+        );
+        assert!(
+            fuel <= used && used - fuel <= YIELD_FUEL,
+            "used {used} fuel, charged {fuel}"
         );
     }
 
@@ -890,8 +1035,9 @@ mod tests {
         let busy = Duration::from_millis(50);
         let charged = charged_for(|linker| {
             linker.func_wrap("host", "work", move || {
-                let began = Instant::now();
-                while began.elapsed() < busy {
+                // A core's work, however long the machine takes to give it.
+                let began = thread_cpu();
+                while thread_cpu().saturating_sub(began) < busy {
                     std::hint::spin_loop();
                 }
             })?;
@@ -925,6 +1071,97 @@ mod tests {
             charged < most,
             "an import waited {wait:?}, charged {charged} fuel"
         );
+    }
+
+    /// How far [`slow_clock`] moves at every reading.
+    const DELAY: Duration = Duration::from_millis(1);
+
+    /// A thread's clock on a machine so busy that every reading of it comes
+    /// a [`DELAY`] after the one before, whatever was done between.
+    fn slow_clock() -> Duration {
+        thread_local! {
+            static READINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        DELAY * READINGS.replace(READINGS.get() + 1)
+    }
+
+    /// A core module whose `go` calls its import `host.work` once, then
+    /// counts `$n` down: the engine's clock interrupts it in the loop.
+    const CALLS_THEN_LOOPS: &str = r#"(module
+        (import "host" "work" (func $work))
+        (func (export "go") (param $n i64)
+            (call $work)
+            (loop $on
+                (local.set $n (i64.sub (local.get $n) (i64.const 1)))
+                (br_if $on (i64.gt_s (local.get $n) (i64.const 0))))))"#;
+
+    /// However slow the machine, an agent is charged for the fuel it burnt
+    /// and the host's time in its own calls, and nothing for the engine's
+    /// clock interrupting it: the check, and the park that follows when its
+    /// budget is dry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_is_not_charged_for_the_engine_s_clock_interrupting_it_on_a_busy_machine() {
+        let engine = engine().unwrap();
+        let module = wasmtime::Module::new(&engine, CALLS_THEN_LOOPS).unwrap();
+        let mut linker = wasmtime::Linker::new(&engine);
+        // The import moves the engine's clock on, so the loop after it is
+        // interrupted, once, whatever the ticker would have done.
+        let ticked = engine.clone();
+        linker
+            .func_wrap("host", "work", move || ticked.increment_epoch())
+            .unwrap();
+        // A budget that starts empty: the interruption parks the agent.
+        let budget = Arc::new(crate::pace::Budget::new(
+            shared::manifest::FUEL_PER_CORE_SECOND,
+            tokio::time::Instant::now(),
+        ));
+        let mut store = Paced::timed(
+            Store::new(&engine, ()),
+            budget.clone(),
+            Box::new(|_| {}),
+            slow_clock,
+        )
+        .unwrap();
+        let drive = store.drive();
+        let instance = drive
+            .run(linker.instantiate_async(&mut *store, &module))
+            .await
+            .unwrap();
+        // What instantiating cost, left out.
+        store.host.take();
+        let before = (budget.used(), store.get_fuel().unwrap());
+        let go = instance
+            .get_typed_func::<i64, ()>(&mut *store, "go")
+            .unwrap();
+        drive.run(go.call_async(&mut *store, 1_000)).await.unwrap();
+        let burnt = before.1 - store.get_fuel().unwrap();
+        let parked = store.parked.so_far(tokio::time::Instant::now());
+        drop(store);
+        let charged = budget.used() - before.0;
+        assert!(parked > Duration::ZERO, "the agent was never parked");
+        // The fuel, and one stretch of the host's: the call into the agent,
+        // its import, and its return.
+        let delay = u64::try_from(DELAY.as_nanos()).unwrap();
+        assert_eq!(
+            charged,
+            burnt + 3 * delay,
+            "burnt {burnt} fuel, charged {charged}"
+        );
+    }
+
+    /// The host's time is counted only while the agent's store is driven:
+    /// what the host does once it has stopped driving it is its own.
+    #[test]
+    fn the_host_s_time_is_counted_only_while_the_agent_is_driven() {
+        let host = HostClock::new(slow_clock);
+        host.resume();
+        host.leave();
+        let driven = host.take();
+        assert_eq!(driven, u64::try_from(DELAY.as_nanos()).unwrap());
+        host.pause();
+        // Handed back to the host, the store dropped mid-run, say.
+        host.enter();
+        assert_eq!(host.take(), 0);
     }
 
     /// Time an agent spends parked for want of fuel is not counted against
