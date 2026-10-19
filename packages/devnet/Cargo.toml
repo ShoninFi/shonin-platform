@@ -20,6 +20,8 @@ devnet = ["chain/devnet"]
 [dependencies]
 shared.workspace = true
 hyperliquid.workspace = true
+robinhood.workspace = true
+testnet-market.workspace = true
 shonin-attestation-core = { path = "../attestation/core" }
 shonin-attestation-deploy = { path = "../attestation/deploy" }
 toml.workspace = true

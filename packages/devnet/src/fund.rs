@@ -31,6 +31,16 @@ use serde::Deserialize;
 /// and never one of the protocol's roles.
 pub const FUNDER_INDEX: u32 = 100;
 
+/// The funding file's name for `testnet-market`'s account: an account of
+/// the EVM mnemonic of its own ([`testnet_market::MARKET_INDEX`]), never
+/// one of the platform's roles.
+pub const MARKET: &str = "market";
+
+/// `testnet-market`'s account on the test networks.
+pub fn market_account() -> Result<Address> {
+    Ok(mnemonic_key(testnet_market::MARKET_INDEX)?.address())
+}
+
 /// Every role, in the order they're listed.
 pub const ROLES: [Role; 10] = [
     Role::Admin,
@@ -79,7 +89,7 @@ impl Funding {
             toml::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
         for amounts in funding.testnet.values() {
             for name in amounts.roles.keys() {
-                if !ROLES.iter().any(|role| role.label() == name) {
+                if name != MARKET && !ROLES.iter().any(|role| role.label() == name) {
                     bail!("{} names {name:?}, which is not a role", path.display());
                 }
             }
@@ -96,6 +106,13 @@ impl Funding {
             .copied()
             .unwrap_or(amounts.default);
         coin(amount).ok()
+    }
+
+    /// What `testnet-market`'s account is topped up to on a chain: its own
+    /// amount, never the default (a chain without one has no market to
+    /// keep).
+    pub fn market_target(&self, chain: &ChainKey) -> Option<U256> {
+        coin(*self.testnet.get(&chain.to_string())?.roles.get(MARKET)?).ok()
     }
 
     /// What a person's own wallet is topped up to on an EVM chain
@@ -175,6 +192,11 @@ fn lamports(amount: f64) -> Result<u64> {
 
 /// The funder's key, from the EVM mnemonic.
 pub fn funder() -> Result<PrivateKeySigner> {
+    mnemonic_key(FUNDER_INDEX)
+}
+
+/// The EVM mnemonic's key at `index`.
+fn mnemonic_key(index: u32) -> Result<PrivateKeySigner> {
     use alloy::signers::local::MnemonicBuilder;
     use alloy::signers::local::coins_bip39::English;
     let phrase = std::env::var(chain::args::TESTNET_EVM_MNEMONIC)
@@ -182,13 +204,13 @@ pub fn funder() -> Result<PrivateKeySigner> {
         .filter(|phrase| !phrase.trim().is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "the funder comes from {}; set it in .env",
+                "the funder and the market's account come from {}; set it in .env",
                 chain::args::TESTNET_EVM_MNEMONIC
             )
         })?;
     MnemonicBuilder::<English>::default()
         .phrase(phrase.trim())
-        .index(FUNDER_INDEX)
+        .index(index)
         .ok()
         .and_then(|builder| builder.build().ok())
         .ok_or_else(|| anyhow!("the EVM mnemonic is not a valid BIP-39 phrase"))
@@ -326,12 +348,36 @@ async fn fund_chain(
             format_ether(need)
         );
     }
+    // testnet-market's account, on the chains it keeps a pool on.
+    if let Some(target) = funding.market_target(key) {
+        let address = market_account()?;
+        let balance = provider.get_balance(address).await?;
+        let need = target.saturating_sub(balance);
+        if need.is_zero() {
+            println!(
+                "  {MARKET:<9} {address:?} holds {}, enough",
+                format_ether(balance)
+            );
+        } else if need > available {
+            println!(
+                "  {MARKET:<9} {address:?} holds {}, short {}: the funder can't cover it past its reserve",
+                format_ether(balance),
+                format_ether(need)
+            );
+        } else {
+            let hash = send_value(&provider, from, address, need).await?;
+            println!(
+                "  {MARKET:<9} {address:?} sent {} ({hash})",
+                format_ether(need)
+            );
+        }
+    }
     prepared
 }
 
 /// Send the chain's coin from the funder at a legacy gas price (HyperEVM's
 /// public RPC takes nothing else), and wait for it to land.
-async fn send_value<P: Provider>(
+pub(crate) async fn send_value<P: Provider>(
     provider: &P,
     from: Address,
     to: Address,
@@ -656,6 +702,21 @@ activation_usd = 2.0
         assert!(!is_more_than_dust(U256::ZERO, target));
         assert!(is_more_than_dust(parse_ether("0.11").unwrap(), target));
         assert!(is_more_than_dust(parse_ether("0.01").unwrap(), U256::ZERO));
+    }
+
+    #[test]
+    fn the_market_account_is_funded_only_where_the_file_names_it() {
+        let funding: Funding = toml::from_str(&format!(
+            "{FILE}\n[testnet.\"evm:46630\"]\nreserve = 0.001\ndefault = 0.0003\nmarket = 0.005\n"
+        ))
+        .unwrap();
+        let robinhood: ChainKey = "evm:46630".parse().unwrap();
+        let base: ChainKey = "evm:84532".parse().unwrap();
+        assert_eq!(
+            funding.market_target(&robinhood),
+            Some(parse_ether("0.005").unwrap())
+        );
+        assert_eq!(funding.market_target(&base), None, "not the default");
     }
 
     #[test]

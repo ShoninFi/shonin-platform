@@ -30,6 +30,7 @@ mod solana_migrate;
 mod solana_orca;
 mod solana_seed;
 mod solana_testnet;
+mod testnet_market;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -211,6 +212,40 @@ enum Command {
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
     /// again; testnet only.
     Fund,
+    /// On the testnets, set up what `testnet-market` needs, from the funder:
+    /// the mirror feeds of the mainnet feeds the Robinhood Chain testnet's
+    /// stocks are priced by (recorded beside the deployment files), the
+    /// market account's gas and inventory, the pools' depth, and the
+    /// Robinhood driver built from the listings (proposed with
+    /// `--propose`). Each step but `pools` is safe to run again; testnet
+    /// only.
+    TestnetMarketSetup {
+        /// Which steps, in this order whatever order they are given in.
+        #[arg(long, value_delimiter = ',', default_value = "feeds,gas,inventory")]
+        steps: Vec<testnet_market::Step>,
+        /// The market account's gas, in the chain's coin, instead of the
+        /// funding file's `market` amount.
+        #[arg(long)]
+        gas: Option<f64>,
+        /// Each stock token the market account is topped up to.
+        #[arg(long, default_value_t = 10.0)]
+        stock_tokens: f64,
+        /// The WETH it is topped up to (wrapped from the funder's coin).
+        #[arg(long, default_value_t = 0.01)]
+        weth: f64,
+        /// The USDC it is topped up to, from what the funder holds.
+        #[arg(long, default_value_t = 50.0)]
+        usdc: f64,
+        /// Of each listed token, how much the funder adds to its pool.
+        #[arg(long, default_value_t = 0.0)]
+        pool_tokens: f64,
+        /// Propose the driver to each chain's registry as `robinhood`.
+        #[arg(long)]
+        propose: bool,
+        /// Refuse unless every endpoint is a local fork (anvil).
+        #[arg(long)]
+        on_fork: bool,
+    },
     /// Top a person's own wallet up on the testnets, to try the app's money
     /// flows with it: the stand-in dollar (minted by the funder on an EVM
     /// chain, by the admin on Solana, into the wallet's dollar account), and
@@ -407,6 +442,7 @@ async fn main() -> Result<()> {
                 | Command::Seed { .. }
                 | Command::Accounts
                 | Command::Fund
+                | Command::TestnetMarketSetup { .. }
                 | Command::FundWallet { .. }
                 | Command::ProposeChecker
                 | Command::ProposeImage { .. }
@@ -680,6 +716,36 @@ async fn main() -> Result<()> {
                 target.network,
                 only(&target, one, evm_chains(&target)),
                 &args.funding,
+            )
+            .await
+        }
+        Some(Command::TestnetMarketSetup {
+            steps,
+            gas,
+            stock_tokens,
+            weth,
+            usdc,
+            pool_tokens,
+            propose,
+            on_fork,
+        }) => {
+            testnet_market::run(
+                target.network,
+                only(&target, one, evm_chains(&target)),
+                &target.configs,
+                &target.deployments_dir,
+                &args.artifacts,
+                &args.funding,
+                &testnet_market::Options {
+                    steps,
+                    gas,
+                    stock_tokens,
+                    weth,
+                    usdc,
+                    pool_tokens,
+                    propose,
+                    on_fork,
+                },
             )
             .await
         }
@@ -1003,6 +1069,16 @@ async fn main() -> Result<()> {
             for (key, config) in only(&target, one, evm_chains(&target)) {
                 let network = target.network;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
+                // A public test network's deployment has no stand-in venue:
+                // nothing to play there (testnet-market keeps its real pools).
+                let without_stand_ins = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Deployments>(&text).ok())
+                    .is_some_and(|deployments| !deploy::has_stand_ins(&deployments));
+                if without_stand_ins {
+                    tracing::info!(chain = %key, "no stand-in venue on this chain: no market on it");
+                    continue;
+                }
                 // Each chain on its own: one whose endpoint is down, or that
                 // stops, is started again after a pause, and holds up none
                 // of the others.

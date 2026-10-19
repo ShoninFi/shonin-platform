@@ -10,6 +10,12 @@
 //! whose transactions land a minute apart (HyperEVM's big blocks) takes the
 //! whole deployment in a handful of blocks. The chains of a network are
 //! deployed at once, each in its own order.
+//!
+//! The stand-ins (the mintable dollar, the stand-in venue, its driver and
+//! its bridge) are for the local chains and their tests alone. On a public
+//! test network ([`public_dollar`]) vaults settle in the chain's own
+//! stablecoin, and no stand-in is deployed or proposed: agents there trade
+//! real exchanges' contracts.
 
 use std::path::Path;
 
@@ -171,7 +177,8 @@ pub async fn refuse_a_used_station_factory(
     // another build, its contracts would be deployed again and the station
     // factory could serve none of them: refused here, before anything is.
     let earlier = Landed::load(file, generation);
-    if earlier.initialised(&set) {
+    let dollar = public_dollar(client.chain_id).map(|dollar| dollar.address);
+    if earlier.initialised(&set, dollar) {
         if earlier.build == Some(build_of(artifacts)?) {
             return Ok(());
         }
@@ -373,6 +380,59 @@ const MARGIN_BPS: u64 = 1_000;
 /// What every account starts with, so nobody has to ask for money first.
 const STARTING_BALANCE: u64 = 1_000_000_000_000;
 
+/// A public test network's own dollar: the stablecoin its vaults settle in,
+/// and whether anyone may mint it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicDollar {
+    pub address: Address,
+    pub mintable: bool,
+}
+
+/// The dollar of the public test network `chain_id`, where no stand-in is
+/// deployed; `None` for a local chain (or any chain not listed), which gets
+/// the stand-ins.
+pub fn public_dollar(chain_id: u64) -> Option<PublicDollar> {
+    use robinhood::listings::{BASE_SEPOLIA_VENUE, ROBINHOOD_TESTNET};
+    match chain_id {
+        // Circle's USDC: from its faucet alone.
+        id if id == BASE_SEPOLIA_VENUE.chain => Some(PublicDollar {
+            address: BASE_SEPOLIA_VENUE.dollar.address,
+            mintable: false,
+        }),
+        // Paxos's USDG, whose testnet mint is open to anyone.
+        id if id == ROBINHOOD_TESTNET.chain => Some(PublicDollar {
+            address: ROBINHOOD_TESTNET.dollar.address,
+            mintable: true,
+        }),
+        // Circle's USDC on HyperEVM.
+        crate::hyperliquid_vaults::CHAIN_ID => Some(PublicDollar {
+            address: crate::hyperliquid_vaults::USDC,
+            mintable: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a deployment carries the stand-ins: the stand-in venue (with its
+/// driver and bridge) and the mintable dollar. A public test network's
+/// doesn't.
+pub fn has_stand_ins(deployments: &Deployments) -> bool {
+    deployments.venue != Address::ZERO
+}
+
+/// Refuse, for a deployment without the stand-ins, what only works with
+/// them.
+pub fn require_stand_ins(deployments: &Deployments, what: &str) -> Result<()> {
+    if has_stand_ins(deployments) {
+        return Ok(());
+    }
+    bail!(
+        "{what} needs the stand-in venue and dollar, which chain {} doesn't have: a public test \
+         network's vaults settle in its own dollar and trade real exchanges",
+        deployments.chain_id
+    )
+}
+
 /// The markets the venue lists, and what they start at.
 pub const SPOT: &str = "BTC";
 pub const PERP: &str = "BTC-PERP";
@@ -559,7 +619,8 @@ async fn deploy(
     // Every address follows from the build, the roles, the network and the
     // generation, so the whole deployment is known before anything is sent,
     // and its contracts go out a few to a transaction.
-    let plan = plan(artifacts, network, &roles, chains, generation)?;
+    let dollar = public_dollar(client.chain_id).map(|dollar| dollar.address);
+    let plan = plan(artifacts, network, &roles, chains, generation, dollar)?;
     create(client, admin, artifacts, &plan.creations, &mut landed).await?;
     let at = plan.addresses;
 
@@ -673,12 +734,16 @@ fn deployment_salt(generation: u64, admin: Address) -> B256 {
 
 /// The deployment's contracts in the order they are created, each with its
 /// address, worked out from the build alone: nothing is asked of a chain.
+/// With a public test network's own `dollar`, vaults settle in it and no
+/// stand-in is created: no mintable dollar, no stand-in venue, driver or
+/// bridge (their addresses are zero).
 fn plan(
     artifacts: &Path,
     network: NetworkName,
     roles: &Roles,
     chains: &[(String, u64)],
     generation: u64,
+    dollar: Option<Address>,
 ) -> Result<Plan> {
     // None on testnets: nobody else's money is at stake there, and their
     // clocks run in real time, so two days would be two real days. Mainnet
@@ -704,13 +769,19 @@ fn plan(
         Ok(address)
     };
 
-    let usd = add("LocalUsd", own, ().abi_encode_params(), &[])?;
-    let venue = add(
-        "LocalVenue",
-        own,
-        (usd, roles.operator, U256::from(MARGIN_BPS)).abi_encode_params(),
-        &[],
-    )?;
+    let (usd, venue) = match dollar {
+        Some(dollar) => (dollar, Address::ZERO),
+        None => {
+            let usd = add("LocalUsd", own, ().abi_encode_params(), &[])?;
+            let venue = add(
+                "LocalVenue",
+                own,
+                (usd, roles.operator, U256::from(MARGIN_BPS)).abi_encode_params(),
+                &[],
+            )?;
+            (usd, venue)
+        }
+    };
     let verifier = add(
         "DevAttestationVerifier",
         own,
@@ -764,13 +835,19 @@ fn plan(
         &[],
     )?;
     let profiles = add("AuthorProfiles", own, ().abi_encode_params(), &[])?;
-    let driver = add("LocalDriver", own, (venue, usd).abi_encode_params(), &[])?;
-    let bridge = add(
-        "LocalBridge",
-        own,
-        (usd, roles.operator).abi_encode_params(),
-        &[],
-    )?;
+    let (driver, bridge) = if dollar.is_some() {
+        (Address::ZERO, Address::ZERO)
+    } else {
+        (
+            add("LocalDriver", own, (venue, usd).abi_encode_params(), &[])?,
+            add(
+                "LocalBridge",
+                own,
+                (usd, roles.operator).abi_encode_params(),
+                &[],
+            )?,
+        )
+    };
 
     // The station factory and its implementation carry nothing chain-specific
     // in their creation code, so they land at the same addresses on every
@@ -1569,11 +1646,13 @@ impl Landed {
     }
 
     /// Whether `set` is what this record's earlier try initialised its
-    /// station factory with: its vault factory, dollar and registry.
-    fn initialised(&self, set: &StationFactorySet) -> bool {
+    /// station factory with: its vault factory, dollar (the chain's own
+    /// `dollar` on a public test network, else the stand-in it created) and
+    /// registry.
+    fn initialised(&self, set: &StationFactorySet, dollar: Option<Address>) -> bool {
         let at = |name: &str| self.contracts.get(name).map(|(address, _)| *address);
         at("VaultFactory") == Some(set.vault_factory)
-            && at("LocalUsd") == Some(set.asset)
+            && dollar.or_else(|| at("LocalUsd")) == Some(set.asset)
             && at("AttestationRegistry") == Some(set.attestation)
     }
 
@@ -1708,8 +1787,12 @@ enum Shows {
 /// like an image), and the accounts' starting money.
 fn setup_steps(deployments: &Deployments) -> Vec<Step> {
     let roles = &deployments.roles;
+    let stand_ins = has_stand_ins(deployments);
     let mut steps = Vec::new();
-    for (id, is_perp) in [(SPOT, false), (PERP, true)] {
+    for (id, is_perp) in [(SPOT, false), (PERP, true)]
+        .into_iter()
+        .filter(|_| stand_ins)
+    {
         steps.push(Step {
             name: format!("market {id}"),
             from: roles.operator,
@@ -1752,6 +1835,11 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
         .abi_encode(),
         shows: Shows::Project,
     });
+    if !stand_ins {
+        // A public test network: its own dollar, which nobody here hands
+        // out, and no stand-in driver or bridge to propose.
+        return steps;
+    }
     steps.push(Step {
         name: "driver local".to_string(),
         from: roles.admin,
@@ -2586,6 +2674,119 @@ mod tests {
     }
 
     #[test]
+    fn a_public_test_network_settles_in_its_own_dollar_and_gets_no_stand_in() {
+        let Some(artifacts) = artifacts() else {
+            eprintln!("skipped: the contracts aren't built");
+            return;
+        };
+        let roles = Roles {
+            admin: Address::repeat_byte(1),
+            platform: Address::repeat_byte(2),
+            attestor: Address::repeat_byte(3),
+            builder: Address::repeat_byte(4),
+            reviewer: Address::repeat_byte(5),
+            executor: Address::repeat_byte(6),
+            keeper: Address::repeat_byte(7),
+            operator: Address::repeat_byte(8),
+            author: Address::repeat_byte(9),
+            viewer: Address::repeat_byte(10),
+        };
+        let names = [("robinhood".to_string(), 46630u64)];
+        let usdg = public_dollar(46630).unwrap();
+        assert!(usdg.mintable);
+        let planned = plan(
+            &artifacts,
+            NetworkName::Testnet,
+            &roles,
+            &names,
+            0,
+            Some(usdg.address),
+        )
+        .unwrap();
+        let at = planned.addresses;
+        assert_eq!(at.usd, usdg.address);
+        assert_eq!(
+            (at.venue, at.driver, at.bridge),
+            (Address::ZERO, Address::ZERO, Address::ZERO)
+        );
+        for creation in &planned.creations {
+            assert!(
+                !creation.name.starts_with("Local"),
+                "{} is a stand-in",
+                creation.name
+            );
+        }
+        // The local chains keep every stand-in.
+        assert_eq!(public_dollar(31339), None);
+        let local = plan(&artifacts, NetworkName::Local, &roles, &names, 0, None).unwrap();
+        for name in ["LocalUsd", "LocalVenue", "LocalDriver", "LocalBridge"] {
+            assert!(
+                local.creations.iter().any(|creation| creation.name == name),
+                "{name}"
+            );
+        }
+        // Base Sepolia's and HyperEVM's USDC are nobody's to mint.
+        assert!(!public_dollar(84532).unwrap().mintable);
+        assert!(!public_dollar(998).unwrap().mintable);
+    }
+
+    #[test]
+    fn a_public_test_network_s_setup_proposes_no_stand_in_and_hands_out_no_money() {
+        let roles = Roles {
+            admin: Address::repeat_byte(1),
+            platform: Address::repeat_byte(2),
+            attestor: Address::repeat_byte(3),
+            builder: Address::repeat_byte(4),
+            reviewer: Address::repeat_byte(5),
+            executor: Address::repeat_byte(6),
+            keeper: Address::repeat_byte(7),
+            operator: Address::repeat_byte(8),
+            author: Address::repeat_byte(9),
+            viewer: Address::repeat_byte(10),
+        };
+        let mut deployments = Deployments {
+            chain_key: "evm:46630".to_string(),
+            chain_id: 46630,
+            rpc_url: String::new(),
+            deployed_block: 0,
+            usd: Address::repeat_byte(0x11),
+            venue: Address::ZERO,
+            attestation_verifier: Address::repeat_byte(0x12),
+            attestation: Address::repeat_byte(0x13),
+            publishing: Address::repeat_byte(0x14),
+            prices: Address::repeat_byte(0x15),
+            strategies: Address::repeat_byte(0x16),
+            reviews: Address::repeat_byte(0x17),
+            profiles: Address::repeat_byte(0x18),
+            factory: Address::repeat_byte(0x19),
+            station_factory: Address::repeat_byte(0x1a),
+            driver: Address::ZERO,
+            bridge: Address::ZERO,
+            closer: Address::repeat_byte(0x1b),
+            roles,
+        };
+        let names: Vec<String> = setup_steps(&deployments)
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("image ") || name == "project"),
+            "{names:?}"
+        );
+        assert!(require_stand_ins(&deployments, "the market").is_err());
+        deployments.venue = Address::repeat_byte(0x22);
+        let names: Vec<String> = setup_steps(&deployments)
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        for wanted in ["market BTC", "driver local", "bridge local-bridge"] {
+            assert!(names.iter().any(|name| name == wanted), "{wanted}");
+        }
+    }
+
+    #[test]
     fn a_batch_keeps_within_the_bytes_a_transaction_carries_and_its_share_of_the_gas() {
         let creation = |bytes: usize| Creation {
             name: "Some",
@@ -2641,7 +2842,7 @@ mod tests {
             author: client.account(Role::Author).unwrap(),
             viewer: client.account(Role::Viewer).unwrap(),
         };
-        let planned = plan(&artifacts, network, &roles, &names, 3).unwrap();
+        let planned = plan(&artifacts, network, &roles, &names, 3, None).unwrap();
 
         // Every creation's measured gas is within the bound a batch falls
         // back on when an endpoint won't measure it.
@@ -2959,7 +3160,7 @@ mod tests {
             viewer: client.account(Role::Viewer).unwrap(),
         };
         let names = [("base".to_string(), 31337u64)];
-        let planned = plan(&artifacts, NetworkName::Testnet, &roles, &names, 0).unwrap();
+        let planned = plan(&artifacts, NetworkName::Testnet, &roles, &names, 0, None).unwrap();
         let creations = &planned.creations[..2];
         let file = dir.join("evm-31337.json");
         let mut landed = Landed::load(&file, 0);

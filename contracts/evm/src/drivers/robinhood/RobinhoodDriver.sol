@@ -62,6 +62,9 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// Below this many token units (a thousandth of a share) a holding whose
     /// feed can't be read is dust too.
     uint256 private constant DUST_UNITS = 1e15;
+    /// The most a token's `oraclePaused` read may spend: a proxied token
+    /// answers it in a few thousand.
+    uint256 private constant PAUSE_READ_GAS = 50_000;
 
     // Roles v2's condition types and operators.
     uint8 private constant T_NONE = 0;
@@ -521,8 +524,11 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         }
         // A token whose oracle the issuer has paused (a corporate action in
         // progress) is not priced by its feed meanwhile. A token without the
-        // call (the testnet's) has nothing to pause.
-        try IStockToken(stock.token).oraclePaused() returns (bool paused) {
+        // call (the testnet's, or WETH) has nothing to pause. The read is
+        // given a bounded allowance: WETH's fallback takes it as a deposit,
+        // which a view call can't make, and that failure burns whatever gas
+        // the call was handed.
+        try IStockToken(stock.token).oraclePaused{gas: PAUSE_READ_GAS}() returns (bool paused) {
             if (paused) trusted = false;
         } catch {}
     }

@@ -143,6 +143,16 @@ async fn evm(
     }
 
     let usd = deployments.usd;
+    // A public test network's own dollar is minted here only where anyone
+    // may mint it (the Robinhood Chain testnet's USDG).
+    if !crate::deploy::has_stand_ins(&deployments)
+        && !crate::deploy::public_dollar(client.chain_id).is_some_and(|dollar| dollar.mintable)
+    {
+        println!(
+            "  dollars: this chain's dollar ({usd}) is nobody's to mint here: its issuer's faucet hands it out"
+        );
+        return Ok(());
+    }
     let decimals = client.read(usd, ILocalUsd::decimalsCall {}).await?;
     let target = U256::from(amounts.dollars) * U256::from(10u64).pow(U256::from(decimals));
     let held = client

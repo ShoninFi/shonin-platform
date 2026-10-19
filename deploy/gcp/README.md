@@ -21,6 +21,7 @@ Everything runs in one zone (`europe-west4-a`), on the default network, with not
 | `shonin-reviewer-<network>` | the reviewer, attested the same way; on demand, off when idle | `GCP_REVIEWER_MACHINE_TYPE` | `shonin-workload` |
 | `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read three secrets, start, stop and read the prover's, the builder's and the reviewer's instances |
 | `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
+| `shonin-testnet-market-testnet` | testnet-market, the testnet alone; Container-Optimized OS | `e2-micro`, 10 GB standard disk | `shonin-testnet-market`: pull images, write logs, read its own key and the paid endpoints |
 
 They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.europe-west4-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.europe-west4-a.c.shonin-testnet.internal:19081`.
 
@@ -36,7 +37,7 @@ They name each other by internal DNS: the executor's status port is `http://shon
 
 ## The images
 
-`Dockerfile.<name>` for each of: `executor`, `builder`, `reviewer`, `unwinder` (the machines), `api`, `keeper` (the services), `prover` (the prover's VM), `requester` (the root key's test), and `indexer` (not deployed: the API runs it). Each builds with the pinned toolchain and `--locked` from the repository root.
+`Dockerfile.<name>` for each of: `executor`, `builder`, `reviewer`, `unwinder` (the machines), `api`, `keeper` (the services), `prover` (the prover's VM), `requester` (the root key's test), `testnet-market` (the testnet alone) and `indexer` (not deployed: the API runs it). Each builds with the pinned toolchain and `--locked` from the repository root.
 
 An image is built for one network, with everything it runs with baked in: `task cloud:build` passes the network (`NETWORK`, and `NETWORK_FEATURE` for the Solana program ids it compiles in: until the devnet ids are committed a testnet image has none, and serves the EVM chains alone, `SHONIN_WITHOUT_SOLANA=1`), the store's public copy (`STORE_URL`) and the API's store the executor reads (`STORE_READ_URL`), the internal URLs of the API (`API_URL`, and its internal port `API_INTERNAL_URL`), the executor (`EXECUTOR_URL`), the builder and the reviewer (`BUILDER_URL`, `REVIEWER_URL`), the reviewer's sealed model key as the build context `sealed`, and the generation's deployment files as the build context `deployments` (from `.shonin/<network>/deployments`, which the repository's own build context leaves out). The chains are the public endpoints committed in `config/chains.toml`: no keyed URL goes into an image. A redeploy is a rebuild.
 
@@ -89,6 +90,10 @@ What it runs is named in the instance's metadata (the images by digest), so `tas
 
 An on-demand VM, on only while proving, created by `task cloud:deploy:prover` (it boots once then, finds nothing to prove, and powers off when idle); its startup script (`prover/startup.sh`) runs the prover and powers the VM off when it exits. Its metadata names `shonin-prover-image` (by digest), `shonin-executor-url` and `shonin-status-urls` (the builder's and the reviewer's status ports). The services VM's account may start, stop and read this instance, the builder's and the reviewer's, and no other (a custom role, `shoninProverStarter`, bound on each instance).
 
+## testnet-market's VM
+
+The testnet alone (deleted with it). `testnet-market/startup.sh` reads the market's own key (`shonin-testnet-market-key`: account 101 of the EVM mnemonic, never the mnemonic) and the paid endpoints, and runs one container, `shonin-testnet-market`, health on `0.0.0.0:19088` (open to the VPC alone). Every minute it posts each Robinhood stock's new Chainlink round from Robinhood Chain mainnet (read with no key) to its mirror feed on the testnet, then swaps each testnet pool (the stocks against USDG, WETH against USDC on Base Sepolia) back within its band of the feed. The image carries the mirror feeds' record (`mirror-feeds-evm-46630.json`) beside the deployment files. `task cloud:redeploy:testnet-market` points it at a new image.
+
 ## Standing it up (testnet)
 
 ```bash
@@ -104,10 +109,14 @@ task cloud:images NETWORK=testnet NAMES="builder unwinder"   # then propose each
 task cloud:deploy:machine NAME=builder NETWORK=testnet       # its first boot gets its key blessed, then it idles off
 task cloud:reviewer NETWORK=testnet                          # seal the model key, build, propose, launch
 task store:sync NETWORK=testnet                  # the published strategies' files to R2 (DRY_RUN=1 to list)
+# the market (after task chains:testnet-market-setup NETWORK=testnet):
+task cloud:secrets:testnet-market NETWORK=testnet            # its key, checked against the mirrors, through stdin
+task cloud:images NETWORK=testnet NAMES=testnet-market
+task cloud:deploy:testnet-market NETWORK=testnet
 task cloud:status NETWORK=testnet
-task cloud:logs NAME=api NETWORK=testnet         # executor | builder | reviewer | api | keeper | tunnel | waker | services | prover
+task cloud:logs NAME=api NETWORK=testnet         # executor | builder | reviewer | api | keeper | tunnel | waker | services | prover | testnet-market
 ```
 
 Stopping and deleting: `task cloud:stop NAME=executor|services|prover NETWORK=testnet` (the disk stays and bills), `task cloud:start ...`, `task cloud:delete NAME=... NETWORK=testnet CONFIRM=yes`. Images: `gcloud artifacts docker images delete europe-west4-docker.pkg.dev/shonin-testnet/shonin/<name>@<digest> --project=shonin-testnet`.
 
-The machines are never handed a mnemonic, nor any key: each makes its own inside the enclave and is blessed through attestation. The only keys in the cloud are the keeper's testnet key and the tunnel's token, readable by the services VM's account alone.
+The machines are never handed a mnemonic, nor any key: each makes its own inside the enclave and is blessed through attestation. The only keys in the cloud are the keeper's testnet key and the tunnel's token, readable by the services VM's account alone, and on the testnet testnet-market's own key, readable by its VM's account alone.

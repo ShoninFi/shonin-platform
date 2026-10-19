@@ -23,6 +23,9 @@
 #   (deploy/gcp/services).
 # - shonin-prover-<network>: an on-demand VM that makes the attestation's proof
 #   when woken and powers itself off when idle (deploy/gcp/prover).
+# - shonin-testnet-market-testnet: the testnet alone; a small plain VM running
+#   testnet-market, which keeps the testnets' pools at the mainnet feeds'
+#   prices (deploy/gcp/testnet-market). Deleted when the testnets are.
 version: "3"
 
 includes:
@@ -43,11 +46,11 @@ vars:
   # The attested machines. `requester` is the root key service's test
   # requester, launched for a live exchange and deleted after.
   MACHINES: "reviewer builder executor unwinder requester"
-  SERVICES: "api indexer keeper"
+  SERVICES: "api indexer keeper testnet-market"
   # B's image: the attestation's prover, run on its own VM, off when idle.
   PROVERS: "prover"
   # The VMs a network runs, by role: shonin-<role>-<network>.
-  VMS: "executor services prover builder reviewer"
+  VMS: "executor services prover builder reviewer testnet-market"
   # The machines started on demand by the waker, and powered off when idle.
   ON_DEMAND: "builder reviewer"
   # The ports inside the VPC (fixed: the images bake them).
@@ -57,6 +60,7 @@ vars:
   CLOUD_PORT_EXECUTOR: "19085"
   CLOUD_PORT_REVIEWER: "19086"
   CLOUD_PORT_KEEPER: "19087"
+  CLOUD_PORT_TESTNET_MARKET: "19088"
   # Internal DNS names, so the images can name each other.
   GCP_INTERNAL: "{{.GCP_ZONE}}.c.{{.GCP_PROJECT}}.internal"
   CLOUD_URL_EXECUTOR: "http://shonin-executor-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_EXECUTOR}}"
@@ -77,6 +81,7 @@ vars:
   REVIEWER_INSTANCE: "projects/{{.GCP_PROJECT}}/zones/{{.GCP_ZONE}}/instances/shonin-reviewer-{{.NETWORK}}"
   SERVICES_ACCOUNT: "{{.GCP_SERVICES_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
   PROVER_ACCOUNT: "{{.GCP_PROVER_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
+  TESTNET_MARKET_ACCOUNT: "{{.GCP_TESTNET_MARKET_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
   WORKLOAD_ACCOUNT: "{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
   # The custom role that may start, stop and read one instance: bound to the
   # services VM's account on the prover's, the builder's and the reviewer's
@@ -148,7 +153,7 @@ tasks:
         for file in "{{.PATH_DEPLOYMENTS_DIR}}"/*.json; do
           case "$(basename "$file")" in
             *.partial.json | *.run-*) ;;
-            evm-[0-9]*.json | attestation-evm-[0-9]*.json | solana-*.json) cp "$file" "$deployments/" ;;
+            evm-[0-9]*.json | attestation-evm-[0-9]*.json | mirror-feeds-evm-[0-9]*.json | solana-*.json) cp "$file" "$deployments/" ;;
           esac
         done
         docker build --platform linux/amd64 \
@@ -211,15 +216,17 @@ tasks:
       - echo "{{.NAME}}:{{.IMAGE_TAG}} is $({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")"
 
   images:
-    desc: "Build and push several images at once, side by side in one Cloud Build with its layer cache (BUILDER=cloud, the default here) or one after another here (BUILDER=local), and print each digest (NAMES=\"api keeper executor prover builder reviewer unwinder\", NETWORK=testnet; the reviewer needs SEALED=<dir holding sealed.json>, its sealed model key; TAG= the commit by default; SKIP_PUSHED=1 leaves an image already pushed under TAG)"
+    desc: "Build and push several images at once, side by side in one Cloud Build with its layer cache (BUILDER=cloud, the default here) or one after another here (BUILDER=local), and print each digest (NAMES=\"api keeper executor prover builder reviewer unwinder testnet-market\", NETWORK=testnet; the reviewer needs SEALED=<dir holding sealed.json>, its sealed model key; TAG= the commit by default; SKIP_PUSHED=1 leaves an image already pushed under TAG)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
       - *network
       - *project
       - *builder
-      - sh: 'for n in {{.NAMES}}; do case " api keeper executor prover builder reviewer unwinder " in *" $n "*) ;; *) exit 1 ;; esac; done'
-        msg: "Cloud Build builds api, keeper, executor, prover, builder, reviewer and unwinder (NAMES={{.NAMES}})."
+      - sh: 'for n in {{.NAMES}}; do case " api keeper executor prover builder reviewer unwinder testnet-market " in *" $n "*) ;; *) exit 1 ;; esac; done'
+        msg: "Cloud Build builds api, keeper, executor, prover, builder, reviewer, unwinder and testnet-market (NAMES={{.NAMES}})."
+      - sh: 'case " {{.NAMES}} " in *" testnet-market "*) [ "{{.NETWORK}}" = "testnet" ] ;; esac'
+        msg: "testnet-market is built for the testnet alone (NETWORK={{.NETWORK}})."
       - sh: 'case " {{.NAMES}} " in *" reviewer "*) [ -s "{{.SEALED}}/sealed.json" ] ;; esac'
         msg: "The reviewer's image carries its model key, sealed: pass SEALED=<dir holding sealed.json> (task cloud:reviewer makes it)."
       - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
@@ -436,6 +443,57 @@ tasks:
       - task: iam:prover-start
         vars: { NETWORK: "{{.NETWORK}}", INSTANCE: "prover" }
 
+  deploy:testnet-market:
+    desc: "Create testnet-market's VM (Container-Optimized OS, e2-micro) from the pushed testnet-market image's digest, with its own key (task cloud:secrets:testnet-market) and the paid endpoints (NETWORK=testnet, TAG= the commit by default)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "testnet-market runs for the testnet alone (NETWORK={{.NETWORK}})."
+      - *project
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
+    cmds:
+      - |
+        market=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/testnet-market:{{.IMAGE_TAG}}")
+        [ -n "$market" ] || { echo "push testnet-market first (task cloud:images NAMES=testnet-market NETWORK=testnet TAG={{.IMAGE_TAG}})"; exit 1; }
+        gcloud compute instances create "shonin-testnet-market-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --machine-type="{{.GCP_TESTNET_MARKET_MACHINE_TYPE}}" \
+          --image-project=cos-cloud --image-family=cos-stable \
+          --boot-disk-size=10GB --boot-disk-type=pd-standard \
+          --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+          --tags=shonin-testnet-market \
+          --service-account="{{.TESTNET_MARKET_ACCOUNT}}" --scopes=cloud-platform \
+          --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/testnet-market/startup.sh" \
+          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}~enable-oslogin=TRUE"
+
+  redeploy:testnet-market:
+    desc: "Point testnet-market's VM at a newly pushed testnet-market image (and the current startup script), and restart it (NETWORK=testnet, TAG= the commit by default)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "testnet-market runs for the testnet alone (NETWORK={{.NETWORK}})."
+      - *project
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
+    cmds:
+      - |
+        market=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/testnet-market:{{.IMAGE_TAG}}")
+        [ -n "$market" ] || { echo "push testnet-market first (TAG={{.IMAGE_TAG}})"; exit 1; }
+        gcloud compute instances add-metadata "shonin-testnet-market-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/testnet-market/startup.sh" \
+          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}"
+        status=$(gcloud compute instances describe "shonin-testnet-market-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
+        case "$status" in
+          TERMINATED|STOPPED|SUSPENDED) gcloud compute instances start "shonin-testnet-market-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
+          *) gcloud compute instances reset "shonin-testnet-market-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
+        esac
+
   iam:
     desc: "The services' and the prover's accounts and their roles, and nothing more: idempotent (NETWORK=testnet)"
     requires:
@@ -447,13 +505,13 @@ tasks:
       - |
         set -e
         project="{{.GCP_PROJECT}}"
-        for account in "{{.GCP_SERVICES_SERVICE_ACCOUNT}}" "{{.GCP_PROVER_SERVICE_ACCOUNT}}"; do
+        for account in "{{.GCP_SERVICES_SERVICE_ACCOUNT}}" "{{.GCP_PROVER_SERVICE_ACCOUNT}}" "{{.GCP_TESTNET_MARKET_SERVICE_ACCOUNT}}"; do
           if ! gcloud iam service-accounts describe "$account@$project.iam.gserviceaccount.com" --project="$project" >/dev/null 2>&1; then
             gcloud iam service-accounts create "$account" --project="$project" --display-name="$account"
           fi
         done
-        # Both pull images and write logs; nothing else project-wide.
-        for member in "serviceAccount:{{.SERVICES_ACCOUNT}}" "serviceAccount:{{.PROVER_ACCOUNT}}"; do
+        # Each pulls images and writes logs; nothing else project-wide.
+        for member in "serviceAccount:{{.SERVICES_ACCOUNT}}" "serviceAccount:{{.PROVER_ACCOUNT}}" "serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}"; do
           for role in roles/artifactregistry.reader roles/logging.logWriter; do
             gcloud projects add-iam-policy-binding "$project" --member="$member" --role="$role" \
               --condition=None --quiet >/dev/null
@@ -467,6 +525,16 @@ tasks:
               --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
           else
             echo "secret $secret does not exist yet: run task cloud:secrets, then this again"
+          fi
+        done
+        # testnet-market's VM reads its own key and the paid endpoints, and
+        # no other secret.
+        for secret in "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" "{{.GCP_SECRET_TESTNET_RPC}}"; do
+          if gcloud secrets describe "$secret" --project="$project" >/dev/null 2>&1; then
+            gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
+              --member="serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
+          else
+            echo "secret $secret does not exist yet: run task cloud:secrets:testnet-market, then this again"
           fi
         done
         # A role that may start, stop and read an instance, bound below on
@@ -531,6 +599,9 @@ tasks:
         exists shonin-services-internal || gcloud compute firewall-rules create shonin-services-internal --project="$project" \
           --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_API}},tcp:{{.CLOUD_PORT_KEEPER}} \
           --source-ranges=10.128.0.0/9 --target-tags=shonin-services
+        exists shonin-testnet-market-health || gcloud compute firewall-rules create shonin-testnet-market-health --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_TESTNET_MARKET}} \
+          --source-ranges=10.128.0.0/9 --target-tags=shonin-testnet-market
         # The machines that run on demand: the builder answers the API (its
         # uploads, the waker) and the prover and keeper (its status); the
         # reviewer answers the builder, the waker, the prover and the keeper;
@@ -625,6 +696,43 @@ tasks:
             --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
         done
         echo "uploaded the keeper's keys ($address, and $solana_address on Solana devnet), the tunnel's token and $(printf '%s' "$rpc" | grep -c . || true) paid endpoint(s); the services VM reads them at its next boot"
+
+  secrets:testnet-market:
+    desc: "Upload testnet-market's key (derived here: account 101 of the EVM mnemonic, never the mnemonic) to Secret Manager, through stdin, checked first against the mirror feeds it posts to, and let its VM read it (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+      - sh: 'command -v cast >/dev/null && command -v jq >/dev/null'
+        msg: "cast (foundry) and jq are needed to derive and check the market's key."
+      - sh: '[ -n "${SHONIN_TESTNET_EVM_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env."
+      - sh: '[ -s "{{.PATH_DEPLOYMENTS_DIR}}/mirror-feeds-evm-46630.json" ]'
+        msg: "No {{.PATH_DEPLOYMENTS_DIR}}/mirror-feeds-evm-46630.json: deploy the mirror feeds first (task chains:testnet-market-setup NETWORK=testnet STEPS=feeds)."
+    cmds:
+      - |
+        set -eu
+        project="{{.GCP_PROJECT}}"
+        scratch=$(mktemp -d)
+        chmod 700 "$scratch"
+        trap 'rm -rf "$scratch"' EXIT
+        printf '%s\n' "$SHONIN_TESTNET_EVM_MNEMONIC" >"$scratch/mnemonic"
+        # The market is account 101. Its address, checked against every
+        # mirror's updater before its key goes anywhere.
+        address=$(cast wallet address --mnemonic "$scratch/mnemonic" --mnemonic-index 101 | tr 'A-F' 'a-f')
+        rpc=$({{.DEVNET}} --vault-chain robinhood chain | head -1 | cut -d' ' -f1)
+        for mirror in $(jq -r '.feeds[].address' "{{.PATH_DEPLOYMENTS_DIR}}/mirror-feeds-evm-46630.json"); do
+          updater=$(cast call "$mirror" 'updater()(address)' --rpc-url "$rpc" | tr 'A-F' 'a-f')
+          [ "$updater" = "$address" ] || { echo "the mirror $mirror takes rounds from $updater, not account 101 ($address)"; exit 1; }
+        done
+        gcloud secrets describe "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" --project="$project" >/dev/null 2>&1 ||
+          gcloud secrets create "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" --project="$project" --replication-policy=automatic
+        cast wallet private-key --mnemonic "$scratch/mnemonic" --mnemonic-index 101 | tr -d '\n' |
+          gcloud secrets versions add "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" --project="$project" --data-file=-
+        gcloud secrets add-iam-policy-binding "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" --project="$project" \
+          --member="serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
+        echo "uploaded testnet-market's key ($address); its VM reads it at its next boot"
 
   drain:
     desc: "Wait until the builder or the reviewer holds nothing a new image or a new root would lose: no paid job unfinished in the API's queue and, for the reviewer, no review waiting to be posted (NAME=builder|reviewer, NETWORK=testnet; DRAIN_MINUTES=60). Run before replacing either image or the executor"
@@ -729,7 +837,7 @@ tasks:
       - gcloud artifacts docker images list "{{.GCP_REGISTRY}}" --project="{{.GCP_PROJECT}}" --include-tags --format="table(package.basename(),version.basename(),tags,createTime)"
 
   logs:
-    desc: "Recent logs (NAME=executor|builder|reviewer|unwinder|api|keeper|tunnel|waker|services|prover, NETWORK=..., FRESHNESS=30m): a machine's container from Cloud Logging, the services' containers from Cloud Logging, a plain VM's boot from its serial port"
+    desc: "Recent logs (NAME=executor|builder|reviewer|unwinder|api|keeper|tunnel|waker|services|prover|testnet-market, NETWORK=..., FRESHNESS=30m): a machine's container from Cloud Logging, the services' containers from Cloud Logging, a plain VM's boot from its serial port"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -748,14 +856,14 @@ tasks:
             exit ;;
         esac
         case "{{.NAME}}" in
-          api|keeper|tunnel|waker)
+          api|keeper|tunnel|waker|testnet-market)
             gcloud logging read "logName=\"projects/$project/logs/gcplogs-docker-driver\" AND jsonPayload.container.name=\"/shonin-{{.NAME}}\"" \
               --project="$project" --freshness="{{.LOGS_FRESHNESS}}" --order=asc --format='value(timestamp,jsonPayload.data)' ;;
           services|prover)
             gcloud compute instances get-serial-port-output "shonin-{{.NAME}}-{{.NETWORK}}" \
               --project="$project" --zone="{{.GCP_ZONE}}" | tail -n 200 ;;
           *)
-            echo "no logs for {{.NAME}}: executor, api, keeper, tunnel, waker, services or prover"; exit 1 ;;
+            echo "no logs for {{.NAME}}: executor, api, keeper, tunnel, waker, services, prover or testnet-market"; exit 1 ;;
         esac
 
   start:

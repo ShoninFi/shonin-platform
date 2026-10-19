@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+# testnet-market: keeps the test networks' Uniswap pools at the real market
+# price, from Chainlink's mainnet feeds (read with no key), and posts those
+# feeds' rounds to their testnet mirrors. Test networks only: the binary
+# refuses any other network, and this image is built for the testnet alone.
+# Runs on its own small VM (deploy/gcp/testnet-market).
+# Built from the repository root by `task cloud:build NAME=testnet-market NETWORK=testnet`,
+# which passes the network's settings and its deployments directory (the
+# mirror feeds' record among them):
+#   docker build --build-arg NETWORK_FEATURE=none --build-arg NETWORK=testnet \
+#     --build-context deployments=.shonin/testnet/deployments \
+#     -f deploy/gcp/Dockerfile.testnet-market .
+#
+# Everything it runs with is in the image but its key: its own test network
+# account's key alone, SHONIN_TESTNET_MARKET_KEY, handed to the container
+# where it is started (an env file only root can read, on its VM). The
+# chains' endpoints are the public ones committed in config/chains.toml,
+# unless the paid endpoints' secret overrides them.
+
+# Where the build starts from: the `deps` stage below, or (in Cloud Build)
+# that stage already built and pushed as an image named for everything it
+# is made from (deploy/gcp/cloudbuild/build.sh).
+ARG DEPS=deps
+
+# The toolchain rust-toolchain.toml pins, with its targets, and cargo-chef.
+FROM rust:1.98.1-slim-bookworm AS chef
+WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustup show active-toolchain && \
+    cargo install cargo-chef --locked --version 0.1.78
+
+# What the dependencies are, from the manifests alone.
+FROM chef AS recipe
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# The dependencies alone, compiled from the recipe.
+FROM chef AS deps
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+# Accepted like every image's; this one compiles no Solana program id.
+ARG NETWORK_FEATURE
+COPY --from=recipe /src/recipe.json recipe.json
+# The Solana programs' crates the chain crate names by path: outside the
+# workspace, so the recipe carries no skeleton of them, and cargo resolves
+# them even where no feature uses them.
+COPY contracts/solana contracts/solana
+RUN cargo chef cook --release --locked -p shonin-testnet-market --bin testnet-market --recipe-path recipe.json
+
+# Then the service itself.
+FROM ${DEPS} AS build
+ARG NETWORK
+RUN : "${NETWORK:?pass --build-arg NETWORK=testnet}" && \
+    { [ "$NETWORK" = testnet ] || { echo "testnet-market is built for the testnet alone, not $NETWORK"; exit 1; }; }
+COPY . .
+RUN cargo build --release --locked -p shonin-testnet-market --bin testnet-market
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG NETWORK
+COPY --from=build /src/target/release/testnet-market /usr/local/bin/testnet-market
+COPY config/chains.toml /etc/shonin/chains.toml
+# The generation's deployment files: the named build context `deployments`
+# (a build without it fails here). The market reads the mirror feeds' record.
+COPY --from=deployments *.json /etc/shonin/deployments/${NETWORK}/
+ENV SHONIN_NETWORK=${NETWORK} \
+    SHONIN_CHAINS=/etc/shonin/chains.toml \
+    SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK}
+ENTRYPOINT ["/usr/local/bin/testnet-market"]
+CMD ["--port", "19088", "--listen", "0.0.0.0"]

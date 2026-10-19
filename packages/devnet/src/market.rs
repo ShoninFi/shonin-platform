@@ -368,6 +368,7 @@ pub async fn operate(
     every: Duration,
     params: TapeParams,
 ) -> Result<()> {
+    crate::deploy::require_stand_ins(deployments, "the stand-in venue's market")?;
     let operator = client.account(Role::Operator)?;
     if operator != deployments.roles.operator {
         return Err(anyhow::Error::new(WrongOperator {

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Watches the testnets: every role's gas, the funders, the keeper and the API.
+"""Watches the testnets: every role's gas, the funders, the keeper, the API
+and the mirror feeds testnet-market keeps.
 
 Reads public endpoints only, with no key. The accounts to watch come from the
 JSON in the TESTNET_WATCH environment variable (testnet addresses are kept out
@@ -8,8 +9,12 @@ of the repository):
     {
       "evm": {"<role>": "0x…", …},          # the same address on every EVM chain
       "solana": {"<role>": "<base58>", …},
-      "hypercore": {"<role>": "0x…", …}     # USDC held on Hyperliquid testnet's HyperCore
+      "hypercore": {"<role>": "0x…", …},    # USDC held on Hyperliquid testnet's HyperCore
+      "mirrors": {"<symbol>": "0x…", …}     # Robinhood Chain testnet's mirror feeds
     }
+
+testnet-market's account goes under "evm" as "market", so its gas is watched
+like a role's.
 
 Public endpoints keep no history, so each run adds a sample to a history file
 (kept between runs by the workflow's cache) and judges from it:
@@ -20,7 +25,10 @@ Public endpoints keep no history, so each run adds a sample to a history file
 - the keeper role sends on every chain at least daily (its daily settlement),
   so the run fails when its transaction count on an EVM chain hasn't moved, or
   its newest Solana signature is older, than KEEPER_QUIET_HOURS;
-- the API's /health must answer, with every chain read within API_STALE_SECONDS.
+- the API's /health must answer, with every chain read within API_STALE_SECONDS;
+- each mirror feed must carry its mainnet feed's latest round, once that round
+  is older than MIRROR_LAG_SECONDS (testnet-market posts it within a minute or
+  two).
 
 Usage: testnet-watch.py <history.json>. Exits 1 (and prints ::error::
 annotations) when anything fails, so GitHub notifies the repository's owner.
@@ -40,11 +48,15 @@ EVM_CHAINS = {
 SOLANA_RPC = "https://api.devnet.solana.com"
 HYPERCORE_INFO = "https://api.hyperliquid-testnet.xyz/info"
 API_HEALTH = os.environ.get("API_HEALTH", "https://testnet-api.shonin.fi/health")
+# Where the mirrors' mainnet feeds are read.
+MIRROR_CHAIN = "robinhood-testnet"
+SOURCE_RPC = "https://rpc.mainnet.chain.robinhood.com"
 
 RUNWAY_DAYS = float(os.environ.get("RUNWAY_DAYS", "7"))
 MIN_SPAN_HOURS = float(os.environ.get("MIN_SPAN_HOURS", "12"))
 KEEPER_QUIET_HOURS = float(os.environ.get("KEEPER_QUIET_HOURS", "26"))
 API_STALE_SECONDS = int(os.environ.get("API_STALE_SECONDS", "900"))
+MIRROR_LAG_SECONDS = int(os.environ.get("MIRROR_LAG_SECONDS", "1800"))
 KEEP_DAYS = 8
 # Some public endpoints refuse Python's default user agent.
 HEADERS = {"content-type": "application/json", "user-agent": "shonin-testnet-watch"}
@@ -188,6 +200,41 @@ def check_api():
             error(f"the API last read {name} {rest}")
 
 
+# latestRoundData() and source(): their selectors.
+LATEST_ROUND = "0xfeaf968c"
+SOURCE = "0x67e828bf"
+
+
+def latest_round(url, feed):
+    """A feed's latest round id and its updatedAt."""
+    words = rpc(url, "eth_call", [{"to": feed, "data": LATEST_ROUND}, "latest"])[2:]
+    word = lambda i: int(words[64 * i : 64 * (i + 1)], 16)
+    return word(0), word(3)
+
+
+def check_mirrors(watch):
+    now = int(time.time())
+    url = EVM_CHAINS[MIRROR_CHAIN]
+    for symbol, mirror in sorted(watch.get("mirrors", {}).items()):
+        try:
+            source = "0x" + rpc(url, "eth_call", [{"to": mirror, "data": SOURCE}, "latest"])[-40:]
+            mirror_round, mirror_at = latest_round(url, mirror)
+            source_round, source_at = latest_round(SOURCE_RPC, source)
+        except Exception as failure:
+            print(f"::warning::{symbol}'s mirror: unreadable this run ({failure})")
+            continue
+        behind = source_round != mirror_round
+        print(
+            f"{symbol}: mirror round {mirror_round} ({(now - mirror_at) / 3600:.1f} h old), "
+            f"mainnet {source_round}{' (newer)' if behind else ''}"
+        )
+        if behind and now - source_at > MIRROR_LAG_SECONDS:
+            error(
+                f"{symbol}'s mirror lacks the mainnet round of {(now - source_at) / 60:.0f} minutes ago: "
+                "is testnet-market running?"
+            )
+
+
 def main():
     path = sys.argv[1]
     watch = json.loads(os.environ["TESTNET_WATCH"])
@@ -205,6 +252,8 @@ def main():
     check_keeper(history, sample)
     print("== api")
     check_api()
+    print("== mirror feeds")
+    check_mirrors(watch)
 
     history = [s for s in history if s["t"] > now - KEEP_DAYS * 86400] + [sample]
     with open(path, "w") as f:

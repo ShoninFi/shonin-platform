@@ -6,6 +6,12 @@
 # The funder keeps `reserve` for itself and funds nothing past it: a role it
 # can't fully top up is reported, not half-funded.
 #
+# `market` is testnet-market's account (m/44'/60'/0'/0/101 of the EVM
+# mnemonic, not a role), on the chains whose pools it keeps: a month of its
+# mirror posts (one each time a mainnet feed moves) and its swaps (with a
+# dollar mint before a buy where the dollar is mintable), at the chain's
+# usual gas price. `task chains:fund` tops it up with the roles.
+#
 # The executor holds no role account: the keeper relays every blessing the
 # executor publishes and, once the chain shows a vault's key blessed, stakes
 # that key with gas: 0.0005 of the chain's coin on a public chain, or three
@@ -23,6 +29,7 @@ admin = 0.03
 executor = 0
 keeper = 0.02
 author = 0.008
+market = 0.005
 
 [testnet."evm:998"] # Hyperliquid testnet's HyperEVM, HYPE
 reserve = 0.05
@@ -45,6 +52,7 @@ executor = 0
 keeper = 0.006
 operator = 0.002
 author = 0.001
+market = 0.005
 
 # Solana devnet, SOL. The funder is the deployer (m/44'/501'/0'/0' of the
 # Solana mnemonic), which paid for the programs; `task chains:solana-setup

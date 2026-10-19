@@ -108,6 +108,13 @@ steps:
     args: [deploy/gcp/cloudbuild/build.sh, unwinder]
     env: *settings
 
+  - id: testnet-market
+    waitFor: [buildkit]
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: [deploy/gcp/cloudbuild/build.sh, testnet-market]
+    env: *settings
+
 serviceAccount: projects/shonin-testnet/serviceAccounts/shonin-cloudbuild@shonin-testnet.iam.gserviceaccount.com
 timeout: 3600s
 options:

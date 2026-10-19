@@ -7365,7 +7365,9 @@ dependencies = [
  "shonin-attestation-deploy",
  "shonin-chain",
  "shonin-hyperliquid",
+ "shonin-robinhood",
  "shonin-shared",
+ "shonin-testnet-market",
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -7663,6 +7665,7 @@ dependencies = [
  "ciborium",
  "fastnum",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7740,6 +7743,23 @@ dependencies = [
  "futures",
  "serde",
  "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "shonin-testnet-market"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
+ "clap",
+ "serde",
+ "serde_json",
+ "shonin-chain",
+ "shonin-robinhood",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

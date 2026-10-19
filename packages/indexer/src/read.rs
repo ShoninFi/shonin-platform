@@ -1193,7 +1193,9 @@ async fn read_trades(
     created_in: Option<u64>,
     head: u64,
 ) -> (Vec<Trade>, u32) {
-    if station == Address::ZERO {
+    // The stand-in venue's fills alone are read here; a public test
+    // network's deployment has no stand-in venue.
+    if station == Address::ZERO || deployments.venue == Address::ZERO {
         return (Vec::new(), 0);
     }
     let fills = history.fills.entry(station).or_default();
@@ -1529,6 +1531,11 @@ fn vault_event(log: &Log) -> Option<VaultEvent> {
 }
 
 async fn read_legs(chain: &Client, deployments: &Deployments, vault: &Vault) -> Result<Vec<Leg>> {
+    // The stand-in venue's leg alone is read here; a public test network's
+    // deployment has none.
+    if deployments.venue == Address::ZERO {
+        return Ok(Vec::new());
+    }
     let station: Address = vault.station.parse().unwrap_or_default();
     let on_venue = chain
         .read(
