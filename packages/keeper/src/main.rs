@@ -284,6 +284,11 @@ async fn main() -> Result<()> {
         }
         let policy = configs.rpc_policy(&served.key);
         chains.spawn(async move {
+            // The chain's sends from the keeper's key don't wait for each
+            // other's receipts: several vaults' window-bound sends land in
+            // one block (see [`rounds_at_once`]).
+            let mut served = served;
+            served.client = served.client.pipelined();
             // Nothing is sent that hasn't been simulated: a chain whose node
             // can't simulate is not kept until it can.
             until_it_can_simulate(chain, &served.client, &served.key, &policy).await;
@@ -1555,53 +1560,19 @@ async fn tick(
     } else if factories.unread_said.over() {
         tracing::info!(%chain, "every factory's vaults are read again");
     }
-    // Read from an observation, what must land inside a slot's window goes
-    // first, for every vault whose window a send made now lands in, before
-    // any vault's other sends take their blocks: each such vault's
-    // valuation step, as its round would make it.
+    // Every vault's round at once (see [`rounds_at_once`]), those whose
+    // valuation window a send made now lands in first.
     let ordered = window_first(client, &vaults);
-    let windowed: Vec<Address> = ordered
-        .iter()
-        .copied()
-        .take_while(|vault| in_window(client, vault))
-        .collect();
-    for vault in windowed {
-        let remembered = memory.entry(vault).or_default();
-        window_step(client, keeper, vault, remembered).await;
-    }
-    for vault in ordered {
-        let remembered = memory.entry(vault).or_default();
-        let done = keep_one(client, keeper, deployments, executor, vault, remembered).await;
-        steps_worked(client.chain_id, vault, done.is_ok());
-        let unkept = (client.chain_id, vault);
-        match done {
-            Ok(()) => {
-                remembered.rounds_failing = 0;
-                if remembered.round_said.over() {
-                    tracing::info!(%chain, %vault, "the vault's rounds finish again");
-                }
-                if let Ok(mut unread) = UNREAD.lock() {
-                    unread.remove(&unkept);
-                }
-            }
-            Err(error) => {
-                remembered.rounds_failing += 1;
-                if let Some(times) = remembered.round_said.due(std::time::Instant::now()) {
-                    tracing::warn!(%chain, %vault, times, error = format!("{error:#}"), "the vault's round did not finish");
-                }
-                if let Ok(mut unread) = UNREAD.lock() {
-                    unread.insert(unkept, remembered.rounds_failing);
-                }
-            }
-        }
-        if let Ok(mut unprobed) = UNPROBED.lock() {
-            if remembered.probes_failing >= MOST_PROBES_FAILING {
-                unprobed.insert(unkept, remembered.probes_failing);
-            } else {
-                unprobed.remove(&unkept);
-            }
-        }
-    }
+    rounds_at_once(
+        chain,
+        client,
+        keeper,
+        deployments,
+        executor,
+        &ordered,
+        memory,
+    )
+    .await;
     // A vault no longer listed is no longer said to be unkept.
     let listed =
         |chain_id: u64, vault: &Address| chain_id != client.chain_id || vaults.contains(vault);
@@ -1644,10 +1615,199 @@ async fn tick(
     Ok(vaults)
 }
 
-/// The vaults in the order a round keeps them: read from an observation,
+/// What a vault's round came to, noted: in the keeper's health and said, as
+/// [`tick`] notes every round it makes.
+fn round_kept(
+    chain: Chain,
+    chain_id: u64,
+    vault: Address,
+    remembered: &mut Memory,
+    done: Result<()>,
+) {
+    steps_worked(chain_id, vault, done.is_ok());
+    let unkept = (chain_id, vault);
+    match done {
+        Ok(()) => {
+            remembered.rounds_failing = 0;
+            if remembered.round_said.over() {
+                tracing::info!(%chain, %vault, "the vault's rounds finish again");
+            }
+            if let Ok(mut unread) = UNREAD.lock() {
+                unread.remove(&unkept);
+            }
+        }
+        Err(error) => {
+            remembered.rounds_failing += 1;
+            if let Some(times) = remembered.round_said.due(std::time::Instant::now()) {
+                tracing::warn!(%chain, %vault, times, error = format!("{error:#}"), "the vault's round did not finish");
+            }
+            if let Ok(mut unread) = UNREAD.lock() {
+                unread.insert(unkept, remembered.rounds_failing);
+            }
+        }
+    }
+    if let Ok(mut unprobed) = UNPROBED.lock() {
+        if remembered.probes_failing >= MOST_PROBES_FAILING {
+            unprobed.insert(unkept, remembered.probes_failing);
+        } else {
+            unprobed.remove(&unkept);
+        }
+    }
+}
+
+/// The most vaults whose rounds are made at once: enough that a chain's
+/// vaults due in one window are all in the first of them, few enough that a
+/// look's reads made of the chain itself after a send don't all reach its
+/// endpoints in one burst.
+const MOST_ROUNDS_AT_ONCE: usize = 16;
+
+/// Every vault's round made at once, whether read from an observation or of
+/// the chain itself: no vault's send waits for another vault's receipt (the
+/// client is [`Client::pipelined`]), so the sends of a look land in the same
+/// block and no vault's duty is a block or a slot late for another's. Each
+/// vault's own steps still wait for their own receipts, in the order its
+/// round makes them, so none is decided on a state its own send may still
+/// change.
+///
+/// What must land inside a slot's window goes first within each vault read
+/// from an observation: a running vault whose window a valuation made now
+/// lands in has its valuation step (see [`window_step`]) before the rest of
+/// its round. Read of the chain itself, a round makes its valuation step in
+/// its place, as it always has. A halted vault's round is its window-bound
+/// steps already: its bill, its station stopped and emptied, its valuation
+/// and its close (or the Closer's close in one go), in that order. The
+/// vaults start in `ordered`'s order (window-bound first), at most
+/// [`MOST_ROUNDS_AT_ONCE`] at a time.
+async fn rounds_at_once(
+    chain: Chain,
+    client: &Observed,
+    keeper: Address,
+    deployments: &Deployments,
+    executor: &str,
+    ordered: &[Address],
+    memory: &mut HashMap<Address, Memory>,
+) {
+    // Judged on the observation, before any send moves the reads to the
+    // chain itself.
+    let served = client.snapshot().map(|snapshot| snapshot.timestamp);
+    let window_first: Vec<Address> = ordered
+        .iter()
+        .copied()
+        .filter(|vault| in_window(client, vault) && !halted_in_observation(client, vault))
+        .collect();
+    let halted: Vec<Address> = ordered
+        .iter()
+        .copied()
+        .filter(|vault| halted_in_observation(client, vault))
+        .collect();
+    let mut taken: Vec<(Address, Memory)> = ordered
+        .iter()
+        .map(|vault| (*vault, memory.remove(vault).unwrap_or_default()))
+        .collect();
+    let places = tokio::sync::Semaphore::new(MOST_ROUNDS_AT_ONCE);
+    let running = std::sync::atomic::AtomicUsize::new(taken.len());
+    // The chain's time while rounds run, read once a second.
+    let (clock, ticks) = tokio::sync::watch::channel(served);
+    let ended = tokio::sync::Notify::new();
+    let rounds: Vec<_> = taken
+        .iter_mut()
+        .map(|(vault, remembered)| {
+            let window_first = window_first.contains(vault);
+            let halted = halted.contains(vault);
+            let vault = *vault;
+            let (places, running, ended, mut ticks) = (&places, &running, &ended, ticks.clone());
+            async move {
+                let mut done = {
+                    let _place = places.acquire().await;
+                    if window_first {
+                        window_step(client, keeper, vault, remembered).await;
+                    }
+                    keep_one(client, keeper, deployments, executor, vault, remembered).await
+                };
+                if running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    ended.notify_waiters();
+                }
+                // Read from an observation, a vault whose valuation window opens
+                // while other rounds of this look still run is valued then,
+                // not at the next look: its valuation step again, or a halted
+                // vault's whole round, once for each window that opens.
+                let (Some(_), Some(Ok(timers))) =
+                    (served, client.peek(vault, IVault::timersCall {}))
+                else {
+                    return done;
+                };
+                let block_interval = client.block_interval_seen().unwrap_or(1);
+                let landing = |now: u64| {
+                    landing_slot(now, timers.slotInterval, timers.slotWindow, block_interval)
+                };
+                let mut judged = (*ticks.borrow()).and_then(landing);
+                while ticks.changed().await.is_ok() {
+                    let Some(now) = *ticks.borrow_and_update() else {
+                        continue;
+                    };
+                    let Some(slot) = landing(now) else {
+                        continue;
+                    };
+                    if judged == Some(slot) {
+                        continue;
+                    }
+                    judged = Some(slot);
+                    let _place = places.acquire().await;
+                    if halted {
+                        done = keep_one(client, keeper, deployments, executor, vault, remembered)
+                            .await;
+                    } else {
+                        window_step(client, keeper, vault, remembered).await;
+                    }
+                }
+                done
+            }
+        })
+        .collect();
+    let reading = async {
+        if served.is_some() {
+            loop {
+                let all_ended = ended.notified();
+                tokio::pin!(all_ended);
+                all_ended.as_mut().enable();
+                if running.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    break;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    () = &mut all_ended => break,
+                }
+                if let Ok(now) = client.block_timestamp().await {
+                    clock.send_replace(Some(now));
+                }
+            }
+        }
+        // Dropped: every round waiting on it ends.
+        drop(clock);
+    };
+    drop(ticks);
+    let (done, ()) = tokio::join!(futures::future::join_all(rounds), reading);
+    for ((vault, mut remembered), done) in taken.into_iter().zip(done) {
+        round_kept(chain, client.chain_id, vault, &mut remembered, done);
+        memory.insert(vault, remembered);
+    }
+}
+
+/// Whether the observation shows the vault halted. A vault whose halt it
+/// doesn't hold (its first look) is taken as running: its window step reads
+/// the halt itself, and leaves a halted vault to its round.
+fn halted_in_observation(client: &Observed, vault: &Address) -> bool {
+    client
+        .peek(*vault, IStationVault::haltedAtCall {})
+        .and_then(Result::ok)
+        .is_some_and(|halted| halted != 0)
+}
+
+/// The vaults in the order a round starts them: read from an observation,
 /// those whose valuation window a send made now lands in first, so what
-/// must land inside a window is never behind another vault's sends; in the
-/// factory's order otherwise, and always on the active path.
+/// must land inside a window is never kept waiting for a place among the
+/// rounds made at once; in the factory's order otherwise, and always on the
+/// active path.
 fn window_first(client: &Observed, vaults: &[Address]) -> Vec<Address> {
     if client.snapshot().is_none() {
         return vaults.to_vec();
@@ -1693,10 +1853,10 @@ fn in_window(client: &Observed, vault: &Address) -> bool {
         })
 }
 
-/// A running vault's valuation step, made ahead of every vault's other
-/// sends in a round read from an observation (see [`tick`]): what [`price`]
-/// does in the vault's round, judged on the same reads. A halted vault is
-/// left to its round, where its station is stopped and emptied before its
+/// A running vault's valuation step, made ahead of the rest of its round
+/// read from an observation (see [`rounds_at_once`]): what [`price`] does
+/// in the vault's round, judged on the same reads. A halted vault is left to
+/// its round, where its station is stopped and emptied before its
 /// valuation. The round's own valuation step follows as before, and finds
 /// the slot valued.
 async fn window_step(client: &Observed, keeper: Address, vault: Address, memory: &mut Memory) {
@@ -6429,6 +6589,7 @@ mod stand_in;
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod in_flight;
     mod refresh;
     mod round_memory;
     mod round_order_and_logs;
