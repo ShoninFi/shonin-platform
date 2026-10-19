@@ -34,6 +34,7 @@ pub use shonin_publishing::state::{ChainNeed, Lists, Review, ReviewInput, Strate
 pub use shonin_registry::state::{ApprovalKind, ImageKind, Journal, KeyInfo};
 
 pub mod orca;
+pub mod real_pki_token;
 pub mod real_token;
 pub mod station;
 pub mod vault;

@@ -59,16 +59,16 @@ flowchart LR
 
 **The proof program** checks everything that would be too expensive on-chain:
 
-- the certificate chain, up to Google's root certificate, which is pinned in the program;
+- the certificate chain, up to Google's root certificate: each certificate valid when the attestation was issued, each signed by the next, the ones above the first allowed to sign certificates;
 - Google's signature over the attestation;
 - that debugging is off, the hardware is a genuine secure enclave, and its security patches are recent enough;
 - that the image was started with exactly its published settings, since an honest image run with dishonest settings isn't honest.
 
-It then commits a short **summary**: which image, which operator's account ran it, the key's address and what it's bound to, and when the attestation expires.
+It then commits a short **summary**: which image, which operator's account ran it, the key's address and what it's bound to, when the attestation was issued, and the fingerprint of the root certificate the chain ends in.
 
 **The proof** shows that this exact program ran on this attestation and produced this summary. It's small and cheap to check, and it's impossible in practice to make one for an attestation the program would have refused.
 
-**On the chain,** RISC Zero's audited verifier contract checks the proof, and ours then check the summary: that the image is on the [allowlist](#the-allowlist), the operator is approved, and the attestation is still fresh. Our contracts only accept proofs from the one published proof program, identified by its fingerprint, so a proof from any other program counts for nothing. Changing that program, or the Google root certificate it trusts, goes through the same public wait as a new image, so how attestations are checked can never change quietly.
+**On the chain,** RISC Zero's audited verifier contract checks the proof, and ours then check the summary: that the chain ends in the Google root certificate they pin, the image is on the [allowlist](#the-allowlist), the operator is approved, and the attestation is still fresh. Our contracts only accept proofs from the one published proof program, identified by its fingerprint, so a proof from any other program counts for nothing. Changing that program, or the Google root certificate it trusts, goes through the same public wait as a new image, so how attestations are checked can never change quietly.
 
 **Anyone can run the program and send the proof,** us included, since the chain checks the proof itself, not who sent it. It's run once per machine each time its blessing is renewed, and one proof covers every vault an executor serves.
 

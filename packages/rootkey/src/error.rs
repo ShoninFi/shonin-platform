@@ -27,6 +27,10 @@ pub enum Error {
     /// chain allows trusts.
     #[error("the token is signed by a Google key no allowed checker trusts")]
     UntrustedGoogleKey,
+    /// The token's certificate chain ends in a root that no checker the
+    /// canonical chain allows trusts.
+    #[error("the token's certificate chain ends in a root no allowed checker trusts")]
+    UntrustedRoot,
     /// The token's nonce does not bind this request's key and purpose.
     #[error("the token's nonce does not bind this request's key and purpose")]
     Nonce,

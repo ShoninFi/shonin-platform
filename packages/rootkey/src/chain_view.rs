@@ -118,9 +118,9 @@ pub trait ChainView: Send + Sync {
     /// acted on.
     fn pin(&self, chain: u64) -> impl Future<Output = Result<u64>> + Send;
 
-    /// The Google signing keys trusted, by their key hash
-    /// (`Jwk::key_hash`), by any checker the canonical registry allows at
-    /// block `at`.
+    /// What any checker the canonical registry allows at block `at`
+    /// trusts: Google signing keys by their key hash (`Jwk::key_hash`), and
+    /// root certificates by theirs (`pki::root_hash`).
     fn trusted_google_keys(&self, at: u64) -> impl Future<Output = Result<Vec<[u8; 32]>>> + Send;
 
     /// The kind an image is allowed as at block `at` of the canonical chain,

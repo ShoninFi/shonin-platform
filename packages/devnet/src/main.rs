@@ -155,8 +155,10 @@ enum Command {
     /// deploy.
     Accounts,
     /// Deploy the Confidential Space checker on every EVM chain of the
-    /// network and propose it to the registry beside the development
-    /// checker. Already proposed is done.
+    /// network, and create it on the Solana cluster, and propose it to each
+    /// registry beside the development checker and any earlier one (a new
+    /// guest or a newly pinned key set is a new checker). Already proposed
+    /// is done.
     ProposeChecker,
     /// Propose a real image digest to every chain's registry (each EVM
     /// chain's and the Solana cluster's, once it is set up), signed by the
@@ -569,10 +571,12 @@ async fn main() -> Result<()> {
                 &args.artifacts,
             )
             .await;
-            // The Solana cluster's checker: the same guest and Google keys.
+            // The Solana cluster's checker: the same guest, root and Google
+            // keys. Its address is derived from them, so a new guest or key
+            // set is a new checker beside the earlier one.
             let image = shonin_attestation_deploy::GUEST_IMAGE_ID.0;
-            let keys: Vec<[u8; 32]> = shonin_attestation_deploy::trusted_keys(
-                shonin_attestation_core::GOOGLE_JWKS_2026_10_06,
+            let keys: Vec<[u8; 32]> = shonin_attestation_deploy::trusted_hashes(
+                shonin_attestation_core::PINNED_GOOGLE_JWKS,
             )?
             .into_iter()
             .map(|key| key.0)

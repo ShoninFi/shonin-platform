@@ -21,7 +21,7 @@
 //! ```text
 //! attestation-prover [--executor-url <url>] [--status-url <url>]...
 //!     [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>]
-//!     [--poll-seconds 15]
+//!     [--root <root.crt>] [--poll-seconds 15]
 //! ```
 //!
 //! `--executor-url` is one status URL like the others; `SHONIN_EXECUTOR_URL`
@@ -30,8 +30,11 @@
 //! `--guest-elf` names the guest's ELF when this binary was built without it
 //! (an image builds the prover without Docker, and ships the ELF built
 //! reproducibly elsewhere); either way the guest must be the one every
-//! checker pins, or the prover refuses to start. `--keys` is the key set the
-//! token is checked against: Google's as pinned when it is left out.
+//! checker pins, or the prover refuses to start. `--keys` is the key set an
+//! OIDC token is checked against: Google's as pinned when it is left out. A
+//! PKI token carries its own certificate chain, and its proof is checked
+//! against the root certificate `--root` names (PEM): Google's Confidential
+//! Space Root CA when it is left out.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,9 +44,9 @@ use serde::Deserialize;
 use shonin_attestation::{
     Binding, Guest, Input, Jwk, PINNED_IMAGE_ID, Proof, evm_seal, pinned_image_id,
 };
-use shonin_attestation_core::GOOGLE_JWKS_2026_10_06;
+use shonin_attestation_core::{CONFIDENTIAL_SPACE_ROOT, PINNED_GOOGLE_JWKS, pki};
 
-const USAGE: &str = "usage: attestation-prover [--executor-url <url>] [--status-url <url>]... [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>] [--poll-seconds 15]";
+const USAGE: &str = "usage: attestation-prover [--executor-url <url>] [--status-url <url>]... [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>] [--root <root.crt>] [--poll-seconds 15]";
 
 /// How often a machine that doesn't answer is said to.
 const UNREACHABLE_SAID_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -69,6 +72,7 @@ struct Args {
     idle_exit: Duration,
     guest_elf: Option<String>,
     keys: Option<String>,
+    root: Option<String>,
     poll: Duration,
 }
 
@@ -87,6 +91,7 @@ fn args() -> Result<Args> {
         idle_exit: Duration::from_secs(600),
         guest_elf: std::env::var("SHONIN_GUEST_ELF").ok(),
         keys: None,
+        root: None,
         poll: Duration::from_secs(15),
     };
     let mut given = std::env::args().skip(1);
@@ -99,6 +104,7 @@ fn args() -> Result<Args> {
             }
             "--guest-elf" => args.guest_elf = Some(value()?),
             "--keys" => args.keys = Some(value()?),
+            "--root" => args.root = Some(value()?),
             "--poll-seconds" => args.poll = Duration::from_secs(value()?.parse().context(USAGE)?),
             _ => bail!(USAGE),
         }
@@ -405,6 +411,12 @@ fn deliver_held(
     }
 }
 
+/// What a fresh receipt is checked against, as the checkers do: the keys
+/// given (an OIDC token's), and the root certificate's hash (a PKI token's).
+fn trusted(keys: &[Jwk], root: [u8; 32]) -> Vec<[u8; 32]> {
+    keys.iter().map(Jwk::key_hash).chain([root]).collect()
+}
+
 /// Prove one token, check the receipt as a chain would, and say the EVM
 /// seal and journal.
 fn prove(guest: &Guest, trusted: &[[u8; 32]], work: &Work) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -435,10 +447,19 @@ fn main() -> Result<()> {
         Some(path) => {
             std::fs::read_to_string(path).with_context(|| format!("reading the key set {path}"))?
         }
-        None => GOOGLE_JWKS_2026_10_06.to_string(),
+        None => PINNED_GOOGLE_JWKS.to_string(),
     };
     let keys = Jwk::from_jwks(&jwks).map_err(|error| anyhow::anyhow!("the key set: {error}"))?;
-    let trusted: Vec<[u8; 32]> = keys.iter().map(Jwk::key_hash).collect();
+    let root = match &args.root {
+        Some(path) => {
+            std::fs::read_to_string(path).with_context(|| format!("reading the root {path}"))?
+        }
+        None => CONFIDENTIAL_SPACE_ROOT.to_string(),
+    };
+    let root = pki::root_hash(
+        &pki::pem_der(&root).map_err(|error| anyhow::anyhow!("the root certificate: {error}"))?,
+    );
+    let trusted = trusted(&keys, root);
     println!(
         "the prover is up: guest {PINNED_IMAGE_ID}, {} keys, status {}, idle exit after {} s",
         keys.len(),
@@ -542,6 +563,21 @@ mod tests {
             solana_signer: [0; 32],
             vaults_root: [2; 32],
         }
+    }
+
+    #[test]
+    fn a_receipt_is_checked_against_the_keys_given_and_the_root() {
+        let keys = Jwk::from_jwks(PINNED_GOOGLE_JWKS).unwrap();
+        let google = shonin_attestation_core::confidential_space_root_hash();
+        let trusted = trusted(&keys, google);
+        assert_eq!(trusted.len(), keys.len() + 1);
+        assert!(keys.iter().all(|key| trusted.contains(&key.key_hash())));
+        assert!(trusted.contains(&google));
+        // Google's root is the one pinned by default.
+        assert_eq!(
+            pki::root_hash(&pki::pem_der(CONFIDENTIAL_SPACE_ROOT).unwrap()),
+            google
+        );
     }
 
     #[test]

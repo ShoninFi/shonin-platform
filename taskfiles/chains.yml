@@ -93,7 +93,7 @@ tasks:
       - "{{.DEVNET}} accounts"
 
   checker:
-    desc: "Propose the Confidential Space checker beside the development checker on every EVM chain of the network (the one named in the deployments directory's attestation-<chain>.json if it is on the chain, else a new one) and on its Solana cluster once set up (the checker program's account for the pinned guest and Google keys), SHONIN_VAULT_CHAIN=solana for Solana alone (local or NETWORK=testnet)"
+    desc: "Propose the Confidential Space checker beside the development checker on every EVM chain of the network (the one named in the deployments directory's attestation-<chain>.json if it is on the chain and pins this build's guest, root and Google keys, else a new one beside it) and on its Solana cluster once set up (the checker program's account for the pinned guest, Google's Confidential Space root and Google keys), SHONIN_VAULT_CHAIN=solana for Solana alone (local or NETWORK=testnet)"
     cmds:
       - task: :contracts:build
       - "{{.DEVNET_SOLANA}} propose-checker"

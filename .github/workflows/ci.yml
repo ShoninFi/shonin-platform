@@ -307,6 +307,11 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      # The chain crate's follower tests run against a local anvil.
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.2.3
+
       # Every test binary of the workspace is large; the runner image's
       # unused toolchains make room for them.
       - name: Room for the test build

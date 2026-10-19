@@ -1,14 +1,15 @@
 //! Proving a Confidential Space attestation, and checking the proof.
 //!
 //! Anyone may prove: the input is the instance's token, Google's signing
-//! keys, a clock, and the keys and root the instance bound into the token's
-//! nonce. The guest checks the token and commits the canonical journal
+//! keys (for an OIDC token; a PKI token carries its own certificate chain),
+//! a clock, and the keys and root the instance bound into the token's nonce. The guest checks the token and commits the canonical journal
 //! ([`Journal`]); a Groth16 receipt of that run is what a chain's checker
 //! verifies, given the registry's own journal and what follows the seal
 //! ([`evm_seal`], [`solana_seal`]).
 //!
 //! [`verify`] is the same check off-chain: the receipt against the guest's
-//! image id, and the Google key it names against the keys the caller trusts.
+//! image id, and the hash the journal names (a Google key's, or a PKI
+//! chain's root certificate's) against the hashes the caller trusts.
 
 use anyhow::{Context, Result, bail, ensure};
 use risc0_zkvm::{
@@ -27,7 +28,7 @@ pub fn image_id() -> [u8; 32] {
 /// test checks the two agree). A prover proves with this guest or not at
 /// all: a seal of any other is refused by every checker.
 pub const PINNED_IMAGE_ID: &str =
-    "173f3361de2092dc0eb630570982375f05ef92fbbd19119b6860549f3c7250e0";
+    "8380b1a222ddbf918b25839f79b6e4aa9b7bab73e307cf21f8938ea1dacd6cef";
 
 /// [`PINNED_IMAGE_ID`] as bytes.
 pub fn pinned_image_id() -> [u8; 32] {
@@ -140,8 +141,10 @@ fn prove_elf(elf: &[u8], input: &Input, proof: Proof) -> Result<(Receipt, Journa
 }
 
 /// Check a receipt as a chain's checker does: that it proves this guest's
-/// run, and that the Google key it names is one of `trusted_keys` (by
-/// [`Jwk::key_hash`]). A dev-mode receipt passes only with `allow_dev`.
+/// run, and that the hash its journal names is one of `trusted_keys`: a
+/// Google key's [`Jwk::key_hash`], or a root certificate's
+/// [`shonin_attestation_core::pki::root_hash`]. A dev-mode receipt passes
+/// only with `allow_dev`.
 pub fn verify(receipt: &Receipt, trusted_keys: &[[u8; 32]], allow_dev: bool) -> Result<Journal> {
     verify_id(
         Digest::from(SHONIN_ATTESTATION_GUEST_ID),
@@ -165,7 +168,7 @@ fn verify_id(
         .context("the receipt's journal is the wrong length")?;
     ensure!(
         trusted_keys.contains(&journal.key_hash),
-        "the token was signed by a key that is not trusted"
+        "the token was signed by a key, or under a root, that is not trusted"
     );
     Ok(journal)
 }
@@ -186,8 +189,8 @@ pub fn groth16_seal(receipt: &Receipt) -> Result<Vec<u8>> {
 }
 
 /// The `seal` an EVM registry's `bless` passes to the checker: the Groth16
-/// seal, then the instance's Solana key and the Google key's hash (324
-/// bytes). The registry's `journal` is [`Journal::evm`].
+/// seal, then the instance's Solana key and the hash the token is trusted
+/// by (324 bytes). The registry's `journal` is [`Journal::evm`].
 pub fn evm_seal(receipt: &Receipt, journal: &Journal) -> Result<Vec<u8>> {
     let mut seal = groth16_seal(receipt)?;
     seal.extend_from_slice(&journal.evm_seal_tail());
@@ -195,8 +198,8 @@ pub fn evm_seal(receipt: &Receipt, journal: &Journal) -> Result<Vec<u8>> {
 }
 
 /// The `seal` the Solana registry's `bless` passes to the checker: the
-/// Groth16 seal, then the instance's EVM key and the Google key's hash (312
-/// bytes). The registry's `journal` is [`Journal::solana`].
+/// Groth16 seal, then the instance's EVM key and the hash the token is
+/// trusted by (312 bytes). The registry's `journal` is [`Journal::solana`].
 pub fn solana_seal(receipt: &Receipt, journal: &Journal) -> Result<Vec<u8>> {
     let mut seal = groth16_seal(receipt)?;
     seal.extend_from_slice(&journal.solana_seal_tail());
@@ -280,6 +283,81 @@ mod tests {
         let mut input = fixture::real_input(fixture::REAL_IAT + 60);
         input.binding.vaults_root = [9; 32];
         assert!(execute(&input).is_err());
+    }
+
+    #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn the_guest_commits_the_root_s_hash_for_a_pki_token_as_the_native_check_does() {
+        let input = fixture::chain::input(&fixture::binding(), IAT, IAT + 60);
+        let native = shonin_attestation_core::verify(&input).unwrap();
+        let (journal, cycles) = execute(&input).unwrap();
+        assert_eq!(journal, native);
+        assert_eq!(journal.key_hash, fixture::chain::root_hash(IAT));
+        println!("the guest checked a PKI token (2048-bit chain) in {cycles} cycles");
+        assert!(cycles < 20_000_000, "{cycles} cycles");
+    }
+
+    #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn the_guest_refuses_a_pki_token_whose_chain_the_native_check_refuses() {
+        use fixture::chain::{LEAF_SEED, Spec, chain_of, key, token};
+        let expired = Spec {
+            not_after: IAT - 1,
+            ..Spec::intermediate(IAT)
+        };
+        let not_ca = Spec {
+            basic: Some((false, None)),
+            ..Spec::intermediate(IAT)
+        };
+        for intermediate in [expired, not_ca] {
+            let chain = chain_of(&Spec::leaf(IAT), &intermediate, &Spec::root(IAT));
+            let mut input = fixture::chain::input(&fixture::binding(), IAT, IAT + 60);
+            input.token = token(
+                &chain,
+                &key(LEAF_SEED),
+                &fixture::claims(&fixture::binding(), IAT),
+            );
+            assert!(shonin_attestation_core::verify(&input).is_err());
+            assert!(execute(&input).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn the_guest_accepts_the_real_pki_token_under_google_s_root() {
+        let input = Input {
+            token: fixture::REAL_PKI_TOKEN.trim().into(),
+            keys: Vec::new(),
+            now: fixture::REAL_PKI_IAT + 60,
+            binding: fixture::real_binding(),
+        };
+        let native = shonin_attestation_core::verify(&input).unwrap();
+        let (journal, cycles) = execute(&input).unwrap();
+        assert_eq!(journal, native);
+        assert_eq!(
+            journal.key_hash,
+            shonin_attestation_core::confidential_space_root_hash()
+        );
+        println!("the guest checked the real PKI token in {cycles} cycles");
+        assert!(cycles < 20_000_000, "{cycles} cycles");
+    }
+
+    #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn a_dev_receipt_of_a_pki_token_verifies_only_for_a_check_trusting_its_root() {
+        let input = fixture::chain::input(&fixture::binding(), IAT, IAT + 60);
+        let (receipt, journal) = prove(&input, Proof::Dev).unwrap();
+        let root = fixture::chain::root_hash(IAT);
+        assert_eq!(verify(&receipt, &[root], true).unwrap(), journal);
+        assert!(verify(&receipt, &trusted(), true).is_err());
+        assert!(
+            verify(
+                &receipt,
+                &[shonin_attestation_core::confidential_space_root_hash()],
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]

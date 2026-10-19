@@ -111,13 +111,101 @@ fn the_real_token_is_refused_by_a_check_given_none_of_google_s_keys() {
     assert_eq!(verify(&input), Err(Error::UnknownKey));
 }
 
+/// The genuine PKI token's input: no JWKS key, the chain is its own.
+fn real_pki_input(now: u64) -> Input {
+    Input {
+        token: fixture::REAL_PKI_TOKEN.trim().into(),
+        keys: Vec::new(),
+        now,
+        binding: real_binding(),
+    }
+}
+
 #[test]
-fn the_real_pki_token_is_refused_for_want_of_its_key() {
+fn the_real_pki_token_passes_chained_to_google_s_root_with_no_jwks_key() {
     let header = header_of(fixture::REAL_PKI_TOKEN);
     assert!(header["x5c"].is_array());
-    let mut input = real_input(REAL_IAT + 60);
-    input.token = fixture::REAL_PKI_TOKEN.into();
-    assert_eq!(verify(&input), Err(Error::UnknownKey));
+    let published = Jwk::from_jwks(GOOGLE_JWKS_2026_10_06).unwrap();
+    assert!(
+        published
+            .iter()
+            .all(|key| Some(key.kid.as_str()) != header["kid"].as_str())
+    );
+
+    let iat = fixture::REAL_PKI_IAT;
+    for now in [iat, iat + 60, iat + 3599] {
+        let journal = verify(&real_pki_input(now)).unwrap();
+        assert_eq!(journal.key_hash, confidential_space_root_hash());
+        assert_eq!(journal.issued_at, iat);
+        // The same VM, image, project and binding as the OIDC token.
+        let oidc = verify(&real_input(REAL_IAT + 60)).unwrap();
+        assert_eq!(
+            Journal {
+                key_hash: oidc.key_hash,
+                issued_at: oidc.issued_at,
+                ..journal
+            },
+            oidc
+        );
+    }
+}
+
+#[test]
+fn the_real_pki_token_s_chain_ends_in_the_root_google_publishes() {
+    let chain = fixture::chain::x5c_of(fixture::REAL_PKI_TOKEN.trim());
+    assert_eq!(chain.len(), 3);
+    let published = pki::pem_der(CONFIDENTIAL_SPACE_ROOT).unwrap();
+    assert_eq!(chain[2], published);
+    assert_eq!(
+        hex::encode(confidential_space_root_hash()),
+        fixture::CONFIDENTIAL_SPACE_ROOT_HASH
+    );
+}
+
+#[test]
+fn the_real_pki_token_is_refused_outside_its_hour() {
+    let iat = fixture::REAL_PKI_IAT;
+    assert_eq!(verify(&real_pki_input(iat - 1)), Err(Error::NotFresh));
+    assert_eq!(verify(&real_pki_input(iat + 3600)), Err(Error::NotFresh));
+}
+
+#[test]
+fn the_real_pki_token_s_signature_covers_its_claims() {
+    let mut input = real_pki_input(fixture::REAL_PKI_IAT + 60);
+    let payload = input.token.split('.').nth(1).unwrap();
+    let mut claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+    claims["submods"]["gce"]["project_id"] = Value::from("another-project");
+    let forged = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let parts: Vec<&str> = input.token.split('.').collect();
+    input.token = format!("{}.{}.{}", parts[0], forged, parts[2]);
+    assert_eq!(verify(&input), Err(Error::BadSignature));
+}
+
+#[test]
+fn the_real_pki_token_with_its_root_swapped_for_another_is_refused() {
+    let token = fixture::REAL_PKI_TOKEN.trim();
+    let mut chain = fixture::chain::x5c_of(token);
+    chain[2] = fixture::chain::chain(fixture::REAL_PKI_IAT).pop().unwrap();
+    let mut header = header_of(token);
+    header["x5c"] = fixture::chain::header(&chain)["x5c"].clone();
+    let parts: Vec<&str> = token.split('.').collect();
+    let mut input = real_pki_input(fixture::REAL_PKI_IAT + 60);
+    input.token = format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+        parts[1],
+        parts[2]
+    );
+    // The intermediate names Google's root as its issuer, not the test's.
+    assert_eq!(verify(&input), Err(Error::Chain("issuer")));
+}
+
+#[test]
+fn the_real_pki_token_is_refused_for_another_binding() {
+    let mut input = real_pki_input(fixture::REAL_PKI_IAT + 60);
+    input.binding.vaults_root = [0x22; 32];
+    assert_eq!(verify(&input), Err(Error::Nonce));
 }
 
 #[test]

@@ -17,14 +17,14 @@ use alloy::sol_types::SolValue;
 use anyhow::{Context, Result, anyhow, bail};
 use chain::Client;
 use chain::bindings::attestation::IAttestationRegistry;
-use shonin_attestation_core::Jwk;
+use shonin_attestation_core::{Jwk, confidential_space_root_hash};
 
 /// The attestation guest's image id, as built reproducibly in RISC Zero's
 /// guest-builder image (`packages/attestation/methods`). A host test checks
 /// it against the guest whenever the guest is built; a guest change is a new
 /// image id, and so a new checker proposed through the timelock.
 pub const GUEST_IMAGE_ID: B256 =
-    alloy::primitives::b256!("173f3361de2092dc0eb630570982375f05ef92fbbd19119b6860549f3c7250e0");
+    alloy::primitives::b256!("8380b1a222ddbf918b25839f79b6e4aa9b7bab73e307cf21f8938ea1dacd6cef");
 
 /// RISC Zero's Groth16 verifier parameters for the vendored release
 /// (`risc0-ethereum` v3.0.1, `ControlID.sol`), which the verifier is
@@ -54,6 +54,16 @@ pub fn trusted_keys(jwks: &str) -> Result<Vec<B256>> {
         bail!("the key set has no RSA keys");
     }
     Ok(keys.iter().map(|key| B256::from(key.key_hash())).collect())
+}
+
+/// What a checker of this guest is deployed trusting: Google's Confidential
+/// Space Root CA, for PKI tokens (by [`confidential_space_root_hash`]),
+/// first; then the Google keys of `jwks`, for OIDC tokens from machines that
+/// still ask for them.
+pub fn trusted_hashes(jwks: &str) -> Result<Vec<B256>> {
+    let mut hashes = vec![B256::from(confidential_space_root_hash())];
+    hashes.extend(trusted_keys(jwks)?);
+    Ok(hashes)
 }
 
 /// Deploy the checker (and RISC Zero's verifier, unless `risc_zero` names
@@ -189,6 +199,24 @@ mod tests {
         let keys = trusted_keys(shonin_attestation_core::GOOGLE_JWKS_2026_10_06).unwrap();
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn a_checker_trusts_google_s_root_and_the_pinned_keys() {
+        let pinned = shonin_attestation_core::PINNED_GOOGLE_JWKS;
+        let hashes = trusted_hashes(pinned).unwrap();
+        assert_eq!(
+            hashes[0],
+            B256::from(confidential_space_root_hash()),
+            "the root first"
+        );
+        assert_eq!(hashes[1..], trusted_keys(pinned).unwrap()[..]);
+        // Few enough for a Solana checker, which trusts at most eight.
+        assert!(hashes.len() <= 8);
+        let mut distinct = hashes.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), hashes.len());
     }
 
     #[test]

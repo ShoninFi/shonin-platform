@@ -10,8 +10,10 @@
 //! The holder ([`authorise`]):
 //!
 //! 1. checks the token exactly as the attestation guest does, with the
-//!    exchange's nonce in place of a blessing's, against the Google keys an
-//!    allowed checker on the canonical chain trusts, and refuses one issued
+//!    exchange's nonce in place of a blessing's: a PKI token by its
+//!    certificate chain, which must end in a root an allowed checker on the
+//!    canonical chain pins; an OIDC token against the Google keys such a
+//!    checker trusts. It refuses one issued
 //!    more than [`MAX_TOKEN_AGE`] ago (and accepts one issued up to
 //!    [`CLOCK_SKEW`] ahead of its own clock);
 //! 2. reads the canonical chain for the image's kind and the project;
@@ -46,7 +48,7 @@ use hpke::{Deserializable, Kem as _, Serializable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use shonin_attestation_core::{Binding, Input, Jwk};
+use shonin_attestation_core::{Binding, Input, Jwk, pki};
 use zeroize::Zeroizing;
 
 use crate::Error;
@@ -383,7 +385,9 @@ pub struct Attested {
     /// `keccak256` of the GCE project id, as the registry lists projects.
     pub project_id: B256,
     pub issued_at: u64,
-    /// The hash of the Google key that signed it.
+    /// What it is trusted by: the hash of the Google key that signed it (an
+    /// OIDC token), or of the root certificate its chain ends in (a PKI
+    /// token).
     pub key_hash: [u8; 32],
 }
 
@@ -399,12 +403,15 @@ fn segment(token: &str, index: usize) -> Result<Value, Error> {
 }
 
 /// Check a token as the attestation guest does, with `nonce` in place of a
-/// blessing's, against those of `google_keys` whose hash is in `trusted`.
+/// blessing's: a PKI token by its own certificate chain, whose root's hash
+/// must be in `trusted`; an OIDC token against those of `google_keys` whose
+/// hash is in `trusted`.
 ///
 /// `google_keys` is what the caller fetched from Google's JWKS; `trusted` is
 /// what the canonical chain's allowed checkers trust
-/// ([`ChainView::trusted_google_keys`]). A key Google publishes that no
-/// checker trusts signs nothing here.
+/// ([`ChainView::trusted_google_keys`]): Google keys' hashes and root
+/// certificates' hashes. A key Google publishes, or a root, that no checker
+/// trusts signs nothing here; a PKI token needs no published key at all.
 pub fn check_token(
     token: &str,
     google_keys: &[Jwk],
@@ -447,17 +454,32 @@ pub fn check_token(
         Err(other) => return Err(Error::Token(other)),
     }
 
-    // The signature has verified: the claims are Google's.
-    let kid = segment(token, 0)?
-        .get("kid")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or(Error::Malformed("token"))?;
-    let key_hash = keys
-        .iter()
-        .find(|key| key.kid == kid)
-        .map(Jwk::key_hash)
-        .ok_or(Error::UntrustedGoogleKey)?;
+    // The signature has verified: the claims are Google's, if what it is
+    // trusted by is trusted.
+    let header = segment(token, 0)?;
+    let key_hash = match header.get("x5c") {
+        // The chain passed the guest's check up to its last certificate;
+        // it counts only if an allowed checker pins that root.
+        Some(x5c) => {
+            let chain = pki::decode_x5c(x5c)
+                .and_then(|chain| pki::check_chain(&chain))
+                .map_err(Error::Token)?;
+            if !trusted.contains(&chain.root) {
+                return Err(Error::UntrustedRoot);
+            }
+            chain.root
+        }
+        None => {
+            let kid = header
+                .get("kid")
+                .and_then(Value::as_str)
+                .ok_or(Error::Malformed("token"))?;
+            keys.iter()
+                .find(|key| key.kid == kid)
+                .map(Jwk::key_hash)
+                .ok_or(Error::UntrustedGoogleKey)?
+        }
+    };
     let claims = segment(token, 1)?;
     let nonces: Vec<&str> = match claims.get("eat_nonce") {
         Some(Value::String(one)) => vec![one.as_str()],

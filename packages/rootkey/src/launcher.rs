@@ -21,8 +21,14 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Ask the launcher at `socket` for an OIDC token of our audience whose
-/// nonce is `nonce`.
+/// The kind of token every request asks for: a PKI token, whose header
+/// carries its signing key's certificate chain up to Google's Confidential
+/// Space Root CA. A blessing's proof and the root key exchange both trust it
+/// by that root, so neither depends on the keys Google rotates.
+pub const TOKEN_TYPE: &str = "PKI";
+
+/// Ask the launcher at `socket` for a PKI token of our audience whose nonce
+/// is `nonce`.
 pub async fn request_token(socket: &Path, nonce: &str) -> Result<String> {
     use http_body_util::BodyExt;
 
@@ -38,7 +44,7 @@ pub async fn request_token(socket: &Path, nonce: &str) -> Result<String> {
     }));
     let body = serde_json::json!({
         "audience": AUDIENCE,
-        "token_type": "OIDC",
+        "token_type": TOKEN_TYPE,
         "nonces": [nonce],
     })
     .to_string();
@@ -88,4 +94,43 @@ pub async fn fetch_google_keys(
         .context("reading Google's signing keys")?;
     shonin_attestation_core::Jwk::from_jwks(&text)
         .map_err(|error| anyhow::anyhow!("Google's signing keys: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn every_token_is_asked_for_as_a_pki_token_of_our_audience_and_nonce() {
+        let dir = std::env::temp_dir().join(format!("shonin-token-type-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("teeserver.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let asked: Arc<Mutex<Vec<serde_json::Value>>> = Default::default();
+        let noted = asked.clone();
+        let app = axum::Router::new().route(
+            "/v1/token",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let noted = noted.clone();
+                async move {
+                    noted.lock().unwrap().push(body);
+                    "a.b.c"
+                }
+            }),
+        );
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+
+        assert_eq!(request_token(&socket, "n1").await.unwrap(), "a.b.c");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            [serde_json::json!({"audience": AUDIENCE, "token_type": "PKI", "nonces": ["n1"]})]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
