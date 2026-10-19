@@ -249,6 +249,9 @@ pub struct Attestation {
     /// The Solana clusters served, by chain key, with who pays for a
     /// simulated `bless` there (the keeper, which relays it).
     solana: Arc<Mutex<BTreeMap<String, SolanaServed>>>,
+    /// How long a posted seal's simulations are waited for, and how many
+    /// run at once.
+    bounds: Bounds,
 }
 
 /// A Solana cluster served.
@@ -394,6 +397,187 @@ enum Simulate {
     SolanaBless(SolanaLeaf, Vec<B256>),
     /// `setRootKey` for the root's signer, on the canonical chain.
     SetRoot(RootLeaf, Vec<B256>),
+}
+
+/// The longest one simulation of a posted seal is waited for, from when
+/// it starts: a Solana `bless` on a public cluster may first have to grow
+/// the payer's lookup table, which takes several landed transactions.
+const SIMULATION_WAITED: Duration = Duration::from_secs(60);
+
+/// The longest every simulation of a posted seal is waited for in all, so
+/// the post is answered well within the prover's post timeout (five
+/// minutes), which it would otherwise take as no answer.
+const SIMULATIONS_WAITED: Duration = Duration::from_secs(120);
+
+/// The most simulations run at once, across every seal posted: each is a
+/// node's connection, and a tree on many chains mustn't open one for each
+/// at once.
+const SIMULATIONS_AT_ONCE: usize = 8;
+
+/// The longest a simulation given up on runs on, still holding its turn.
+const SIMULATION_RUNS_AT_MOST: Duration = Duration::from_secs(5 * 60);
+
+/// How long a posted seal's simulations are waited for, and how many run
+/// at once.
+#[derive(Clone)]
+struct Bounds {
+    each: Duration,
+    all: Duration,
+    at_once: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Bounds {
+            each: SIMULATION_WAITED,
+            all: SIMULATIONS_WAITED,
+            at_once: Arc::new(tokio::sync::Semaphore::new(SIMULATIONS_AT_ONCE)),
+        }
+    }
+}
+
+/// Which send an EVM simulation stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimulatedSend {
+    Bless,
+    SetRoot,
+}
+
+impl SimulatedSend {
+    fn name(self) -> &'static str {
+        match self {
+            SimulatedSend::Bless => "bless",
+            SimulatedSend::SetRoot => "setRootKey",
+        }
+    }
+}
+
+/// Why an EVM simulation did not go through.
+#[derive(Debug)]
+enum EvmMiss {
+    /// The chain is not connected.
+    NotConnected,
+    /// The node's answer: a revert, or an error of its own.
+    Failed(String),
+}
+
+/// What one simulation of a posted seal came to.
+#[derive(Debug)]
+enum Outcome {
+    Solana {
+        cluster: String,
+        vault: Pubkey,
+        result: Result<(), Refusal>,
+    },
+    Evm {
+        chain_id: u64,
+        what: SimulatedSend,
+        result: Result<(), EvmMiss>,
+    },
+}
+
+impl Outcome {
+    /// What a simulation not answered in time comes to: it could not be
+    /// asked, which the prover answers by posting the seal again later.
+    fn unanswered(each: &Simulate) -> Outcome {
+        let late = |on: &str| {
+            format!("a simulation on {on} was not answered in time; post the seal again later")
+        };
+        match each {
+            Simulate::SolanaBless(leaf, _) => Outcome::Solana {
+                cluster: leaf.cluster.clone(),
+                vault: leaf.vault,
+                result: Err(Refusal::Unavailable(late(&leaf.cluster))),
+            },
+            Simulate::Bless(leaf, _) => Outcome::Evm {
+                chain_id: leaf.chain_id,
+                what: SimulatedSend::Bless,
+                result: Err(EvmMiss::Failed(late(&format!("chain {}", leaf.chain_id)))),
+            },
+            Simulate::SetRoot(root, _) => Outcome::Evm {
+                chain_id: root.chain_id,
+                what: SimulatedSend::SetRoot,
+                result: Err(EvmMiss::Failed(late(&format!("chain {}", root.chain_id)))),
+            },
+        }
+    }
+}
+
+/// Whether a seal is kept, from what its simulations came to, in the order
+/// they were asked. Any EVM chain's `bless` that does not go through
+/// refuses it. A `setRootKey` that does not go through refuses it only when
+/// nothing is blessed with it (`blesses` false). A Solana cluster that can't
+/// be asked, or refuses, holds back only its own keys: it is asked through
+/// a far less reliable endpoint, and allows images and checkers through an
+/// admin path of its own, and the keeper simulates its keys' blessing again
+/// before it relays one. So the seal is refused over Solana only when
+/// nothing in the tree would land anywhere with it: no key blessed, and no
+/// root recorded.
+fn judge(outcomes: Vec<Outcome>, blesses: bool) -> Result<(), Refusal> {
+    let mut sealable = false;
+    let mut solana_refused = None;
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Solana { result: Ok(()), .. } => sealable = true,
+            Outcome::Solana {
+                cluster,
+                vault,
+                result: Err(refusal),
+            } => {
+                tracing::warn!(
+                    cluster,
+                    vault = %vault,
+                    why = ?refusal,
+                    "a simulated bless on this cluster did not go through; its keys wait for the keeper's own simulation or a later seal"
+                );
+                solana_refused.get_or_insert(refusal);
+            }
+            // Something in the tree lands with this seal: a key blessed, or
+            // the root recorded.
+            Outcome::Evm { result: Ok(()), .. } => sealable = true,
+            Outcome::Evm {
+                chain_id,
+                what,
+                result: Err(EvmMiss::NotConnected),
+            } => {
+                if what == SimulatedSend::SetRoot && blesses {
+                    tracing::warn!(
+                        chain_id,
+                        "the root key's chain is not connected, so recording the root from this seal can't be simulated; the seal is kept for the vault keys, and the root waits for a later one"
+                    );
+                    continue;
+                }
+                return Err(Refusal::Unavailable(format!(
+                    "chain {chain_id} is not connected"
+                )));
+            }
+            Outcome::Evm {
+                chain_id,
+                what,
+                result: Err(EvmMiss::Failed(why)),
+            } => {
+                if what == SimulatedSend::SetRoot && blesses {
+                    tracing::warn!(
+                        error = why,
+                        "recording the root key from this seal would not go through; the seal is kept for the vault keys, and the root waits for a later one"
+                    );
+                    continue;
+                }
+                let what = what.name();
+                return Err(if why.contains("revert") {
+                    Refusal::Journal(format!(
+                        "a simulated {what} reverts on chain {chain_id}: {why}"
+                    ))
+                } else {
+                    Refusal::Unavailable(why)
+                });
+            }
+        }
+    }
+    match solana_refused {
+        Some(refusal) if !sealable => Err(refusal),
+        _ => Ok(()),
+    }
 }
 
 /// Why a seal posted to the status port was not taken.
@@ -643,7 +827,20 @@ impl Attestation {
             changed: Default::default(),
             chains: Default::default(),
             solana: Default::default(),
+            bounds: Bounds::default(),
         })
+    }
+
+    /// The same, waiting for a posted seal's simulations `each` and `all`
+    /// in all, with at most `at_once` of them running at a time.
+    #[cfg(test)]
+    fn bounded(mut self, each: Duration, all: Duration, at_once: usize) -> Attestation {
+        self.bounds = Bounds {
+            each,
+            all,
+            at_once: Arc::new(tokio::sync::Semaphore::new(at_once)),
+        };
+        self
     }
 
     /// The instance's Solana key: the token's Solana signer.
@@ -1395,119 +1592,135 @@ impl Attestation {
     /// refused for it: the vault keys trade depositors' money, and their
     /// blessing never waits on the root. A seal kept although `setRootKey`
     /// would revert leaves the root's leaf wanted, for a later seal.
+    ///
+    /// The simulations run at once (see [`Attestation::simulate_all`]), so
+    /// the answer comes within [`SIMULATIONS_WAITED`], under the prover's
+    /// post timeout; one not answered in time counts as one that could not
+    /// be asked, never as one that went through.
     pub async fn accept(&self, post: SealPost) -> Result<(), Refusal> {
         let (sealed, simulate) = self.check(&post)?;
         let blesses = simulate
             .iter()
             .any(|each| matches!(each, Simulate::Bless(..) | Simulate::SolanaBless(..)));
-        // A Solana cluster is asked through a far less reliable endpoint, and
-        // allows images and checkers through an admin path of its own: one
-        // that can't be asked, or refuses, holds back only its own keys,
-        // whose blessing the keeper simulates again before it relays one. The
-        // seal is refused over Solana only when nothing in the tree would
-        // land anywhere with it: no key blessed, and no root recorded.
-        let mut sealable = false;
-        let mut solana_refused = None;
-        for each in simulate {
-            let chain_id = match &each {
-                Simulate::Bless(leaf, _) => leaf.chain_id,
-                Simulate::SetRoot(root, _) => root.chain_id,
-                Simulate::SolanaBless(leaf, proof) => {
-                    match self.simulate_solana(&sealed, leaf, proof).await {
-                        Ok(()) => sealable = true,
-                        Err(refusal) => {
-                            tracing::warn!(
-                                cluster = leaf.cluster,
-                                vault = %leaf.vault,
-                                why = ?refusal,
-                                "a simulated bless on this cluster did not go through; its keys wait for the keeper's own simulation or a later seal"
-                            );
-                            solana_refused.get_or_insert(refusal);
-                        }
-                    }
-                    continue;
-                }
+        let outcomes = self.simulate_all(&sealed, simulate).await;
+        judge(outcomes, blesses)?;
+        self.keep(sealed)
+    }
+
+    /// Run every simulation at once, no more than [`Bounds::at_once`] of
+    /// them (across every seal posted) at a time, and say what each came
+    /// to, in the order given. Each is waited for [`Bounds::each`] from
+    /// when it starts, and all of them [`Bounds::all`] in all; one not
+    /// answered by then is [`Outcome::unanswered`].
+    ///
+    /// A simulation given up on is left to finish on its own, still holding
+    /// its turn: on Solana it may be growing the payer's lookup table, which
+    /// the prover's next post then finds ready, rather than starting over.
+    /// It runs no longer than [`SIMULATION_RUNS_AT_MOST`].
+    async fn simulate_all(&self, sealed: &Sealed, simulate: Vec<Simulate>) -> Vec<Outcome> {
+        let bounds = self.bounds.clone();
+        let deadline = tokio::time::Instant::now() + bounds.all;
+        let waits = simulate.into_iter().map(|each| {
+            let this = self.clone();
+            let sealed = sealed.clone();
+            let bounds = bounds.clone();
+            let unanswered = Outcome::unanswered(&each);
+            let answered = async move {
+                let turn = bounds.at_once.clone().acquire_owned().await.ok()?;
+                let running = tokio::spawn(async move {
+                    let _turn = turn;
+                    tokio::time::timeout(SIMULATION_RUNS_AT_MOST, this.simulate_one(&sealed, each))
+                        .await
+                        .ok()
+                });
+                tokio::time::timeout(bounds.each, running)
+                    .await
+                    .ok()?
+                    .ok()?
             };
-            let chain = self
-                .chains
+            async move {
+                tokio::time::timeout_at(deadline, answered)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(unanswered)
+            }
+        });
+        futures::future::join_all(waits).await
+    }
+
+    /// One simulation, as [`Attestation::accept`] asks it.
+    async fn simulate_one(&self, sealed: &Sealed, each: Simulate) -> Outcome {
+        let chain = |chain_id: u64| {
+            self.chains
                 .lock()
                 .ok()
-                .and_then(|chains| chains.get(&chain_id).cloned());
-            let Some((client, deployments)) = chain else {
-                if matches!(each, Simulate::SetRoot(..)) && blesses {
-                    tracing::warn!(
-                        chain_id,
-                        "the root key's chain is not connected, so recording the root from this seal can't be simulated; the seal is kept for the vault keys, and the root waits for a later one"
-                    );
-                    continue;
+                .and_then(|chains| chains.get(&chain_id).cloned())
+        };
+        let not_connected = |chain_id: u64, what: SimulatedSend| Outcome::Evm {
+            chain_id,
+            what,
+            result: Err(EvmMiss::NotConnected),
+        };
+        let failed = |error: anyhow::Error| EvmMiss::Failed(format!("{error:#}"));
+        match each {
+            Simulate::SolanaBless(leaf, proof) => Outcome::Solana {
+                result: self.simulate_solana(sealed, &leaf, &proof).await,
+                cluster: leaf.cluster,
+                vault: leaf.vault,
+            },
+            Simulate::Bless(leaf, proof) => {
+                let what = SimulatedSend::Bless;
+                let Some((client, deployments)) = chain(leaf.chain_id) else {
+                    return not_connected(leaf.chain_id, what);
+                };
+                let result = client
+                    .read(
+                        deployments.attestation,
+                        IAttestationRegistry::blessCall {
+                            seal: sealed.seal.clone(),
+                            journal: sealed.journal.clone(),
+                            vaultChain: U256::from(leaf.vault_chain),
+                            vault: leaf.vault,
+                            strategyHash: leaf.strategy_hash,
+                            key: leaf.key,
+                            merkleProof: proof,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(failed);
+                Outcome::Evm {
+                    chain_id: leaf.chain_id,
+                    what,
+                    result,
                 }
-                return Err(Refusal::Unavailable(format!(
-                    "chain {chain_id} is not connected"
-                )));
-            };
-            let (what, simulated) = match each {
-                Simulate::Bless(leaf, proof) => (
-                    "bless",
-                    client
-                        .read(
-                            deployments.attestation,
-                            IAttestationRegistry::blessCall {
-                                seal: sealed.seal.clone(),
-                                journal: sealed.journal.clone(),
-                                vaultChain: U256::from(leaf.vault_chain),
-                                vault: leaf.vault,
-                                strategyHash: leaf.strategy_hash,
-                                key: leaf.key,
-                                merkleProof: proof,
-                            },
-                        )
-                        .await
-                        .map(|_| ()),
-                ),
-                Simulate::SolanaBless(..) => continue,
-                Simulate::SetRoot(root, proof) => (
-                    "setRootKey",
-                    client
-                        .read(
-                            deployments.attestation,
-                            IAttestationRegistry::setRootKeyCall {
-                                seal: sealed.seal.clone(),
-                                journal: sealed.journal.clone(),
-                                rootSigner: root.signer,
-                                merkleProof: proof,
-                            },
-                        )
-                        .await
-                        .map(|_| ()),
-                ),
-            };
-            if let Err(error) = simulated {
-                let why = format!("{error:#}");
-                if what == "setRootKey" && blesses {
-                    tracing::warn!(
-                        error = why,
-                        "recording the root key from this seal would not go through; the seal is kept for the vault keys, and the root waits for a later one"
-                    );
-                    continue;
-                }
-                return Err(if why.contains("revert") {
-                    Refusal::Journal(format!(
-                        "a simulated {what} reverts on chain {chain_id}: {why}"
-                    ))
-                } else {
-                    Refusal::Unavailable(why)
-                });
             }
-            // Something in the tree lands with this seal: a key blessed, or
-            // the root recorded.
-            sealable = true;
+            Simulate::SetRoot(root, proof) => {
+                let what = SimulatedSend::SetRoot;
+                let Some((client, deployments)) = chain(root.chain_id) else {
+                    return not_connected(root.chain_id, what);
+                };
+                let result = client
+                    .read(
+                        deployments.attestation,
+                        IAttestationRegistry::setRootKeyCall {
+                            seal: sealed.seal.clone(),
+                            journal: sealed.journal.clone(),
+                            rootSigner: root.signer,
+                            merkleProof: proof,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(failed);
+                Outcome::Evm {
+                    chain_id: root.chain_id,
+                    what,
+                    result,
+                }
+            }
         }
-        if let Some(refusal) = solana_refused
-            && !sealable
-        {
-            return Err(refusal);
-        }
-        self.keep(sealed)
     }
 
     /// Simulate a `bless` of one Solana leaf with the seal, as the keeper
@@ -2428,6 +2641,26 @@ mod tests {
         chain_id: u64,
         reverts: impl Fn(&str) -> bool + Clone + Send + Sync + 'static,
     ) -> (Client, Arc<Mutex<usize>>) {
+        bless_node_with(chain_id, reverts, Duration::ZERO, Default::default()).await
+    }
+
+    /// How many simulations nodes are answering at once, and the most they
+    /// ever were.
+    #[derive(Default)]
+    struct InFlight {
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    /// The same, answering each simulation only after `delay`, and counting
+    /// in `in_flight` how many it is answering at once.
+    async fn bless_node_with(
+        chain_id: u64,
+        reverts: impl Fn(&str) -> bool + Clone + Send + Sync + 'static,
+        delay: Duration,
+        in_flight: Arc<InFlight>,
+    ) -> (Client, Arc<Mutex<usize>>) {
+        use std::sync::atomic::Ordering;
         let asked = Arc::new(Mutex::new(0usize));
         let noted = asked.clone();
         let app = axum::Router::new().route(
@@ -2435,7 +2668,16 @@ mod tests {
             axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
                 let noted = noted.clone();
                 let reverts = reverts.clone();
+                let in_flight = in_flight.clone();
                 async move {
+                    let simulation = request["method"] == "eth_call"
+                        && crate::stand_in::code_run(&request).is_none();
+                    if simulation {
+                        let now = in_flight.now.fetch_add(1, Ordering::SeqCst) + 1;
+                        in_flight.most.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        in_flight.now.fetch_sub(1, Ordering::SeqCst);
+                    }
                     let id = request["id"].clone();
                     let method = request["method"].as_str().unwrap_or_default();
                     let answer = |result: serde_json::Value| {
@@ -2529,6 +2771,164 @@ mod tests {
         attestation.serve_chain(second, crate::stand_in::deployments());
         attestation.accept(post(nonce, &journal)).await.unwrap();
         assert!(attestation.status().seal.is_some());
+    }
+
+    /// An instance holding one key on each of `chains`, each served by a
+    /// node that answers a simulation after `delay` (reverting on
+    /// `reverting`), and a development seal for its tree.
+    async fn on_slow_chains(
+        attestation: &Attestation,
+        chains: std::ops::Range<u64>,
+        delay: impl Fn(u64) -> Duration,
+        reverting: Option<u64>,
+    ) -> (SealPost, Arc<InFlight>) {
+        let in_flight = Arc::new(InFlight::default());
+        for chain_id in chains {
+            let byte = chain_id as u8;
+            attestation.put(
+                chain_id,
+                Address::repeat_byte(byte),
+                B256::repeat_byte(0x5b),
+                Address::repeat_byte(byte.wrapping_add(0x80)),
+            );
+            let reverts = reverting == Some(chain_id);
+            let (node, _) = bless_node_with(
+                chain_id,
+                move |_| reverts,
+                delay(chain_id),
+                in_flight.clone(),
+            )
+            .await;
+            attestation.serve_chain(node, crate::stand_in::deployments());
+        }
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(attestation, NOW)
+        };
+        (post(attestation.binding().nonce(), &journal), in_flight)
+    }
+
+    /// A tree on many chains whose nodes are each slow to answer is
+    /// simulated on all of them at once, never more at a time than the
+    /// bound, and the seal every one of them takes is kept well within the
+    /// time one after another would take.
+    #[tokio::test]
+    async fn many_slow_chains_are_simulated_at_once_and_a_seal_they_all_take_is_kept() {
+        let attestation = Attestation::new(Mode::Development).unwrap().bounded(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            4,
+        );
+        let (post, in_flight) = on_slow_chains(
+            &attestation,
+            1_000..1_012,
+            |_| Duration::from_millis(500),
+            None,
+        )
+        .await;
+
+        let started = Instant::now();
+        assert_eq!(attestation.accept(post).await, Ok(()));
+        let took = started.elapsed();
+        assert!(attestation.status().seal.is_some());
+        // Twelve half-second answers one after another take six seconds;
+        // four at a time, a second and a half.
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+        let most = in_flight.most.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(most > 1, "the chains were asked one after another");
+        assert!(most <= 4, "{most} simulations ran at once");
+    }
+
+    /// However many chains' nodes never answer in time, the post is
+    /// answered within the overall bound, under the prover's post timeout,
+    /// and refused as a chain that could not be asked: the prover posts it
+    /// again later.
+    #[tokio::test]
+    async fn a_seal_whose_simulations_outlast_the_bound_is_refused_within_it() {
+        let attestation = Attestation::new(Mode::Development).unwrap().bounded(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            4,
+        );
+        let (post, _) = on_slow_chains(
+            &attestation,
+            1_000..1_012,
+            |_| Duration::from_secs(60),
+            None,
+        )
+        .await;
+
+        let started = Instant::now();
+        let answered = tokio::time::timeout(Duration::from_secs(10), attestation.accept(post))
+            .await
+            .expect("the post was not answered within the bound");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(answered, Err(Refusal::Unavailable(_))),
+            "{answered:?}"
+        );
+        assert!(attestation.status().seal.is_none());
+        assert!(SIMULATIONS_WAITED < Duration::from_secs(5 * 60));
+    }
+
+    /// One chain's simulation not answered in time refuses the seal, as a
+    /// chain that could not be asked does, however many others take it:
+    /// never kept on the strength of the others.
+    #[tokio::test]
+    async fn a_simulation_that_times_out_refuses_the_seal() {
+        let attestation = Attestation::new(Mode::Development).unwrap().bounded(
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            4,
+        );
+        let (post, _) = on_slow_chains(
+            &attestation,
+            1_000..1_006,
+            |chain_id| {
+                if chain_id == 1_003 {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        )
+        .await;
+
+        let answered = tokio::time::timeout(Duration::from_secs(10), attestation.accept(post))
+            .await
+            .expect("the post was not answered within the bound");
+        assert!(
+            matches!(&answered, Err(Refusal::Unavailable(why)) if why.contains("1003")),
+            "{answered:?}"
+        );
+        assert!(attestation.status().seal.is_none());
+    }
+
+    /// One chain whose checker refuses the seal refuses it, however many
+    /// others, simulated at the same time, take it.
+    #[tokio::test]
+    async fn a_simulation_that_fails_among_many_that_pass_refuses_the_seal() {
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        let (post, _) = on_slow_chains(
+            &attestation,
+            1_000..1_008,
+            |_| Duration::from_millis(50),
+            Some(1_005),
+        )
+        .await;
+
+        let answered = attestation.accept(post).await;
+        assert!(
+            matches!(&answered, Err(Refusal::Journal(why)) if why.contains("1005")),
+            "{answered:?}"
+        );
+        assert!(attestation.status().seal.is_none());
     }
 
     /// The root's signer is the tree's last leaf, by the registry's root
