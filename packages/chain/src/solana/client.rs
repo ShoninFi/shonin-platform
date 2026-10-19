@@ -139,7 +139,7 @@ impl std::fmt::Display for MayStillLand {
 }
 
 /// The seconds the cluster's clock sysvar holds.
-fn clock_seconds(clock: Option<&rpc::Account>) -> Result<u64> {
+pub(crate) fn clock_seconds(clock: Option<&rpc::Account>) -> Result<u64> {
     let clock = clock.ok_or_else(|| anyhow!("the cluster has no clock"))?;
     let bytes: [u8; 8] = clock
         .data
@@ -266,6 +266,26 @@ impl SolanaClient {
             signing: Arc::new(signing),
             tables: Arc::default(),
         })
+    }
+
+    /// The same client, its reads at the confirmed commitment answered from
+    /// `served` where it holds them (see [`super::served`]).
+    pub fn with_served(&self, served: Arc<super::served::Served>) -> Self {
+        let mut client = self.clone();
+        client.rpc = self.rpc.with_served(served);
+        client
+    }
+
+    /// The same client, every read made of the node.
+    pub fn live(&self) -> Self {
+        let mut client = self.clone();
+        client.rpc = self.rpc.live();
+        client
+    }
+
+    /// The observation this client's reads are answered from, if any.
+    pub fn served(&self) -> Option<&Arc<super::served::Served>> {
+        self.rpc.served()
     }
 
     /// The platform's role keys, where this client signs as every role.
@@ -855,7 +875,10 @@ impl SolanaClient {
             return Ok((Vec::new(), Vec::new()));
         }
         let addresses: Vec<Pubkey> = known.iter().map(|table| table.address).collect();
-        let mut accounts = self.rpc.accounts(&addresses).await?;
+        // A table is read of the node itself, never from an observation:
+        // what was just made or grown must be seen.
+        let rpc = self.rpc.live();
+        let mut accounts = rpc.accounts(&addresses).await?;
         for _ in 1..TABLE_READS {
             let missing: Vec<usize> = (0..accounts.len())
                 .filter(|at| accounts[*at].is_none())
@@ -865,7 +888,7 @@ impl SolanaClient {
             }
             tokio::time::sleep(POLL).await;
             let again: Vec<Pubkey> = missing.iter().map(|at| addresses[*at]).collect();
-            for (at, account) in missing.into_iter().zip(self.rpc.accounts(&again).await?) {
+            for (at, account) in missing.into_iter().zip(rpc.accounts(&again).await?) {
                 accounts[at] = account;
             }
         }
@@ -925,7 +948,7 @@ impl SolanaClient {
             // A node behind the cluster answers nothing for a table that
             // is there: it is asked again until the wait is over.
             if now > slot
-                && let Some(account) = self.rpc.account(&table.address).await?
+                && let Some(account) = self.rpc.live().account(&table.address).await?
             {
                 let read = Table::read(table.address, &account, payer, now)?;
                 read.agrees_with(&table.addresses)?;

@@ -488,6 +488,11 @@ fn landed(sent: Result<chain::solana::Landed>) -> Sent {
 /// reviewer) on one cluster and keep its blessed keys in lamports, for as
 /// long as the keeper runs. A builder or a reviewer is often off: that is
 /// said at debug only.
+///
+/// Its reads of the cluster are answered from the vault loop's latest look
+/// while that is fresh and nothing has been sent since (see
+/// [`crate::solana::Looks`]); otherwise they are the node's, and noted, so
+/// the next look holds them.
 pub(crate) async fn keep_keys(
     client: SolanaClient,
     platform: Platform,
@@ -495,6 +500,7 @@ pub(crate) async fn keep_keys(
     keeper: Keypair,
     executor: String,
     service: bool,
+    looks: crate::solana::Looks,
 ) {
     let http = reqwest::Client::new();
     let mut memory = Memory::default();
@@ -504,6 +510,7 @@ pub(crate) async fn keep_keys(
         if memory.due(at) {
             let looked = match published(&http, &executor).await {
                 Ok(published) => {
+                    let client = looks.reads(&client);
                     let registry = OnCluster {
                         client: &client,
                         platform: &platform,

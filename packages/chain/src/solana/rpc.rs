@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::Pubkey;
+use super::served::Served;
 
 /// How long one call may take before it is given up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +46,9 @@ pub struct Rpc {
     /// When the node last asked to be asked less often: every call made
     /// through this connection (its clones too) waits until then.
     pace: Arc<Mutex<Pace>>,
+    /// The observation reads are answered from, where this clone was given
+    /// one (see [`super::served`]).
+    served: Option<Arc<Served>>,
 }
 
 /// The pause the node asked for, shared by every call to it.
@@ -137,12 +141,22 @@ const MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
 /// Whether `error` is the node saying it hasn't reached the slot a read was
 /// pinned to: by the code a validator's RPC gives it, or by what it says
 /// (other nodes give it another code).
-fn behind(error: &anyhow::Error) -> bool {
+pub(crate) fn behind(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RpcError>().is_some_and(|rpc| {
         let message = rpc.message.to_ascii_lowercase();
         rpc.code == MIN_CONTEXT_SLOT_NOT_REACHED
             || message.contains("mincontextslot")
             || message.contains("minimum context slot")
+    })
+}
+
+/// Whether a `sendTransaction` was turned down by the node's own run of it
+/// (its preflight): nothing went out.
+fn preflight_refused(sent: &Result<String>) -> bool {
+    sent.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<RpcError>()
+            .is_some_and(|rpc| !rpc.data["err"].is_null())
     })
 }
 
@@ -257,7 +271,28 @@ impl Rpc {
             next: Arc::new(AtomicU64::new(1)),
             counted_cluster: "connecting",
             pace: Arc::new(Mutex::new(Pace::default())),
+            served: None,
         })
+    }
+
+    /// The same connection, its reads at the confirmed commitment answered
+    /// from `served` where it holds them (see [`super::served`]).
+    pub fn with_served(&self, served: Arc<Served>) -> Self {
+        let mut rpc = self.clone();
+        rpc.served = Some(served);
+        rpc
+    }
+
+    /// The same connection, every read made of the node.
+    pub fn live(&self) -> Self {
+        let mut rpc = self.clone();
+        rpc.served = None;
+        rpc
+    }
+
+    /// The observation this connection's reads are answered from, if any.
+    pub fn served(&self) -> Option<&Arc<Served>> {
+        self.served.as_ref()
     }
 
     pub(crate) fn counted_on(mut self, cluster: &str) -> Self {
@@ -397,6 +432,14 @@ impl Rpc {
         struct Answer {
             value: Option<RawAccount>,
         }
+        if commitment == COMMITMENT
+            && let Some(served) = &self.served
+        {
+            if let Some(answer) = served.account(address) {
+                return Ok(answer);
+            }
+            served.learn(&[*address]);
+        }
         let answer: Answer = self
             .call(
                 "getAccountInfo",
@@ -421,6 +464,14 @@ impl Rpc {
         #[derive(Deserialize)]
         struct Answer {
             value: Vec<Option<RawAccount>>,
+        }
+        if commitment == COMMITMENT
+            && let Some(served) = &self.served
+        {
+            if let Some(answer) = served.accounts(addresses) {
+                return Ok(answer);
+            }
+            served.learn(addresses);
         }
         let mut out = Vec::with_capacity(addresses.len());
         for chunk in addresses.chunks(100) {
@@ -551,6 +602,13 @@ impl Rpc {
             pubkey: String,
             account: RawAccount,
         }
+        if let Some(found) = self
+            .served
+            .as_ref()
+            .and_then(|served| served.program_accounts(program, filters))
+        {
+            return Ok(found);
+        }
         let filters = memcmp(filters);
         let answer: Vec<Keyed> = self
             .call(
@@ -572,6 +630,12 @@ impl Rpc {
         #[derive(Deserialize)]
         struct Answer {
             value: u64,
+        }
+        if let Some(served) = &self.served {
+            if let Some(answer) = served.account(address) {
+                return Ok(answer.map_or(0, |account| account.lamports));
+            }
+            served.learn(&[*address]);
         }
         let answer: Answer = self
             .call(
@@ -612,19 +676,28 @@ impl Rpc {
     /// Hand a signed transaction to the node, after it has simulated it: a
     /// transaction that would fail is refused here, with its logs.
     pub async fn send(&self, wire: &[u8]) -> Result<String> {
-        self.call(
-            "sendTransaction",
-            json!([
-                base64::engine::general_purpose::STANDARD.encode(wire),
-                {
-                    "encoding": "base64",
-                    "skipPreflight": false,
-                    "preflightCommitment": COMMITMENT,
-                    "maxRetries": 0,
-                }
-            ]),
-        )
-        .await
+        let sent = self
+            .call(
+                "sendTransaction",
+                json!([
+                    base64::engine::general_purpose::STANDARD.encode(wire),
+                    {
+                        "encoding": "base64",
+                        "skipPreflight": false,
+                        "preflightCommitment": COMMITMENT,
+                        "maxRetries": 0,
+                    }
+                ]),
+            )
+            .await;
+        // Anything but the node's preflight turning it down may have gone
+        // out: what it changes is read of the node from now on.
+        if let Some(served) = &self.served
+            && !preflight_refused(&sent)
+        {
+            served.went_out();
+        }
+        sent
     }
 
     pub async fn statuses(&self, signatures: &[String]) -> Result<Vec<Option<Status>>> {

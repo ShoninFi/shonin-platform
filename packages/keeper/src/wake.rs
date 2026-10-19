@@ -47,7 +47,7 @@ pub struct Dues {
 }
 
 impl Dues {
-    fn at(&mut self, time: u64, why: &'static str) {
+    pub(crate) fn at(&mut self, time: u64, why: &'static str) {
         if time > self.head {
             self.chain.push((time, why));
         }

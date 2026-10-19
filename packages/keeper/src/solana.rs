@@ -44,15 +44,18 @@
 //! and went through.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chain::SolanaServed;
+use chain::follow::clock::ChainClock;
+use chain::solana::observe::{Looked, Observation, Observer};
 use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::anchor_lang::AccountDeserialize;
 use chain::solana::programs::{station, vault as vp};
 use chain::solana::rate_limited;
-use chain::solana::scan::VaultScan;
+use chain::solana::served::{Learned, Served as ServedReads};
 use chain::solana::upkeep::{SignedUsage, queued_request};
 use chain::solana::{
     Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
@@ -60,10 +63,8 @@ use chain::solana::{
 use serde::Deserialize;
 use vp::state::{Claim, ClaimState, Holder, Request, Vault, VaultState};
 
-use crate::{DAY, MINUTE, Said, chain_kept, waited};
+use crate::{DAY, LAST_ORDERS, MINUTE, Said, chain_kept, own_clock_hold, waited, wake};
 
-/// How long the keeper waits between one round of a cluster and the next.
-const ROUND_PAUSE: Duration = Duration::from_secs(2);
 /// The most records closed in one transaction.
 const CLOSES_AT_ONCE: usize = 8;
 /// The least an unwind must bring home to be paid for: a cent.
@@ -82,9 +83,29 @@ const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
 /// How long one ask of the executor may take, and how long a `close` waits
 /// for an answer.
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most vaults whose rounds are made at once: enough that a cluster's
+/// vaults due in one slot are all in the first of them, few enough that the
+/// reads made of the node after a send don't all reach it in one burst.
+const MOST_ROUNDS_AT_ONCE: usize = 16;
+/// How often a due duty that waits is said, for each vault, duty and
+/// reason.
+const WAIT_SAID_EVERY: Duration = Duration::from_secs(5 * 60);
 
-/// Keep one Solana vault chain, round after round, for good, with the
-/// cluster's checked RPC settings.
+/// Keep one Solana vault chain for good, with the cluster's checked RPC
+/// settings.
+///
+/// Each look reads every account the keeper decides from in one call (see
+/// [`chain::solana::observe`]) and makes every vault's round on it, its
+/// reads answered from that look (see [`chain::solana::served`]); between
+/// looks the keeper reads nothing of the cluster, and looks again when a
+/// duty can next act (see [`dues_of`]), at once when the executor answers an
+/// ask, and a moment after a send of its own. A look whose clock isn't
+/// bounded by the wall clock (a local cluster moved through time, one too
+/// few looks yet to tell) makes the round reading the node itself, as the
+/// keeper always has, and the next look is at the active pace
+/// (`solana_active_round_ms`); so does a look whose node didn't answer the
+/// clock. A look the node answered as of a slot older than one already seen
+/// is not acted on at all: the next is at the active pace.
 pub async fn keep_chain(
     served: SolanaServed,
     policy: chain::rpc_policy::RpcPolicy,
@@ -102,6 +123,20 @@ pub async fn keep_chain(
     };
     tracing::info!(chain = %served.key, keeper = %keeper.pubkey(), "the keeper is up");
     chain_kept(chain, |kept| kept.connected = Some(Instant::now()));
+    let active = Duration::from_millis(policy.solana_active_round_ms);
+    let notice = Duration::from_millis(policy.solana_notice_ms);
+    // A read stays in the looks for as long as spans the key loops' looks
+    // and a few notice bounds.
+    let keep_reads = Duration::from_millis(
+        policy
+            .key_look_ms
+            .saturating_mul(2)
+            .max(policy.solana_notice_ms.saturating_mul(3)),
+    );
+    let looks = Looks {
+        fresh: notice.max(Duration::from_millis(policy.key_look_ms)),
+        ..Looks::default()
+    };
     // The executor's keys on this cluster: blessings relayed, lamports
     // given once the registry vouches for a key.
     let keys = tokio::spawn(crate::solana_keys::keep_keys(
@@ -111,6 +146,7 @@ pub async fn keep_chain(
         keeper.insecure_clone(),
         executor.clone(),
         false,
+        looks.clone(),
     ));
     let _keys = Aborting(keys);
     // The builder's and the reviewer's Solana keys, each on its own cadence.
@@ -124,6 +160,7 @@ pub async fn keep_chain(
                 keeper.insecure_clone(),
                 service,
                 true,
+                looks.clone(),
             )))
         })
         .collect();
@@ -134,28 +171,95 @@ pub async fn keep_chain(
         executor,
         rent_poll_rounds: policy.solana_rent_poll_rounds,
     };
+    let answered = answers_for(&served.client.cluster);
     let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
-    let mut scan = VaultScan::for_cluster(&served.client.cluster);
+    let mut observer = Observer::new(Duration::from_millis(policy.solana_rescan_ms));
+    let mut clock = ChainClock::new(
+        policy.head_lag_max_ms,
+        policy.head_ahead_max_ms,
+        policy.clock_settle_observations,
+    );
     let mut said = Said::default();
     let mut slowed = 0u32;
+    let mut path_on_wakes: Option<bool> = None;
+    let mut earlier = Earlier::default();
+    let counted = format!("solana:{}", served.client.cluster);
+    let mut requests_before = requests_so_far(&counted);
     loop {
         let started = Instant::now();
-        let done = keeping.round(&mut scan, &mut memory).await;
+        let plan = looks.learned.plan(started, keep_reads);
+        let looked = observer.look(&served.client, &plan).await;
         let now = Instant::now();
-        match &done {
-            // A round cut short by a node that limits the rate failed at
+        let observation = match looked {
+            // A look cut short by a node that limits the rate failed at
             // nothing: it is not counted, and the next waits longer, the
             // longer the node keeps asking.
-            Err(error) if rate_limited(error) => {
+            Err(error) if rate_limited(&error) => {
                 slowed = slowed.saturating_add(1);
                 let pause = slowed_pause(slowed);
-                tracing::debug!(chain = %served.key, seconds = pause.as_secs(), error = format!("{error:#}"), "the node limits the rate; the next round waits");
+                waits_on_the_cluster(&memory, "the node limits the rate", &format!("{error:#}"));
+                tracing::debug!(chain = %served.key, seconds = pause.as_secs(), error = format!("{error:#}"), "the node limits the rate; the next look waits");
                 tokio::time::sleep(pause).await;
                 continue;
             }
-            _ => slowed = 0,
+            Err(error) => {
+                slowed = 0;
+                chain_kept(chain, |kept| kept.failing += 1);
+                if let Some(times) = said.due(now) {
+                    tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the round did not finish");
+                }
+                waits_on_the_cluster(
+                    &memory,
+                    "the cluster could not be read",
+                    &format!("{error:#}"),
+                );
+                sleep_or_answer(now + active, &answered).await;
+                continue;
+            }
+            Ok(Looked::Lagging { answered: at, seen }) => {
+                slowed = 0;
+                // Nothing the node answered is taken: a decision on an older
+                // slot than one already seen could undo what was seen.
+                chain_kept(chain, |kept| kept.failing += 1);
+                let why = match at {
+                    Some(at) => format!("the node answered as of slot {at}, behind slot {seen}"),
+                    None => format!("the node has not reached slot {seen}"),
+                };
+                if let Some(times) = said.due(now) {
+                    tracing::warn!(chain = %served.key, times, why, "the round did not finish: the node lags");
+                }
+                waits_on_the_cluster(&memory, "the node lags", &why);
+                sleep_or_answer(now + active, &answered).await;
+                continue;
+            }
+            Ok(Looked::Observed(observation)) => {
+                slowed = 0;
+                observation
+            }
+        };
+        earlier.note(&served.key, &observation.factory);
+        let mut active_because = None;
+        match observation.now {
+            Some(time) => clock.note(time, observation.wall_ms),
+            None => active_because = Some("the node did not answer the clock".to_string()),
         }
-        match done {
+        if active_because.is_none()
+            && let Err(unbounded) = clock.state()
+        {
+            active_because = Some(format!("the cluster's clock is not bounded: {unbounded:?}"));
+        }
+        let reads = match &active_because {
+            None => {
+                let served = Arc::new(observation.served(looks.learned.clone()));
+                looks.latest(&served);
+                served
+            }
+            Some(_) => Arc::new(ServedReads::learning(looks.learned.clone())),
+        };
+        let wake = keeping.reading(&served.client.with_served(reads.clone()));
+        let done = wake.round(&observation, &mut memory).await;
+        let now = Instant::now();
+        match &done {
             Ok(()) => {
                 chain_kept(chain, |kept| {
                     kept.finished = Some(now);
@@ -173,8 +277,190 @@ pub async fn keep_chain(
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        let (answered_here, asked) = reads.counts();
+        let requests_now = requests_so_far(&counted);
+        let requests: BTreeMap<&str, u64> = requests_now
+            .iter()
+            .map(|(method, count)| {
+                (
+                    *method,
+                    count - requests_before.get(method).copied().unwrap_or(0),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        requests_before = requests_now;
+        let next = match (&active_because, done.is_ok()) {
+            (Some(_), _) => wake::Next {
+                at: now + active,
+                why: "the active path",
+            },
+            (None, false) => wake::Next {
+                at: now + active,
+                why: "a round that did not finish",
+            },
+            // A look that sent anything is followed by another at once (a
+            // second after the last began, at most): what follows a send (a
+            // settle, a claim's next part, a valuation whose window opened
+            // meanwhile) is judged on the cluster as it is now.
+            (None, true) if reads.sends() > 0 => wake::Next {
+                at: now.max(started + active.min(Duration::from_secs(1))),
+                why: "a send of the keeper's own",
+            },
+            (None, true) => {
+                let head = observation.now.unwrap_or(0);
+                let mut dues = wake::Dues {
+                    head,
+                    ..wake::Dues::default()
+                };
+                for (address, vault) in &observation.vaults {
+                    if let Some(remembered) = memory.get(address) {
+                        let claims: Vec<&Claim> = observation
+                            .claims
+                            .iter()
+                            .filter(|(of, _, _)| of == address)
+                            .map(|(_, _, claim)| claim)
+                            .collect();
+                        dues_of(
+                            vault,
+                            &claims,
+                            observation.holders(address).as_deref(),
+                            remembered,
+                            &mut dues,
+                        );
+                    }
+                }
+                wake::next(&dues, 1, active, notice, started, now, |time| {
+                    clock.to_wall_ms(time).map(crate::at_wall_ms)
+                })
+            }
+        };
+        match &active_because {
+            Some(because) => {
+                tracing::debug!(chain = %served.key, because, slot = observation.slot, requests = ?requests, "read the cluster itself this round");
+            }
+            None => tracing::debug!(
+                chain = %served.key,
+                slot = observation.slot,
+                time = observation.now,
+                accounts = observation.len(),
+                calls = observation.calls,
+                listed = observation.listed,
+                answered = answered_here,
+                asked,
+                sends = reads.sends(),
+                requests = ?requests,
+                next = ?next.at.saturating_duration_since(now),
+                why = next.why,
+                "looked at the cluster"
+            ),
+        }
+        // A change of path is said at info: an operator sees a cluster read
+        // every round, and why.
+        let on_wakes = active_because.is_none();
+        if path_on_wakes != Some(on_wakes) {
+            match &active_because {
+                None => tracing::info!(chain = %served.key, "the cluster is read at its wakes"),
+                Some(because) => {
+                    tracing::info!(chain = %served.key, because, "the cluster is read every round")
+                }
+            }
+            path_on_wakes = Some(on_wakes);
+        }
+        sleep_or_answer(next.at, &answered).await;
     }
+}
+
+/// How many requests this process has made of the cluster counted as
+/// `chain`, by method, since it started (every loop's, the key loops'
+/// included).
+fn requests_so_far(chain: &str) -> BTreeMap<&'static str, u64> {
+    chain::rpc_counts::snapshot()
+        .counters
+        .into_iter()
+        .filter(|row| row.chain == chain)
+        .map(|row| (row.method, row.requests))
+        .collect()
+}
+
+/// Sleep until `at`, or until the executor answers an ask on this cluster.
+async fn sleep_or_answer(at: Instant, answered: &tokio::sync::Notify) {
+    tokio::select! {
+        () = tokio::time::sleep_until(at.into()) => {}
+        () = answered.notified() => {}
+    }
+}
+
+/// Every look's reads, shared with the key loops: the latest look, taken as
+/// the cluster's for `fresh` after it until anything is sent, and what was
+/// read of the node, for the next look to hold.
+#[derive(Clone, Default)]
+pub(crate) struct Looks {
+    latest: Arc<std::sync::Mutex<Option<Arc<ServedReads>>>>,
+    pub learned: Learned,
+    pub fresh: Duration,
+}
+
+impl Looks {
+    fn latest(&self, served: &Arc<ServedReads>) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(served.clone());
+        }
+    }
+
+    /// `client`, its reads answered from the latest look while it is fresh
+    /// and nothing has been sent since; otherwise every read the node's,
+    /// each noted for the next look.
+    pub(crate) fn reads(&self, client: &SolanaClient) -> SolanaClient {
+        let latest = self.latest.lock().ok().and_then(|latest| latest.clone());
+        match latest {
+            Some(served) if served.serving() && served.taken.elapsed() <= self.fresh => {
+                client.with_served(served)
+            }
+            _ => client.with_served(Arc::new(ServedReads::learning(self.learned.clone()))),
+        }
+    }
+}
+
+/// Whether the cluster's factory names an earlier vault program, whose
+/// vaults this keeper can't keep: said at warn when first seen, and in the
+/// health while it does.
+#[derive(Default)]
+struct Earlier {
+    said: Option<Pubkey>,
+}
+
+impl Earlier {
+    fn note(&mut self, cluster: &chain::ChainKey, factory: &vp::state::Factory) {
+        let previous = factory.previous;
+        if previous == Pubkey::default() {
+            if self.said.take().is_some()
+                && let Ok(mut troubles) = TROUBLES.lock()
+            {
+                troubles.earlier = None;
+            }
+            return;
+        }
+        if self.said != Some(previous) {
+            tracing::warn!(chain = %cluster, earlier = %previous, "the vault factory replaces an earlier vault program: its vaults are not kept by this keeper");
+            self.said = Some(previous);
+        }
+        if let Ok(mut troubles) = TROUBLES.lock() {
+            troubles.earlier = Some(previous);
+        }
+    }
+}
+
+/// Wakes the cluster's loop when the executor answers an ask for one of its
+/// vaults.
+static ANSWERED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn answers_for(cluster: &str) -> Arc<tokio::sync::Notify> {
+    ANSWERED
+        .lock()
+        .map(|mut answered| answered.entry(cluster.to_string()).or_default().clone())
+        .unwrap_or_default()
 }
 
 /// How long the next round waits after `times` rounds in a row cut short by
@@ -353,6 +639,14 @@ fn owes(signed: &SignedUsage, tank: &vp::state::Tank, sent_as_of: u64) -> bool {
     signed.total > tank.usage_settled
         && signed.as_of > tank.usage_as_of
         && signed.as_of > sent_as_of
+}
+
+/// Whether the slot `now` falls in has had its window close without a
+/// valuation in it.
+fn window_missed(vault: &Vault, now: u64) -> bool {
+    let start = slot_start(now, vault.timers.slot_interval);
+    now - start >= vault.timers.slot_window
+        && (vault.valuation_count == 0 || vault.last_valued_at < start)
 }
 
 /// Whether a valuation sent now lands inside this slot's window and the
@@ -654,6 +948,12 @@ impl Keeping {
             (Err(error), _) => {
                 went_out(&key);
                 tracing::debug!(%vault, what, error = format!("{error:#}"), "not yet");
+                let why = match outcome {
+                    Outcome::Stale => "the vault refuses it as stale",
+                    Outcome::Reverted => "it landed and failed",
+                    _ => "the vault refuses it",
+                };
+                waits(vault, what, why, &format!("{error:#}"));
             }
             (Ok(landed), _) => {
                 went_out(&key);
@@ -676,69 +976,69 @@ impl Keeping {
             Ok(_) => self.send(vault, ixs, what).await,
             Err(error) => {
                 tracing::debug!(%vault, what, error = format!("{error:#}"), "the simulation turns it down; not sent");
+                waits(
+                    vault,
+                    what,
+                    "the simulation turns it down",
+                    &format!("{error:#}"),
+                );
                 Outcome::of(&Err(error))
             }
         }
     }
 
+    /// The same cluster, read through `client`.
+    fn reading(&self, client: &SolanaClient) -> Keeping {
+        Keeping {
+            client: client.clone(),
+            platform: self.platform.clone(),
+            keeper: self.keeper.insecure_clone(),
+            executor: self.executor.clone(),
+            rent_poll_rounds: self.rent_poll_rounds,
+        }
+    }
+
+    /// Every vault's round on what `observation` found, at most
+    /// [`MOST_ROUNDS_AT_ONCE`] at once: a send of one vault's never waits
+    /// for another's to land, so vaults due in the same slot are all kept
+    /// in it. Each vault's own steps still wait for their own sends to land,
+    /// in the order its round makes them.
     async fn round(
         &self,
-        scan: &mut VaultScan,
+        observation: &Observation,
         memory: &mut HashMap<Pubkey, Memory>,
     ) -> Result<()> {
-        // Every vault and every claim of each, read once a round; the vault
-        // program listed only when its counts say something new is there.
-        let found = scan.look(&self.client).await?;
-        let vaults = found.vaults;
+        let vaults = &observation.vaults;
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
         let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
-        for (vault, _, claim) in found.claims {
-            claims.entry(vault).or_default().push(claim);
+        for (vault, _, claim) in &observation.claims {
+            claims.entry(*vault).or_default().push(claim.clone());
         }
-        for (address, vault) in &vaults {
-            let remembered = memory.entry(*address).or_default();
-            let theirs = claims.remove(address).unwrap_or_default();
-            let done = self.keep_one(address, vault, &theirs, remembered).await;
-            steps_worked(address, done.is_ok());
-            match done {
-                Ok(()) => {
-                    remembered.rounds_failing = 0;
-                    if remembered.round_said.over() {
-                        tracing::info!(vault = %address, "the vault's rounds finish again");
-                    }
-                    if let Ok(mut troubles) = TROUBLES.lock() {
-                        troubles.unkept.remove(address);
-                        troubles.limited.remove(address);
-                    }
+        let mut taken: Vec<(Pubkey, &Vault, Vec<Claim>, Memory)> = vaults
+            .iter()
+            .map(|(address, vault)| {
+                (
+                    *address,
+                    vault,
+                    claims.remove(address).unwrap_or_default(),
+                    memory.remove(address).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let places = tokio::sync::Semaphore::new(MOST_ROUNDS_AT_ONCE);
+        let rounds = taken
+            .iter_mut()
+            .map(|(address, vault, theirs, remembered)| {
+                let places = &places;
+                async move {
+                    let _place = places.acquire().await;
+                    self.keep_one(address, vault, theirs, remembered).await
                 }
-                // The node asking to be asked less often is no failure of
-                // the vault's, but a vault left round after round is not
-                // kept all the same: it counts as a round that didn't
-                // finish, said only once it has held as many rounds as a
-                // failure must to be in the health.
-                Err(error) if rate_limited(&error) => {
-                    remembered.rounds_failing += 1;
-                    if remembered.rounds_failing < MOST_VAULT_ROUNDS_FAILING {
-                        tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; the vault's round is left to the next");
-                    } else if let Some(times) = remembered.round_said.due(Instant::now()) {
-                        tracing::warn!(vault = %address, times, rounds = remembered.rounds_failing, error = format!("{error:#}"), "the node's rate limit keeps the vault's round from finishing");
-                    }
-                    if let Ok(mut troubles) = TROUBLES.lock() {
-                        troubles.unkept.insert(*address, remembered.rounds_failing);
-                        troubles.limited.insert(*address);
-                    }
-                }
-                Err(error) => {
-                    remembered.rounds_failing += 1;
-                    if let Some(times) = remembered.round_said.due(Instant::now()) {
-                        tracing::warn!(vault = %address, times, error = format!("{error:#}"), "the vault's round did not finish");
-                    }
-                    if let Ok(mut troubles) = TROUBLES.lock() {
-                        troubles.unkept.insert(*address, remembered.rounds_failing);
-                        troubles.limited.remove(address);
-                    }
-                }
-            }
+            });
+        let done = futures::future::join_all(rounds).await;
+        for ((address, _, _, mut remembered), done) in taken.into_iter().zip(done) {
+            round_kept(&address, &mut remembered, done);
+            memory.insert(address, remembered);
         }
         if let Ok(mut troubles) = TROUBLES.lock() {
             troubles.unkept.retain(|vault, _| addresses.contains(vault));
@@ -909,10 +1209,22 @@ impl Keeping {
 
     /// Whether the vault's `close` would go through now.
     async fn would_close(&self, v: &VaultAccounts, vault: &Vault) -> bool {
-        self.client
+        match self
+            .client
             .simulate(vec![self.platform.ix_close_vault(v, vault)], &self.keeper())
             .await
-            .is_ok()
+        {
+            Ok(_) => true,
+            Err(error) => {
+                waits(
+                    &v.vault,
+                    "close",
+                    "the simulation turns it down",
+                    &format!("{error:#}"),
+                );
+                false
+            }
+        }
     }
 
     /// Settle everything the last priced valuation owes.
@@ -933,12 +1245,29 @@ impl Keeping {
     async fn value(&self, v: &VaultAccounts, address: &Pubkey) -> Result<()> {
         let vault = self.platform.vault(&self.client, address).await?;
         let now = self.client.now().await?;
-        if !valuation_due(&vault, now) || vault.owed() {
+        let wanted = valuation_wanted_now(&vault, now);
+        if !valuation_due(&vault, now) {
+            // Wanted since its slot began, and the slot's window is over
+            // with the slot not valued: the window was missed.
+            if let Some(why) = wanted
+                && window_missed(&vault, now)
+            {
+                waits(address, "value", "the slot's window passed unvalued", why);
+            }
             return Ok(());
         }
-        let Some(why) = valuation_wanted_now(&vault, now) else {
+        let Some(why) = wanted else {
             return Ok(());
         };
+        if vault.owed() {
+            waits(
+                address,
+                "value",
+                "the last valuation's settlement is owed first",
+                why,
+            );
+            return Ok(());
+        }
         tracing::debug!(vault = %address, why, "a valuation is wanted");
         let ix = self.platform.ix_record_valuation(&self.client, v).await?;
         let simulated = match self
@@ -950,6 +1279,12 @@ impl Keeping {
             // Outside the window, or valued already: next slot.
             Err(error) => {
                 tracing::debug!(vault = %address, error = format!("{error:#}"), "no valuation this slot");
+                waits(
+                    address,
+                    "value",
+                    "the simulation turns it down",
+                    &format!("{why}: {error:#}"),
+                );
                 return Ok(());
             }
         };
@@ -963,6 +1298,7 @@ impl Keeping {
             after.is_some_and(|after| after.priced && after.latest.index == vault.valuation_count);
         if !priced {
             tracing::debug!(vault = %address, "this slot's valuation would be void; not sent");
+            waits(address, "value", "it would be void", why);
             return Ok(());
         }
         self.send(address, vec![ix], "value").await;
@@ -1592,6 +1928,12 @@ impl Keeping {
                 vault.timers.slot_interval,
             ));
             memory.unwind_idle = true;
+            waits(
+                address,
+                "unwind the station",
+                "no unwind would go through",
+                "",
+            );
             return Ok(());
         };
         if !worth_an_unwind(brought, vault.dust()) {
@@ -1601,6 +1943,12 @@ impl Keeping {
                 vault.timers.slot_interval,
             ));
             memory.unwind_idle = true;
+            waits(
+                address,
+                "unwind the station",
+                "nothing worth an unwind would come home",
+                &format!("{brought}"),
+            );
             return Ok(());
         }
         memory.unwind_checks = None;
@@ -1885,6 +2233,12 @@ impl Keeping {
         }
         memory.close_held_since.get_or_insert((now, Instant::now()));
         tracing::debug!(vault = %v.vault, "the bill did not go through; the close waits for it");
+        waits(
+            &v.vault,
+            "close",
+            "its bill has not gone through",
+            &format!("{billing:?}"),
+        );
         false
     }
 
@@ -1939,6 +2293,12 @@ impl Keeping {
                 if claim.state == ClaimState::Queued && queued_by.is_none() {
                     // Not read yet: the next round reads the requests again.
                     tracing::debug!(vault = %address, claim = claim.id, "the request a queued claim is queued by wasn't found");
+                    waits(
+                        &address,
+                        "pay a claim of the closed vault",
+                        "the request it is queued by is not visible yet",
+                        &format!("claim {}", claim.id),
+                    );
                     continue;
                 }
                 self.send(
@@ -2039,6 +2399,55 @@ impl Keeping {
     }
 }
 
+/// What a vault's round came to, noted: in the keeper's health and said.
+fn round_kept(address: &Pubkey, remembered: &mut Memory, done: Result<()>) {
+    steps_worked(address, done.is_ok());
+    match done {
+        Ok(()) => {
+            remembered.rounds_failing = 0;
+            if remembered.round_said.over() {
+                tracing::info!(vault = %address, "the vault's rounds finish again");
+            }
+            if let Ok(mut troubles) = TROUBLES.lock() {
+                troubles.unkept.remove(address);
+                troubles.limited.remove(address);
+            }
+        }
+        // The node asking to be asked less often is no failure of the
+        // vault's, but a vault left round after round is not kept all the
+        // same: it counts as a round that didn't finish, said only once it
+        // has held as many rounds as a failure must to be in the health.
+        Err(error) if rate_limited(&error) => {
+            remembered.rounds_failing += 1;
+            waits(
+                address,
+                "its round",
+                "the node limits the rate",
+                &format!("{error:#}"),
+            );
+            if remembered.rounds_failing >= MOST_VAULT_ROUNDS_FAILING
+                && let Some(times) = remembered.round_said.due(Instant::now())
+            {
+                tracing::warn!(vault = %address, times, rounds = remembered.rounds_failing, error = format!("{error:#}"), "the node's rate limit keeps the vault's round from finishing");
+            }
+            if let Ok(mut troubles) = TROUBLES.lock() {
+                troubles.unkept.insert(*address, remembered.rounds_failing);
+                troubles.limited.insert(*address);
+            }
+        }
+        Err(error) => {
+            remembered.rounds_failing += 1;
+            if let Some(times) = remembered.round_said.due(Instant::now()) {
+                tracing::warn!(vault = %address, times, error = format!("{error:#}"), "the vault's round did not finish");
+            }
+            if let Ok(mut troubles) = TROUBLES.lock() {
+                troubles.unkept.insert(*address, remembered.rounds_failing);
+                troubles.limited.remove(address);
+            }
+        }
+    }
+}
+
 /// A step that failed is said at warn (at once, then at most every ten
 /// minutes with a count, for each vault and step) and the round carries on:
 /// one that can't go through this round mustn't hold up the steps after it.
@@ -2102,6 +2511,175 @@ fn went_out(key: &(Pubkey, &'static str)) {
         && troubles.not_sent.remove(key).is_some()
     {
         tracing::info!(vault = %key.0, what = key.1, "the keeper's send goes out again");
+    }
+}
+
+// A due duty that waits --------------------------------------------------------------------------
+
+/// When each due duty that waits was last said, and how many times since,
+/// by vault, duty and reason.
+static WAITS: std::sync::LazyLock<std::sync::Mutex<HashMap<WaitKey, WaitSaid>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// When a wait was last said, and how many times it waited since.
+type WaitSaid = (Option<Instant>, u64);
+
+/// A wait, by vault, duty and reason.
+type WaitKey = (Pubkey, &'static str, &'static str);
+
+/// Say at info that a duty of `vault`'s that is due waits, and why: at
+/// once, then at most every [`WAIT_SAID_EVERY`] for the same vault, duty and
+/// reason, with how many times it waited since. A wait is never silent, and
+/// a slow round reads differently from a stopped loop. Whether it was said.
+fn waits(vault: &Pubkey, duty: &'static str, why: &'static str, detail: &str) -> bool {
+    let now = Instant::now();
+    let due = WAITS.lock().ok().and_then(|mut waits| {
+        let said = waits.entry((*vault, duty, why)).or_insert((None, 0));
+        said.1 += 1;
+        if said
+            .0
+            .is_none_or(|at| now.duration_since(at) >= WAIT_SAID_EVERY)
+        {
+            let times = said.1;
+            *said = (Some(now), 0);
+            Some(times)
+        } else {
+            None
+        }
+    });
+    match due {
+        Some(times) => {
+            tracing::info!(%vault, duty, why, detail, times, "a due duty waits");
+            true
+        }
+        None => false,
+    }
+}
+
+/// Every vault the keeper knows waits for the same reason, the cluster's.
+fn waits_on_the_cluster(memory: &HashMap<Pubkey, Memory>, why: &'static str, detail: &str) {
+    for vault in memory.keys() {
+        waits(vault, "every duty", why, detail);
+    }
+}
+
+/// The slot after the one `now` falls in begins.
+fn next_slot(now: u64, interval: u64) -> u64 {
+    slot_start(now, interval).saturating_add(interval.max(1))
+}
+
+/// Add what one vault is next due for, from what the look read of it and
+/// the keeper's memory of it, without reading anything: each due time is
+/// the first cluster time at which a condition [`Keeping::keep_one`] acts on
+/// can change. A vault still running is looked at as each of its slots
+/// begins (its valuation, a claim's try, a holder's serve and an unwind are
+/// each made at most once a slot), and again inside the slot's valuation
+/// window while a valuation is wanted and not made.
+fn dues_of(
+    vault: &Vault,
+    claims: &[&Claim],
+    holders: Option<&[Holder]>,
+    memory: &Memory,
+    out: &mut wake::Dues,
+) {
+    let head = out.head;
+    let interval = vault.timers.slot_interval.max(1);
+    // Paces and holds the keeper keeps whatever the vault's state.
+    if let Some((_, next, here)) = memory.ask_again {
+        out.at(next, "an ask made again");
+        out.wall.push((here, "an ask made again"));
+    }
+    if let Some((_, next)) = memory.keep_again {
+        out.at(next, "a bill's keep sent again");
+    }
+    for (since, why) in [
+        (memory.close_held_since, "a close's hold ends"),
+        (memory.last_try_since, "a bill's last try ends"),
+    ] {
+        if let Some((chain, wall)) = since {
+            out.at(chain.saturating_add(LAST_ORDERS), why);
+            out.wall.push((wall + own_clock_hold(), why));
+        }
+    }
+    if let Some((next, _)) = memory.unwind_checks {
+        out.at(next, "an unwind simulated again");
+    }
+    let grace_end = vault
+        .halted()
+        .then(|| vault.halted_at.saturating_add(vault.timers.halt_grace));
+    if vault.state == VaultState::Closed {
+        if let Some(quiet) = memory.quiet_since
+            && head < quiet.saturating_add(DAY)
+        {
+            out.at(quiet.saturating_add(DAY), "a quiet vault's daily look");
+            return;
+        }
+        out.at(next_slot(head, interval), "a closed vault's slot begins");
+        if let Some((asked, here)) = memory.bill_asked_at {
+            out.at(asked.saturating_add(MINUTE), "a closed vault's ask");
+            out.wall
+                .push((here + Duration::from_secs(MINUTE), "a closed vault's ask"));
+        }
+        let grace_end = vault.halted_at.saturating_add(vault.timers.halt_grace);
+        if let Some((seen, wall)) = memory.closed_seen_at {
+            out.at(
+                seen.max(grace_end).saturating_add(LAST_ORDERS),
+                "a closed vault's last bill",
+            );
+            out.wall
+                .push((wall + own_clock_hold(), "a closed vault's last bill"));
+        }
+        out.at(grace_end, "a closed vault's station may be stopped");
+        return;
+    }
+    if vault.state == VaultState::None {
+        return;
+    }
+    out.at(next_slot(head, interval), "a slot begins");
+    // Inside the slot's window, a valuation wanted and not made is looked
+    // for again (a refusal, a send that didn't land, a look before the
+    // window's first second).
+    if valuation_due(vault, head) && valuation_wanted_now(vault, head).is_some() {
+        out.at(head.saturating_add(1), "inside a slot's valuation window");
+    }
+    if let Some(daily) = memory.daily_at {
+        out.at(daily.saturating_add(DAY), "the daily round");
+    }
+    if let Some(end) = grace_end {
+        out.at(end, "a halt's grace ends");
+    }
+    if vault.live() && !vault.halted() {
+        for claim in claims {
+            if matches!(
+                claim.state,
+                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+            ) {
+                out.at(
+                    claim.booked_at.saturating_add(vault.timers.freeze_after),
+                    "an unpaid claim may freeze the vault",
+                );
+            }
+        }
+        match holders {
+            Some(holders) => {
+                for holder in holders.iter().filter(|holder| holder.units != 0) {
+                    out.at(
+                        holder.units_since.saturating_add(vault.timers.freeze_after),
+                        "a holder's units may freeze the vault",
+                    );
+                }
+            }
+            None if vault.units != 0 => {
+                out.unknown = Some("a vault's holdings were not read");
+            }
+            None => {}
+        }
+    }
+    if vault.state == VaultState::WindingDown && !vault.halted() {
+        out.at(
+            vault.retired_at.saturating_add(vault.timers.wind_down),
+            "a retired vault may be evicted",
+        );
     }
 }
 
@@ -2230,10 +2808,16 @@ fn ask(cluster: &str, url: &str, vault: &Pubkey) -> Option<Instant> {
                 if matches!(asked, Asked::NotServed) && !asks.latest.contains_key(&vault) {
                     tracing::warn!(%vault, "the executor serves no total for this vault; if it should, check the executor's URL");
                 }
+                // A total to collect has the cluster looked at at once: the
+                // bill is collected now, not at the next look.
+                let total = matches!(asked, Asked::Total(_));
                 if asks.latest.get(&vault).is_none_or(|(_, at)| *at < sent) {
                     asks.latest.insert(vault, (asked, sent));
                 }
                 asks.note_serving();
+                if total {
+                    answers_for(&cluster).notify_one();
+                }
             }
             Err(error) => {
                 if asks
@@ -2362,6 +2946,9 @@ struct Troubles {
     /// Sends that didn't go out, by vault and what they were for, since
     /// when, and their warning.
     not_sent: HashMap<(Pubkey, &'static str), (Instant, Said)>,
+    /// The earlier vault program the factory names, whose vaults this
+    /// keeper doesn't keep.
+    earlier: Option<Pubkey>,
 }
 
 static TROUBLES: std::sync::LazyLock<std::sync::Mutex<Troubles>> =
@@ -2402,6 +2989,14 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
             out.push((
                 format!("{} sends not going out", whats.len()),
                 format!("not going out: {}", whats.join(", ")),
+            ));
+        }
+        if let Some(earlier) = troubles.earlier {
+            out.push((
+                "an earlier vault program not kept".to_string(),
+                format!(
+                    "the vault factory replaces the vault program {earlier}, whose vaults this keeper does not keep"
+                ),
             ));
         }
         let mut refused: Vec<String> = troubles
@@ -3108,6 +3703,216 @@ mod tests {
         assert!(kept(), "a round that did not finish ends nothing");
         steps_worked(&vault, true);
         assert!(!kept(), "a round finished without it, yet it is kept");
+    }
+
+    /// The due times one vault gives at cluster time `head`.
+    fn dues_at(
+        head: u64,
+        vault: &Vault,
+        claims: &[&Claim],
+        holders: Option<&[Holder]>,
+        memory: &Memory,
+    ) -> wake::Dues {
+        let mut dues = wake::Dues {
+            head,
+            ..wake::Dues::default()
+        };
+        dues_of(vault, claims, holders, memory, &mut dues);
+        dues
+    }
+
+    fn due(dues: &wake::Dues, why: &str) -> Option<u64> {
+        dues.chain
+            .iter()
+            .filter(|(_, said)| *said == why)
+            .map(|(time, _)| *time)
+            .min()
+    }
+
+    fn a_claim(state: ClaimState, booked_at: u64) -> Claim {
+        let mut bytes =
+            [0u8; 8 + <Claim as chain::solana::programs::anchor_lang::Space>::INIT_SPACE];
+        bytes[..8].copy_from_slice(
+            <Claim as chain::solana::programs::anchor_lang::Discriminator>::DISCRIMINATOR,
+        );
+        let mut claim = Claim::try_deserialize(&mut &bytes[..]).unwrap();
+        claim.state = state;
+        claim.booked_at = booked_at;
+        claim
+    }
+
+    #[test]
+    fn a_running_vault_is_looked_at_as_each_slot_begins_and_again_inside_a_wanted_window() {
+        // Monday 13 November 2023 and a day and a half on: a slot's start.
+        let start = 1_699_833_600 + DAY + DAY / 2;
+        let quiet = a_quiet_vault(start);
+        let memory = Memory::default();
+        let dues = dues_at(start + 3, &quiet, &[], None, &memory);
+        assert_eq!(due(&dues, "a slot begins"), Some(start + 10));
+        assert_eq!(due(&dues, "inside a slot's valuation window"), None);
+        // A request waits for its price: inside the window, looked at again
+        // a second on; past the window, not until the next slot.
+        let mut asked = a_quiet_vault(start);
+        asked.note_request(start);
+        asked.timers.slot_window = 3;
+        let dues = dues_at(start + 1, &asked, &[], None, &memory);
+        assert_eq!(
+            due(&dues, "inside a slot's valuation window"),
+            Some(start + 2)
+        );
+        let dues = dues_at(start + 4, &asked, &[], None, &memory);
+        assert_eq!(due(&dues, "inside a slot's valuation window"), None);
+        assert_eq!(due(&dues, "a slot begins"), Some(start + 10));
+    }
+
+    #[test]
+    fn every_unpaid_claim_queued_or_not_is_looked_at_when_it_may_freeze_the_vault() {
+        let vault = a_vault();
+        let memory = Memory::default();
+        let claims = [
+            a_claim(ClaimState::Queued, 100),
+            a_claim(ClaimState::Waiting, 200),
+            a_claim(ClaimState::Paid, 50),
+        ];
+        let claims: Vec<&Claim> = claims.iter().collect();
+        let dues = dues_at(500, &vault, &claims, None, &memory);
+        let freezes: Vec<u64> = dues
+            .chain
+            .iter()
+            .filter(|(_, why)| *why == "an unpaid claim may freeze the vault")
+            .map(|(time, _)| *time)
+            .collect();
+        assert_eq!(
+            freezes,
+            vec![1_100, 1_200],
+            "a queued claim's freeze is due too"
+        );
+        // A halted vault is past freezing.
+        let mut halted = a_vault();
+        halted.halted_at = 400;
+        let dues = dues_at(500, &halted, &claims, None, &memory);
+        assert_eq!(due(&dues, "an unpaid claim may freeze the vault"), None);
+    }
+
+    #[test]
+    fn a_vault_s_deadlines_and_the_keeper_s_holds_are_due_times() {
+        let mut vault = a_vault();
+        vault.timers.halt_grace = 600;
+        vault.timers.wind_down = 7 * DAY;
+        vault.state = VaultState::WindingDown;
+        vault.retired_at = 1_000;
+        let memory = Memory {
+            daily_at: Some(900),
+            keep_again: Some((60, 1_060)),
+            ..Memory::default()
+        };
+        let holders = [a_holder(5, 300), a_holder(0, 100)];
+        let dues = dues_at(1_000, &vault, &[], Some(&holders), &memory);
+        assert_eq!(
+            due(&dues, "a retired vault may be evicted"),
+            Some(1_000 + 7 * DAY)
+        );
+        assert_eq!(due(&dues, "the daily round"), Some(900 + DAY));
+        assert_eq!(due(&dues, "a bill's keep sent again"), Some(1_060));
+        assert_eq!(
+            due(&dues, "a holder's units may freeze the vault"),
+            Some(300 + 1_000)
+        );
+        // Units whose holdings weren't read leave the next look to the
+        // active pace.
+        vault.units = 5;
+        let dues = dues_at(1_000, &vault, &[], None, &memory);
+        assert!(dues.unknown.is_some());
+        // A halt's grace end.
+        let mut halted = a_vault();
+        halted.halted_at = 1_000;
+        halted.timers.halt_grace = 600;
+        let dues = dues_at(1_100, &halted, &[], None, &memory);
+        assert_eq!(due(&dues, "a halt's grace ends"), Some(1_600));
+    }
+
+    #[test]
+    fn a_closed_vault_left_quiet_is_looked_at_once_a_day() {
+        let mut closed = a_vault();
+        closed.state = VaultState::Closed;
+        let memory = Memory {
+            quiet_since: Some(5_000),
+            ..Memory::default()
+        };
+        let dues = dues_at(5_010, &closed, &[], None, &memory);
+        assert_eq!(
+            dues.chain,
+            vec![(5_000 + DAY, "a quiet vault's daily look")]
+        );
+        let busy = Memory::default();
+        let dues = dues_at(5_010, &closed, &[], None, &busy);
+        assert_eq!(due(&dues, "a closed vault's slot begins"), Some(5_020));
+    }
+
+    #[test]
+    fn a_due_duty_that_waits_is_said_at_once_then_once_per_throttle_for_each_reason() {
+        let vault = Pubkey::new_unique();
+        assert!(waits(&vault, "value", "the simulation turns it down", "a"));
+        assert!(!waits(&vault, "value", "the simulation turns it down", "b"));
+        // Another reason, or another duty, is said at once.
+        assert!(waits(&vault, "value", "it would be void", "c"));
+        assert!(waits(
+            &vault,
+            "settle a claim",
+            "the simulation turns it down",
+            "d"
+        ));
+        // Once the throttle is over, said again with how many waits it
+        // stands for.
+        if let Ok(mut said) = WAITS.lock() {
+            let entry = said
+                .get_mut(&(vault, "value", "the simulation turns it down"))
+                .unwrap();
+            entry.0 = entry.0.map(|at| at - WAIT_SAID_EVERY);
+        }
+        assert!(waits(&vault, "value", "the simulation turns it down", "e"));
+        assert!(!waits(&vault, "value", "the simulation turns it down", "f"));
+    }
+
+    #[test]
+    fn a_slot_whose_window_closed_unvalued_is_a_missed_window() {
+        let start = 1_699_833_600 + DAY + DAY / 2;
+        let mut vault = a_quiet_vault(start);
+        vault.timers.slot_window = 3;
+        vault.last_valued_at = start - 10;
+        assert!(!window_missed(&vault, start + 2), "inside the window");
+        assert!(window_missed(&vault, start + 3));
+        vault.last_valued_at = start + 1;
+        assert!(!window_missed(&vault, start + 5), "valued in it");
+    }
+
+    #[test]
+    fn a_factory_naming_an_earlier_vault_program_is_in_the_health_until_it_names_none() {
+        let cluster: chain::ChainKey = "solana:localnet".parse().unwrap();
+        let mut bytes = vec![
+            0u8;
+            8 + <vp::state::Factory as chain::solana::programs::anchor_lang::Space>::INIT_SPACE
+        ];
+        bytes[..8].copy_from_slice(
+            <vp::state::Factory as chain::solana::programs::anchor_lang::Discriminator>::DISCRIMINATOR,
+        );
+        let mut factory = vp::state::Factory::try_deserialize(&mut &bytes[..]).unwrap();
+        let mut earlier = Earlier::default();
+        let said = || {
+            troubles(Instant::now())
+                .into_iter()
+                .find(|(first, _)| first == "an earlier vault program not kept")
+        };
+        earlier.note(&cluster, &factory);
+        assert!(said().is_none(), "a factory replacing none");
+        let previous = Pubkey::new_unique();
+        factory.previous = previous;
+        earlier.note(&cluster, &factory);
+        let (_, detail) = said().expect("an earlier program is not in the health");
+        assert!(detail.contains(&previous.to_string()), "{detail}");
+        factory.previous = Pubkey::default();
+        earlier.note(&cluster, &factory);
+        assert!(said().is_none());
     }
 
     #[test]
