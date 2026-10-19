@@ -29,6 +29,10 @@ use std::sync::Arc;
 use crate::config::ChainConfig;
 use crate::deployments::Deployments;
 
+mod in_flight;
+
+pub use in_flight::Superseded;
+
 /// One of the platform's roles, as an account on the chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -148,11 +152,21 @@ pub struct Client {
     /// One send at a time from each account this client signs for, shared by
     /// every clone. The nonce is asked of the node when a transaction is
     /// filled in, so two sends from one account at once would both take the
-    /// same one and the node would keep only one of them.
+    /// same one and the node would keep only one of them. A
+    /// [`Client::pipelined`] client holds it only until a send is handed
+    /// over, and also while a node that signs numbers one of its sends.
     turns: Arc<std::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
-    /// The nonce after each account's last send whose receipt was seen,
-    /// shared by every clone and every [`KeyClient`] made from it.
+    /// The nonce after each account's last send whose receipt was seen, and
+    /// the nonces of its sends in flight, shared by every clone and every
+    /// [`KeyClient`] made from it.
     nonces: NonceFloor,
+    /// Whether this clone's sends from an account it signs for hold the
+    /// account's turn only until they are handed over, so several can be in
+    /// flight at once (see [`Client::pipelined`]).
+    pipelined: bool,
+    /// The longest any send waits for its receipt, when shorter than its
+    /// own wait (see [`Client::waiting_at_most`]).
+    receipt_wait: Option<Duration>,
     /// Where a log query with no numbered range goes: the endpoints
     /// `logs_rpc` names, or the same connection as everything else when it
     /// names none.
@@ -176,54 +190,100 @@ pub struct Client {
     label: String,
 }
 
-/// The nonce after each account's last send this client saw land.
+/// The nonce after each account's last send this client saw land, and the
+/// nonces of its sends in flight.
 ///
 /// A public RPC is often several nodes behind one name, and one a block
 /// behind counts the account's sends without the last one: numbered from its
 /// count alone, the next send would take the last one's nonce again, and be
 /// refused or, worse, replace a send still waiting in the pool. So a send is
 /// numbered at the node's count of the account's sends (pending ones
-/// included) but never below this. It starts empty: a client that starts
-/// again takes the node's count until it has seen a send of its own land.
+/// included) but never below this, and never at a nonce one of this client's
+/// sends still in flight holds (see [`Client::pipelined`]). It starts empty:
+/// a client that starts again takes the node's count until it has seen a
+/// send of its own land.
 #[derive(Clone, Default)]
-struct NonceFloor(Arc<std::sync::Mutex<HashMap<Address, u64>>>);
+pub(crate) struct NonceFloor(Arc<std::sync::Mutex<HashMap<Address, Numbered>>>);
+
+/// One account's numbering, as [`NonceFloor`] keeps it.
+#[derive(Default)]
+struct Numbered {
+    /// The nonce after the last send seen landed (or seen used).
+    floor: u64,
+    /// The nonces handed to sends that may still land.
+    flying: std::collections::BTreeSet<u64>,
+}
 
 impl NonceFloor {
-    /// The nonce for `from`'s next send, given the node's count of its sends.
-    fn number(&self, from: Address, counted: u64) -> u64 {
-        let floor = self
-            .0
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Address, Numbered>> {
+        self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&from)
-            .copied()
-            .unwrap_or(0);
-        counted.max(floor)
+    }
+
+    /// The nonce for `from`'s next send, given the node's count of its sends:
+    /// the lowest at or above both the count and the floor that no send in
+    /// flight holds.
+    fn number(&self, from: Address, counted: u64) -> u64 {
+        let numbers = self.lock();
+        let Some(numbered) = numbers.get(&from) else {
+            return counted;
+        };
+        let mut nonce = counted.max(numbered.floor);
+        while numbered.flying.contains(&nonce) {
+            nonce = nonce.saturating_add(1);
+        }
+        nonce
+    }
+
+    /// Number `from`'s next send as [`NonceFloor::number`] does, and hold
+    /// the nonce for it until it is [`NonceFloor::landed`] or
+    /// [`NonceFloor::released`].
+    pub(crate) fn claim(&self, from: Address, counted: u64) -> u64 {
+        let mut numbers = self.lock();
+        let numbered = numbers.entry(from).or_default();
+        let mut nonce = counted.max(numbered.floor);
+        while numbered.flying.contains(&nonce) {
+            nonce = nonce.saturating_add(1);
+        }
+        numbered.flying.insert(nonce);
+        nonce
+    }
+
+    /// The send numbered `nonce` never went out, or never can land: the
+    /// nonce is free for the next send.
+    pub(crate) fn released(&self, from: Address, nonce: u64) {
+        if let Some(numbered) = self.lock().get_mut(&from) {
+            numbered.flying.remove(&nonce);
+        }
     }
 
     /// A send of `from`'s numbered `nonce` landed (reverted or not: either
-    /// way the nonce is used).
-    fn landed(&self, from: Address, nonce: u64) {
-        let mut floors = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next = floors.entry(from).or_default();
-        *next = (*next).max(nonce.saturating_add(1));
+    /// way the nonce is used), or the chain shows the nonce used by another.
+    pub(crate) fn landed(&self, from: Address, nonce: u64) {
+        let mut numbers = self.lock();
+        let numbered = numbers.entry(from).or_default();
+        numbered.floor = numbered.floor.max(nonce.saturating_add(1));
+        numbered.flying.remove(&nonce);
     }
 
     /// Ask the node for `from`'s count of sends, pending ones included, and
     /// number the next send from it and the floor. A count the node won't
     /// give is a send that can't be numbered safely, so nothing is sent.
     async fn next(&self, provider: &DynProvider, from: Address) -> Result<u64> {
-        let counted = provider
-            .get_transaction_count(from)
-            .pending()
-            .await
-            .context("counting the account's sends")
-            .map_err(NeverSent::wrap)?;
+        let counted = pending_count(provider, from).await?;
         Ok(self.number(from, counted))
     }
+}
+
+/// The node's count of `from`'s sends, pending ones included.
+pub(crate) async fn pending_count(provider: &DynProvider, from: Address) -> Result<u64> {
+    provider
+        .get_transaction_count(from)
+        .pending()
+        .await
+        .context("counting the account's sends")
+        .map_err(NeverSent::wrap)
 }
 
 /// The fillers a signing client runs: gas, then the nonce, then the chain id.
@@ -1707,6 +1767,8 @@ impl Client {
             keys,
             turns: Default::default(),
             nonces: Default::default(),
+            pipelined: false,
+            receipt_wait: None,
             logs,
             log_endpoints,
             log_range: config.log_range,
@@ -2165,8 +2227,9 @@ impl Client {
     ///
     /// A send from an account this client signs for waits for that
     /// account's turn and holds it until the receipt comes or the wait runs
-    /// out. A node that signs for the account numbers its transactions
-    /// itself, so those need no turn.
+    /// out; on a [`Client::pipelined`] client, only until it is handed over.
+    /// A node that signs for the account numbers its transactions itself, so
+    /// those need no turn.
     async fn sent(
         &self,
         request: TransactionRequest,
@@ -2180,6 +2243,7 @@ impl Client {
                 .with_context(|| sending.to_string())
                 .map_err(NeverSent::wrap)?;
         }
+        let within = self.receipt_wait.map_or(within, |most| within.min(most));
         let _turn = match request.from {
             Some(from)
                 if self
@@ -2187,16 +2251,28 @@ impl Client {
                     .as_ref()
                     .is_some_and(|keys| keys.contains_key(&from)) =>
             {
-                let turn = self
-                    .turns
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry(from)
-                    .or_default()
-                    .clone();
-                Some(turn.lock_owned().await)
+                Some(self.turn_of(from).lock_owned().await)
             }
             _ => None,
+        };
+        let _turn = match (_turn, &self.signing, request.from) {
+            (Some(turn), Some(signing), Some(from))
+                if self.pipelined && request.nonce.is_none() =>
+            {
+                return self
+                    .sent_in_flight(
+                        turn,
+                        signing.clone(),
+                        from,
+                        request,
+                        within,
+                        sending,
+                        what,
+                        sent_as,
+                    )
+                    .await;
+            }
+            (turn, ..) => turn,
         };
         // Numbered here, while the account's turn is held: the node's count
         // of the account's sends, pending ones included, but never below the
@@ -2242,12 +2318,22 @@ impl Client {
                     }
                 }
             }
-            _ => *self
-                .provider
-                .send_transaction(request)
-                .await
-                .with_context(|| sending.to_string())?
-                .tx_hash(),
+            _ => {
+                // A node that signs numbers each send as it takes it, from
+                // its count of the account's sends: two handed to it at once
+                // could both be numbered the same. A pipelined client hands
+                // it one at a time, and waits for the receipts outside.
+                let _numbering = match (self.pipelined, request.from) {
+                    (true, Some(from)) => Some(self.turn_of(from).lock_owned().await),
+                    _ => None,
+                };
+                *self
+                    .provider
+                    .send_transaction(request)
+                    .await
+                    .with_context(|| sending.to_string())?
+                    .tx_hash()
+            }
         };
         sent_as(hash);
         let receipt = receipt_within(&self.provider, hash, within, what).await?;
@@ -2255,6 +2341,16 @@ impl Client {
             self.nonces.landed(from, nonce);
         }
         Ok(receipt)
+    }
+
+    /// `from`'s turn to send, shared by every clone.
+    fn turn_of(&self, from: Address) -> Arc<tokio::sync::Mutex<()>> {
+        self.turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(from)
+            .or_default()
+            .clone()
     }
 
     /// Have the node sign a digest as `who`, the way a wallet would: the

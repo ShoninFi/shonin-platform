@@ -205,12 +205,10 @@ async fn a_halted_and_a_running_vault_one_served_round() -> (Address, Address, V
 }
 
 /// A running vault that wants a valuation and a halted vault past its
-/// grace, its station emptied, in one served round: the running vault's
-/// valuation lands inside its window, and the halted vault's close, which
-/// has no window, never takes a block ahead of it. (Sends wait for each
-/// other's receipts, so a three-second window at two-second blocks holds one
-/// valuation that may land a block late: the halted vault's waits for the
-/// next slot.)
+/// grace, its station emptied, in one served round on a chain that mines a
+/// block for every send: the running vault's valuation lands inside its
+/// window, and the halted vault's close, which has no window, never takes a
+/// block ahead of it.
 #[tokio::test]
 async fn a_halted_vault_s_close_does_not_take_the_block_another_vault_s_valuation_needs() {
     let (halted, running, sent) = a_halted_and_a_running_vault_one_served_round().await;
@@ -238,6 +236,123 @@ async fn a_halted_vault_s_close_does_not_take_the_block_another_vault_s_valuatio
     assert!(
         halted_closed.iter().all(|at| *at > running_valued[0]),
         "the halted vault's close went ahead of the running vault's valuation: {sent:?}"
+    );
+}
+
+/// Two running vaults and a halted vault past its grace, its station
+/// emptied, all wanting a valuation in the same slot, on a chain that mines
+/// a two-second block every second of the wall clock, with a three-second
+/// window and the head two seconds before the slot: one round read from an
+/// observation. What was sent, with the head's time each was sent at (two
+/// sends made at the same head land in the same block).
+async fn three_vaults_due_in_one_window_one_served_round()
+-> (Address, [Address; 2], Vec<(String, u64)>) {
+    let halted = Address::repeat_byte(0x11);
+    let running = [Address::repeat_byte(0x12), Address::repeat_byte(0x13)];
+    let slot = SLOT_START + 10;
+    let start = slot - 2;
+    let node = stand_in::node(start);
+    a_halted_vault_ready_to_close(&node, halted, Address::repeat_byte(0x21), start);
+    for (vault, station) in running.iter().zip([0x22, 0x23]) {
+        a_running_vault_wanting_a_valuation(&node, *vault, Address::repeat_byte(station), start);
+    }
+    let factory = deployments().factory;
+    answers(
+        &node,
+        factory,
+        IVaultFactory::vaultsCall {},
+        vec![running[0], halted, running[1]],
+    );
+    answers(
+        &node,
+        factory,
+        IReplacesFactory::previousCall {},
+        Address::ZERO,
+    );
+    stand_in::keeps_the_window(&node, 10, 3);
+    let client =
+        stand_in::connect_with_a_block_clock(&node, 2, std::time::Duration::from_secs(1)).await;
+    let learned = observed::Shared::default();
+    let mut memory = HashMap::new();
+    let mut factories = Factories::default();
+    // A first round of the chain itself learns what the rounds read, at a
+    // moment no valuation lands in a window.
+    node.lock().unwrap().timestamp = start - 5;
+    let live = Observed::live(client.deref().clone(), learned.clone());
+    let _ = tick(
+        Chain::Base,
+        &live,
+        &deployments(),
+        KEEPER,
+        "http://127.0.0.1:1",
+        &mut memory,
+        &mut factories,
+    )
+    .await;
+    {
+        let mut node = node.lock().unwrap();
+        node.timestamp = start;
+        node.head += 3;
+    }
+    let before = stand_in::everything_sent_when(&node).len();
+    let (_, snapshot) = look(&client, &learned, &node).await;
+    let reads = served(&client, &learned, &snapshot, None);
+    let _ = tick(
+        Chain::Base,
+        &reads,
+        &deployments(),
+        KEEPER,
+        "http://127.0.0.1:1",
+        &mut memory,
+        &mut factories,
+    )
+    .await;
+    let sent = stand_in::everything_sent_when(&node)[before..].to_vec();
+    (halted, running, sent)
+}
+
+/// Every vault due a valuation in one window is valued in the same block,
+/// inside the window: the sends don't wait for each other's receipts, so a
+/// three-second window at two-second blocks holds all three. The halted
+/// vault's close follows its own valuation.
+#[tokio::test]
+async fn every_valuation_due_in_one_window_lands_in_the_same_block() {
+    let (halted, running, sent) = three_vaults_due_in_one_window_one_served_round().await;
+    let block = 2;
+    let valued = alloy::hex::encode_prefixed(IVault::recordValuationCall::SELECTOR);
+    let closed = alloy::hex::encode_prefixed(IVault::closeCall::SELECTOR);
+    let sends_of = |vault: Address, selector: &str| -> Vec<u64> {
+        sent.iter()
+            .filter(|(call, _)| call.starts_with(&format!("{vault}")) && call.ends_with(selector))
+            .map(|(_, at)| *at)
+            .collect()
+    };
+    let valuations: Vec<Vec<u64>> = [halted, running[0], running[1]]
+        .iter()
+        .map(|vault| sends_of(*vault, &valued))
+        .collect();
+    assert!(
+        valuations.iter().all(|at| at.len() == 1),
+        "a vault was not valued once in the round: {sent:?}"
+    );
+    let at = valuations[0][0];
+    assert!(
+        valuations.iter().all(|sent_at| sent_at[0] == at),
+        "the valuations did not land in one block: {sent:?}"
+    );
+    assert!(
+        (at + block) % 10 <= 3,
+        "the valuations land outside their window: {sent:?}"
+    );
+    let halted_closed = sends_of(halted, &closed);
+    assert_eq!(
+        halted_closed.len(),
+        1,
+        "the halted vault was not closed: {sent:?}"
+    );
+    assert!(
+        halted_closed[0] > at,
+        "the halted vault's close went before its valuation landed: {sent:?}"
     );
 }
 

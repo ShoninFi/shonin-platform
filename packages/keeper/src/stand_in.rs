@@ -558,6 +558,74 @@ pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> crate::Obser
         .into()
 }
 
+/// A client whose sends are mined a block at a time, as a real chain mines
+/// them: every `every` of the wall clock the stand-in's head moves on a
+/// block and its clock by `seconds`, and every send taken since lands in
+/// that block. A send's receipt is there only once its block is. Sends made
+/// while the same head stands land in the same block, so the head's time a
+/// send was made at (see [`everything_sent_when`]) names its block.
+pub async fn connect_with_a_block_clock(
+    node: &Shared,
+    seconds: u64,
+    every: std::time::Duration,
+) -> crate::Observed {
+    node.lock().unwrap().block_time = seconds;
+    let behind = Behind::new(connect(node).await.rpc_url.clone());
+    let pending: Arc<Mutex<Vec<Value>>> = Arc::default();
+    {
+        let (node, pending) = (node.clone(), pending.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let mut node = node.lock().unwrap();
+                node.timestamp += seconds;
+                node.head += 1;
+                pending.lock().unwrap().clear();
+            }
+        });
+    }
+    let state = (behind, pending);
+    let app = Router::new()
+        .route(
+            "/",
+            post(
+                |State((behind, pending)): State<(Behind, Arc<Mutex<Vec<Value>>>)>,
+                 Json(body): Json<Value>| async move {
+                    if body["method"] == "eth_getTransactionReceipt"
+                        && pending.lock().unwrap().contains(&body["params"][0])
+                    {
+                        return Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": null}));
+                    }
+                    let answer: Value = behind.forward(&body).await;
+                    if body["method"] == "eth_sendTransaction" && answer.get("error").is_none() {
+                        pending.lock().unwrap().push(answer["result"].clone());
+                    }
+                    Json(answer)
+                },
+            ),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let config = ChainConfig {
+        label: "stand-in mining blocks".to_string(),
+        rpc: url.clone(),
+        ws: None,
+        dollar: "USDC".to_string(),
+        native_usd: None,
+        confirmations: None,
+        public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
+    };
+    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    crate::receipts_polled_every(&client, std::time::Duration::from_millis(50));
+    client.into()
+}
+
 /// The stand-in behind a proxy, asked over one pool of connections: a new
 /// connection for every request would run the machine out of local ports
 /// when many tests run at once.

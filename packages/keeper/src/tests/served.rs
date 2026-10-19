@@ -597,19 +597,20 @@ async fn two_vaults_one_round(served: bool) -> Vec<(Address, u64)> {
         .collect()
 }
 
+/// Whether read from an observation or of the chain itself, the vaults'
+/// rounds are made at once: neither vault's other sends take the blocks the
+/// other's valuation needs, and both land inside their window.
 #[tokio::test]
-async fn read_from_an_observation_every_vault_s_valuation_goes_before_any_vault_s_other_sends() {
+async fn every_vault_s_valuation_lands_in_its_window_whether_read_from_an_observation_or_not() {
     let landing_in_window = |at: u64| (at + 2) % 10 <= 5;
-    let served = two_vaults_one_round(true).await;
-    assert_eq!(served.len(), 2, "both vaults valued: {served:?}");
-    assert!(
-        served.iter().all(|(_, at)| landing_in_window(*at)),
-        "{served:?}"
-    );
-    // Read of the chain itself, vault by vault, as before: the first vault's
-    // other sends take the blocks the second's valuation needed.
-    let live = two_vaults_one_round(false).await;
-    assert_eq!(live.len(), 1, "{live:?}");
+    for served in [true, false] {
+        let valued = two_vaults_one_round(served).await;
+        assert_eq!(valued.len(), 2, "both vaults valued: {valued:?}");
+        assert!(
+            valued.iter().all(|(_, at)| landing_in_window(*at)),
+            "{valued:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -798,5 +799,100 @@ async fn after_a_send_logs_are_still_read_only_where_they_were_checked() {
             .iter()
             .any(|(method, _)| method == "eth_getLogs" || method == "eth_blockNumber"),
         "logs were read of the chain itself, unchecked, after a send"
+    );
+}
+
+/// A vault whose valuation window opens while another vault's round of the
+/// same look still runs (its claims' sends taking a block each) is valued
+/// in that window, not left for the look after: the look reads the chain's
+/// time while its rounds run, and makes the vault's valuation step when its
+/// window opens.
+#[tokio::test]
+async fn a_window_that_opens_while_another_vault_s_round_runs_is_not_missed() {
+    let busy = Address::repeat_byte(0x11);
+    let waiting = Address::repeat_byte(0x12);
+    let slot = SLOT_START + 10;
+    // A valuation sent now would land two seconds before the slot.
+    let start = slot - 4;
+    let node = stand_in::node(start);
+    a_vault_wanting_a_valuation(&node, busy, Address::repeat_byte(0x21), start, 3);
+    a_vault_wanting_a_valuation(&node, waiting, Address::repeat_byte(0x22), start, 0);
+    let factory = deployments().factory;
+    answers(
+        &node,
+        factory,
+        IVaultFactory::vaultsCall {},
+        vec![busy, waiting],
+    );
+    answers(
+        &node,
+        factory,
+        IReplacesFactory::previousCall {},
+        Address::ZERO,
+    );
+    stand_in::keeps_the_window(&node, 10, 3);
+    let client =
+        stand_in::connect_with_a_block_clock(&node, 2, std::time::Duration::from_secs(1)).await;
+    let learned = observed::Shared::default();
+    let mut memory = HashMap::new();
+    let mut factories = Factories::default();
+    // A first round of the chain itself learns what the rounds read, a slot
+    // before, when no valuation lands in a window: the claims tried then are
+    // due again in the slot of the look.
+    node.lock().unwrap().timestamp = slot - 18;
+    let live = Observed::live(client.deref().clone(), learned.clone());
+    let _ = tick(
+        Chain::Base,
+        &live,
+        &deployments(),
+        KEEPER,
+        "http://127.0.0.1:1",
+        &mut memory,
+        &mut factories,
+    )
+    .await;
+    {
+        let mut node = node.lock().unwrap();
+        node.timestamp = start;
+        node.head += 3;
+    }
+    let before = stand_in::everything_sent_when(&node).len();
+    let reads = looked(&client, &learned, &node).await;
+    let _ = tick(
+        Chain::Base,
+        &reads,
+        &deployments(),
+        KEEPER,
+        "http://127.0.0.1:1",
+        &mut memory,
+        &mut factories,
+    )
+    .await;
+    let sent = stand_in::everything_sent_when(&node)[before..].to_vec();
+    let claims_tried = sent
+        .iter()
+        .filter(|(call, _)| {
+            call.starts_with(&format!("{busy}"))
+                && call.contains(&alloy::hex::encode(IVault::settleClaimCall::SELECTOR))
+        })
+        .count();
+    assert!(
+        claims_tried >= 2,
+        "the busy vault's round was not long: {sent:?}"
+    );
+    let valued = alloy::hex::encode_prefixed(IVault::recordValuationCall::SELECTOR);
+    let waiting_valued: Vec<u64> = sent
+        .iter()
+        .filter(|(call, _)| call.starts_with(&format!("{waiting}")) && call.ends_with(&valued))
+        .map(|(_, at)| *at)
+        .collect();
+    assert_eq!(
+        waiting_valued.len(),
+        1,
+        "the vault whose window opened during the look was not valued in it: {sent:?}"
+    );
+    assert!(
+        (waiting_valued[0] + 2) % 10 <= 3,
+        "its valuation lands outside its window: {sent:?}"
     );
 }
