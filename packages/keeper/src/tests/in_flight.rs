@@ -340,6 +340,16 @@ async fn a_node_with_a_pool(every: Option<Duration>) -> (Shared, String) {
 /// The keeper's client on the stand-in, signing for itself as on a
 /// testnet, its sends in flight together, each waited for at most `wait`.
 async fn the_keeper_on(url: &str, wait: Duration) -> (Observed, Address) {
+    the_keeper_with_receipts_lagging_on(url, wait, None).await
+}
+
+/// [`the_keeper_on`], taking a used nonce's receipt missing for `lag` (and
+/// the blocks) as a sign another transaction used it, when given.
+async fn the_keeper_with_receipts_lagging_on(
+    url: &str,
+    wait: Duration,
+    lag: Option<Duration>,
+) -> (Observed, Address) {
     let keys = chain::keys_from_mnemonic(
         "test test test test test test test test test test test junk",
         1,
@@ -357,11 +367,14 @@ async fn the_keeper_on(url: &str, wait: Duration) -> (Observed, Address) {
         logs_rpc: None,
         log_range: None,
     };
-    let client = Client::connect(&config, chain::Signing::Keys(keys))
+    let mut client = Client::connect(&config, chain::Signing::Keys(keys))
         .await
         .unwrap()
         .pipelined()
         .waiting_at_most(wait);
+    if let Some(lag) = lag {
+        client = client.receipts_lagging_at_most(lag);
+    }
     receipts_polled_every(&client, Duration::from_millis(50));
     (client.into(), keeper)
 }
@@ -727,7 +740,12 @@ async fn a_send_of_the_same_key_from_elsewhere_never_has_a_duty_sent_twice() {
     // Taken while the keeper's waits in the pool.
     let (pool, url) = a_node_with_a_pool(None).await;
     pool.lock().unwrap().never_mines.insert(vault(1));
-    let (client, keeper) = the_keeper_on(&url, Duration::from_secs(20)).await;
+    let (client, keeper) = the_keeper_with_receipts_lagging_on(
+        &url,
+        Duration::from_secs(20),
+        Some(Duration::from_secs(2)),
+    )
+    .await;
     let (outcome, ()) = tokio::join!(value(&client, keeper, vault(1)), async {
         until_pooled(&pool, 1).await;
         pool.lock().unwrap().external(keeper);
@@ -809,13 +827,15 @@ async fn a_landed_send_whose_receipt_never_comes_is_not_said_superseded() {
 
 /// A send whose nonce another transaction of the same key took is still
 /// said to have been superseded, once its receipt has stayed missing for
-/// longer than a node behind another explains, and before its deadline.
+/// longer than a node behind another explains, in blocks and in time, and
+/// before its deadline.
 #[tokio::test]
 async fn a_send_whose_nonce_another_took_is_said_superseded_before_its_deadline() {
     let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(50))).await;
     pool.lock().unwrap().never_mines.insert(vault(1));
     let wait = Duration::from_secs(20);
-    let (client, keeper) = the_keeper_on(&url, wait).await;
+    let lag = Duration::from_secs(3);
+    let (client, keeper) = the_keeper_with_receipts_lagging_on(&url, wait, Some(lag)).await;
     let started = std::time::Instant::now();
     let (sent, ()) = tokio::join!(
         client.send(keeper, vault(1), IVault::recordValuationCall {}),
@@ -831,6 +851,7 @@ async fn a_send_whose_nonce_another_took_is_said_superseded_before_its_deadline(
             .any(|cause| cause.is::<chain::client::Superseded>()),
         "{error:#}"
     );
+    assert!(started.elapsed() >= lag, "said superseded within the lag");
     assert!(
         started.elapsed() < wait / 2,
         "it was said superseded only at its deadline"
@@ -841,6 +862,110 @@ async fn a_send_whose_nonce_another_took_is_said_superseded_before_its_deadline(
             .map(|(to, nonce, ..)| (*to, *nonce))
             .collect::<Vec<_>>(),
         vec![(None, 0)]
+    );
+}
+
+/// On a chain of fast blocks, a valuation that landed is not said not to
+/// have gone out while its receipt lags some seconds, however many blocks
+/// that is: a tenth of a second a block, four seconds behind.
+#[tokio::test]
+async fn a_landed_send_whose_receipt_lags_seconds_of_fast_blocks_is_seen_to_land() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(100))).await;
+    let (client, keeper) = the_keeper_on(&url, Duration::from_secs(20)).await;
+    let lagging = async {
+        until_pooled(&pool, 1).await;
+        pool.lock().unwrap().lagging_receipts = true;
+        while mined(&pool, keeper).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Forty blocks.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        pool.lock().unwrap().lagging_receipts = false;
+    };
+    let (outcome, ()) = tokio::join!(value(&client, keeper, vault(1)), lagging);
+    assert_eq!(mined(&pool, keeper).len(), 1, "it landed");
+    assert_eq!(outcome, Outcome::Done, "a landed valuation said not sent");
+}
+
+/// A valuation whose caller stopped waiting while its nonce is used and its
+/// receipt hasn't come may have landed: the same call isn't sent again
+/// until its receipt is found, and is sent again once it is.
+#[tokio::test]
+async fn a_send_that_may_still_land_is_not_sent_again_until_its_receipt_is_found() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(100))).await;
+    let (client, keeper) = the_keeper_on(&url, Duration::from_secs(2)).await;
+    let lagging = async {
+        until_pooled(&pool, 1).await;
+        pool.lock().unwrap().lagging_receipts = true;
+    };
+    let (first, ()) = tokio::join!(value(&client, keeper, vault(1)), lagging);
+    assert_eq!(first, Outcome::NotSent);
+    assert_eq!(mined(&pool, keeper).len(), 1, "it landed");
+    let handed = pool.lock().unwrap().handed.len();
+    // Decided again while it may still land: nothing goes out.
+    assert_eq!(value(&client, keeper, vault(1)).await, Outcome::NotSent);
+    assert_eq!(
+        pool.lock().unwrap().handed.len(),
+        handed,
+        "sent again while the first may still land"
+    );
+    // Its receipt comes: the call is the keeper's to send again.
+    pool.lock().unwrap().lagging_receipts = false;
+    let mut again = Outcome::NotSent;
+    for _ in 0..100 {
+        again = value(&client, keeper, vault(1)).await;
+        if again != Outcome::NotSent {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(again, Outcome::Done);
+    assert_eq!(mined(&pool, keeper).len(), 2);
+}
+
+/// A send whose nonce another transaction took, still unknown when its
+/// caller stopped waiting, holds its call back only until the chain shows
+/// it superseded: then the call is sent again, and lands once.
+#[tokio::test]
+async fn a_held_send_whose_nonce_another_took_is_sent_again_once_shown_superseded() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(50))).await;
+    pool.lock().unwrap().never_mines.insert(vault(1));
+    let (client, keeper) = the_keeper_with_receipts_lagging_on(
+        &url,
+        Duration::from_secs(1),
+        Some(Duration::from_secs(3)),
+    )
+    .await;
+    let (first, ()) = tokio::join!(value(&client, keeper, vault(1)), async {
+        until_pooled(&pool, 1).await;
+        pool.lock().unwrap().external(keeper);
+    });
+    assert_eq!(first, Outcome::NotSent);
+    let handed = pool.lock().unwrap().handed.len();
+    assert_eq!(value(&client, keeper, vault(1)).await, Outcome::NotSent);
+    assert_eq!(
+        pool.lock().unwrap().handed.len(),
+        handed,
+        "sent again too soon"
+    );
+    pool.lock().unwrap().never_mines.clear();
+    let started = std::time::Instant::now();
+    let mut again = Outcome::NotSent;
+    while started.elapsed() < Duration::from_secs(15) {
+        again = value(&client, keeper, vault(1)).await;
+        if again != Outcome::NotSent {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(again, Outcome::Done);
+    assert_eq!(
+        mined(&pool, keeper)
+            .iter()
+            .map(|(to, nonce, ..)| (*to, *nonce))
+            .collect::<Vec<_>>(),
+        vec![(None, 0), (Some(vault(1)), 1)],
+        "the valuation landed twice, or not after the other send"
     );
 }
 

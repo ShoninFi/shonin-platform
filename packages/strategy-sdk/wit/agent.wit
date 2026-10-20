@@ -72,6 +72,15 @@ interface transfers {
         amount: u64,
     }
 
+    /// The vault's accounts as one read found them.
+    record balances-read {
+        /// Each account read, and what it holds.
+        read: list<balance>,
+        /// Each account whose read failed: what it holds is unknown, not
+        /// nothing, so `read` adds up to less than the vault is worth.
+        unread: list<account>,
+    }
+
     /// Where a move stopped short, and why.
     record partial-move {
         /// The vault's own account the money reached on the way, and is in
@@ -106,8 +115,12 @@ interface transfers {
     /// Send a station's idle dollars over a declared bridge to the same
     /// station on another chain.
     bridge: async func(name: string, source-chain: string, destination-chain: string, amount: u64) -> moved;
-    /// What each of the vault's accounts holds now.
+    /// What each of the vault's accounts holds now. An account whose read
+    /// failed is left out; `read-balances` says which.
     balances: async func() -> list<balance>;
+    /// What each of the vault's accounts holds now, and which of them could
+    /// not be read.
+    read-balances: async func() -> balances-read;
 }
 
 /// What the vault tells the agent about itself.
