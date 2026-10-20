@@ -8,10 +8,11 @@
 //! Sequence: as in the payment that is waited for, the build service exits
 //! after two idle seconds. Each run starts with where payments were read to
 //! and when to read that chain again as the last run left them. After the
-//! first, a run started an hour before the chain's time (woken for
-//! something else) exits without reading the chain, the wait kept as it
-//! was; a run started at the time kept, as the waker would, reads it again
-//! and exits, and the wait kept is twice the last.
+//! first, a run started a quarter of an hour before the chain's time
+//! (woken for something else), with a wait as long kept, exits without
+//! reading the chain, what was kept left as it was; a run started at the
+//! time kept, as the waker would, reads it again and exits, and the wait
+//! kept is twice the last.
 
 mod black_box;
 
@@ -99,12 +100,21 @@ async fn a_chain_whose_payments_wait_is_read_again_ever_more_rarely_across_start
                 .unwrap()
                 .as_secs()
         };
-        let later = now() + 3_600;
+        // The longest wait, ending a quarter of an hour on: a time no
+        // further off than its wait is kept as it is.
+        let longest = 900;
+        let later = now() + longest;
         let mut early_kept = last.kept.clone();
-        early_kept[0].1 = early_kept[0].1.replace(
-            &format!("\"retry_at\":{}", last.retry_at),
-            &format!("\"retry_at\":{later}"),
-        );
+        early_kept[0].1 = early_kept[0]
+            .1
+            .replace(
+                &format!("\"retry_at\":{}", last.retry_at),
+                &format!("\"retry_at\":{later}"),
+            )
+            .replace(
+                &format!("\"wait\":{}", last.wait),
+                &format!("\"wait\":{longest}"),
+            );
         let early = run(&format!("run {again}, started early"), &early_kept).await;
         assert!(
             !early.read,
@@ -112,7 +122,7 @@ async fn a_chain_whose_payments_wait_is_read_again_ever_more_rarely_across_start
         );
         assert_eq!(
             (early.wait, early.retry_at),
-            (last.wait, later),
+            (longest, later),
             "run {again}, started early"
         );
         tokio::time::sleep(Duration::from_secs(last.retry_at.saturating_sub(now()))).await;

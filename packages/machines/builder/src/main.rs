@@ -43,7 +43,9 @@
 //! wait twice the last up to a cap, and the waits are kept with where
 //! payments were read to, so a start goes on from the last one rather than
 //! from the first: a chain whose payments can't be read for long wakes the
-//! build service ever more rarely, up for one idle spell each time.
+//! build service ever more rarely, up for one idle spell each time. A time
+//! kept further off than its wait is brought in to it at a start, so a
+//! clock that was ahead never holds a chain past the cap.
 
 mod build;
 // The same as the reviewer's: what a machine that runs on demand keeps off
@@ -1683,8 +1685,14 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
 /// The chains whose reads were failing when the last run ended, as kept in
 /// `file`: none if there are none. Only when to read them again is lost
 /// with a file that can't be read, so it doesn't stop the start.
+///
+/// A time to read a chain again is never further off than its wait from
+/// now: one kept further out (written by a clock that was ahead, or read by
+/// one that has stepped back) is brought in to it, so no chain goes unread
+/// longer than [`STALLED_LONGEST_WAIT`] whatever the clocks did.
 fn stalls_kept(file: &Path) -> BTreeMap<String, Stalled> {
-    read_kept(file)
+    let now = unix_now();
+    let mut kept: BTreeMap<String, Stalled> = read_kept(file)
         .unwrap_or_else(|error| {
             tracing::warn!(
                 error = format!("{error:#}"),
@@ -1692,7 +1700,12 @@ fn stalls_kept(file: &Path) -> BTreeMap<String, Stalled> {
             );
             None
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for stalled in kept.values_mut() {
+        let wait = stalled.wait.min(STALLED_LONGEST_WAIT.as_secs());
+        stalled.retry_at = stalled.retry_at.min(now + wait);
+    }
+    kept
 }
 
 /// Keep the chains whose reads are failing, and when each is read again, so
@@ -4150,6 +4163,51 @@ mod tests {
         // A file that can't be read loses only the times: the start goes on.
         std::fs::write(&service.stalls_file, b"{").unwrap();
         assert!(stalls_kept(&service.stalls_file).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A time to read a chain again kept further off than its wait (written
+    /// by a run whose clock was ahead) is brought in to the wait at load, so
+    /// the wake plan never holds a chain's reads, and its paid jobs, past
+    /// the longest wait; one within its wait is kept as it was.
+    #[tokio::test]
+    async fn a_kept_time_to_read_a_chain_again_is_never_further_off_than_its_wait() {
+        let dir = a_scratch("stall-skew");
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        let service = a_service(&dir, None);
+        let now = unix_now();
+        // Written by a run whose clock was a day ahead: a 900 s wait.
+        std::fs::write(
+            &service.stalls_file,
+            format!(
+                r#"{{"8453":{{"retry_at":{},"paused":false,"wait":900}}}}"#,
+                now + 86_400 + 900
+            ),
+        )
+        .unwrap();
+        let kept = stalls_kept(&service.stalls_file);
+        let mut unread = Unread::default();
+        unread.waiting("8453".to_string(), kept.get("8453").copied(), now);
+        // A second may pass between the two readings of the clock.
+        assert!(
+            unread.retry_at.unwrap() <= now + 1 + STALLED_LONGEST_WAIT.as_secs(),
+            "the plan's retry time is {} s out, the cap {} s",
+            unread.retry_at.unwrap() - now,
+            STALLED_LONGEST_WAIT.as_secs()
+        );
+        assert_eq!(kept["8453"].wait, 900, "the wait itself is kept");
+        // One within its wait is kept as it was.
+        let within = Stalled {
+            retry_at: now + 600,
+            paused: true,
+            wait: 900,
+        };
+        std::fs::write(
+            &service.stalls_file,
+            serde_json::to_vec(&BTreeMap::from([("8453", within)])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stalls_kept(&service.stalls_file)["8453"], within);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
