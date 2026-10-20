@@ -39,7 +39,11 @@
 //! once that record gives every payment in it, which is then admitted from
 //! the record; otherwise that chain's payments wait, said at warn, and the
 //! chain is left out of the wake plan meanwhile, so it neither keeps the
-//! build service up nor wakes it for nothing.
+//! build service up nor wakes it for nothing. It is read again later, each
+//! wait twice the last up to a cap, and the waits are kept with where
+//! payments were read to, so a start goes on from the last one rather than
+//! from the first: a chain whose payments can't be read for long wakes the
+//! build service ever more rarely, up for one idle spell each time.
 
 mod build;
 // The same as the reviewer's: what a machine that runs on demand keeps off
@@ -330,6 +334,9 @@ struct Service {
     /// The chains, by chain id, whose last turn of reading payments failed,
     /// and when each is read again (see [`Stalled`]).
     payments_stalled: std::sync::Mutex<BTreeMap<String, Stalled>>,
+    /// Where those are kept, so a restart waits on from the last wait rather
+    /// than from the first.
+    stalls_file: PathBuf,
     /// When the build service last had anything to do.
     idle: cloud::Idle,
     /// The work loops' turns, closed before the state is written at exit.
@@ -800,15 +807,24 @@ async fn main() -> Result<()> {
     let queue_file = args.store.join("queue.json");
     let archives = args.store.join("archives");
     let payments_file = args.store.join("payments.json");
+    let stalls_file = args.store.join("stalls.json");
     // Kept off the machine, what was kept is brought back first, the
     // archives of the jobs still unfinished with it.
     if let Some(internal) = &internal {
-        restore(internal, &queue_file, &payments_file, &archives).await?;
+        restore(
+            internal,
+            &queue_file,
+            &payments_file,
+            &stalls_file,
+            &archives,
+        )
+        .await?;
     }
     let mut queue: Queue = read_kept::<Written>(&queue_file)?
         .map(Queue::from)
         .unwrap_or_default();
     let payments_read: BTreeMap<String, u64> = read_kept(&payments_file)?.unwrap_or_default();
+    let payments_stalled = stalls_kept(&stalls_file);
 
     let network = args.chain_args.network.to_string();
     let confirmations = targets
@@ -868,7 +884,8 @@ async fn main() -> Result<()> {
             .map(|launched| launched.attestation.clone()),
         internal,
         payments_seen: Mutex::new(BTreeMap::new()),
-        payments_stalled: Default::default(),
+        payments_stalled: std::sync::Mutex::new(payments_stalled),
+        stalls_file,
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
         turns: cloud::Turns::default(),
         sweeping: std::sync::Mutex::new(None),
@@ -973,16 +990,21 @@ async fn main() -> Result<()> {
 }
 
 /// Bring back what was kept off the machine into the files the build
-/// service reads at start: the queue, where payments were read to, and the
-/// archive of every job the queue holds unfinished. What is not kept there
-/// leaves the file as it is.
+/// service reads at start: the queue, where payments were read to, the
+/// chains whose reads are failing, and the archive of every job the queue
+/// holds unfinished. What is not kept there leaves the file as it is.
 async fn restore(
     internal: &cloud::Internal,
     queue_file: &Path,
     payments_file: &Path,
+    stalls_file: &Path,
     archives: &Path,
 ) -> Result<()> {
-    for (name, file) in [(QUEUE, queue_file), (PAYMENTS, payments_file)] {
+    for (name, file) in [
+        (QUEUE, queue_file),
+        (PAYMENTS, payments_file),
+        (STALLS, stalls_file),
+    ] {
         if let Some(bytes) = internal.read_state(name).await? {
             write_atomically(file, &bytes)
                 .with_context(|| format!("bringing back {}", file.display()))?;
@@ -1014,10 +1036,11 @@ async fn restore(
     Ok(())
 }
 
-/// The names the queue and where payments were read to are kept under off
-/// the machine.
+/// The names the queue, where payments were read to, and the chains whose
+/// reads are failing are kept under off the machine.
 const QUEUE: &str = "queue";
 const PAYMENTS: &str = "payments";
+const STALLS: &str = "stalls";
 
 /// The name a job's archive is kept under off the machine.
 fn archive_name(id: &str) -> String {
@@ -1113,7 +1136,11 @@ impl Unread {
             self.now = true;
             return;
         };
-        if !stalled.paused && stalled.retry_at <= now + STALLED_KEEPS_UP.as_secs() {
+        // Its time to be read again has come, and the read is not done:
+        // a start the plan's retry time woke reads it before it goes idle.
+        if stalled.retry_at <= now
+            || (!stalled.paused && stalled.retry_at <= now + STALLED_KEEPS_UP.as_secs())
+        {
             self.now = true;
         }
         self.stalled.insert(chain_id);
@@ -1583,7 +1610,14 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
     // Where payments were last noted read through, for the wake plan.
     let mut noted = None;
     let chain_id = on.client.chain_id.to_string();
+    // A chain whose reads were failing when the last run ended is read again
+    // when it said, and waits on from the last wait if it fails again.
     let mut wait = STALLED_FIRST_WAIT;
+    if let Some(stalled) = service.stalled_on(&chain_id) {
+        wait = stalled.next_wait();
+        let until = stalled.retry_at.saturating_sub(unix_now());
+        tokio::time::sleep(Duration::from_secs(until).min(STALLED_LONGEST_WAIT)).await;
+    }
     loop {
         let Some(turn) = service.turns.turn().await else {
             return;
@@ -1595,14 +1629,15 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
         }
         drop(turn);
         let Err(error) = read else {
-            if service
+            let cleared = service
                 .payments_stalled
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&chain_id)
-                .is_some()
-            {
+                .is_some();
+            if cleared {
                 tracing::info!(%chain, "payments on this chain are read again");
+                keep_stalls(&service).await;
             }
             wait = STALLED_FIRST_WAIT;
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1618,8 +1653,10 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
                 Stalled {
                     retry_at: unix_now() + wait.as_secs(),
                     paused: halted.is_some(),
+                    wait: wait.as_secs(),
                 },
             );
+        keep_stalls(&service).await;
         match halted {
             Some(halted) => tracing::warn!(
                 %chain,
@@ -1643,18 +1680,71 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
     }
 }
 
+/// The chains whose reads were failing when the last run ended, as kept in
+/// `file`: none if there are none. Only when to read them again is lost
+/// with a file that can't be read, so it doesn't stop the start.
+fn stalls_kept(file: &Path) -> BTreeMap<String, Stalled> {
+    read_kept(file)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "when to read the chains whose reads were failing again is not known: read them now"
+            );
+            None
+        })
+        .unwrap_or_default()
+}
+
+/// Keep the chains whose reads are failing, and when each is read again, so
+/// a restart waits on from there. One not kept is said and kept with the
+/// next change; meanwhile a restart reads that chain at once.
+async fn keep_stalls(service: &Service) {
+    let bytes = {
+        let stalled = service
+            .payments_stalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        serde_json::to_vec(&*stalled)
+    };
+    let kept = match bytes {
+        Ok(bytes) => service.keep(&service.stalls_file, STALLS, &bytes).await,
+        Err(error) => Err(error.into()),
+    };
+    match kept {
+        Ok(()) => {}
+        // Before the blessing nothing has changed that the API would keep.
+        Err(error) if error.is::<cloud::NotBlessed>() => tracing::debug!("{error}"),
+        Err(error) => tracing::warn!(
+            error = format!("{error:#}"),
+            "when to read the chains whose reads are failing again could not be written down"
+        ),
+    }
+}
+
 /// A chain whose last turn of reading payments failed: it is read again at
 /// `retry_at` (unix seconds), sooner after a first failure, later after
-/// each next one, never later than [`STALLED_LONGEST_WAIT`]. While a payment
-/// may wait unread there, the chain gives the wake plan that time, so the
-/// waker starts the build service again by then if it has exited.
-#[derive(Clone, Copy, Debug)]
+/// each next one, never later than [`STALLED_LONGEST_WAIT`], across starts
+/// too. While a payment may wait unread there, the chain gives the wake plan
+/// that time, so the waker starts the build service again by then if it has
+/// exited.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Stalled {
     retry_at: u64,
     /// Whether the registry's record could not prove which payments blocks
     /// whose logs could not be read hold ([`Halted`]), rather than a read
     /// that failed: that is not waited for with the build service kept up.
     paused: bool,
+    /// The wait, in seconds, that `retry_at` ends.
+    #[serde(default)]
+    wait: u64,
+}
+
+impl Stalled {
+    /// The wait after the next failed read: twice this one, never more than
+    /// [`STALLED_LONGEST_WAIT`], never less than [`STALLED_FIRST_WAIT`].
+    fn next_wait(&self) -> Duration {
+        (Duration::from_secs(self.wait) * 2).clamp(STALLED_FIRST_WAIT, STALLED_LONGEST_WAIT)
+    }
 }
 
 /// The wait before reading payments again on a chain whose last turn
@@ -3612,6 +3702,7 @@ mod tests {
             internal,
             payments_seen: Mutex::new(BTreeMap::new()),
             payments_stalled: Default::default(),
+            stalls_file: dir.join("store/stalls.json"),
             idle: cloud::Idle::new(None),
             turns: cloud::Turns::default(),
             sweeping: std::sync::Mutex::new(None),
@@ -3716,6 +3807,7 @@ mod tests {
             service.internal.as_ref().unwrap(),
             &service.queue_file,
             &service.payments_file,
+            &service.stalls_file,
             &service.archives,
         )
         .await
@@ -3784,6 +3876,7 @@ mod tests {
             service.internal.as_ref().unwrap(),
             &service.queue_file,
             &service.payments_file,
+            &service.stalls_file,
             &service.archives,
         )
         .await
@@ -3830,6 +3923,14 @@ mod tests {
             .keep(&service.payments_file, PAYMENTS, br#"{"base":42}"#)
             .await
             .unwrap();
+        service
+            .keep(
+                &service.stalls_file,
+                STALLS,
+                br#"{"8453":{"retry_at":7,"paused":true,"wait":600}}"#,
+            )
+            .await
+            .unwrap();
         {
             let mut queue = service.queue.lock().await;
             queue.next_id = 8801;
@@ -3849,6 +3950,7 @@ mod tests {
             restarted.internal.as_ref().unwrap(),
             &restarted.queue_file,
             &restarted.payments_file,
+            &restarted.stalls_file,
             &restarted.archives,
         )
         .await
@@ -3866,6 +3968,10 @@ mod tests {
         assert_eq!(
             std::fs::read(&restarted.payments_file).unwrap(),
             br#"{"base":42}"#
+        );
+        assert_eq!(
+            stalls_kept(&restarted.stalls_file)["8453"].next_wait(),
+            Duration::from_secs(900)
         );
         let _ = std::fs::remove_dir_all(&before);
         let _ = std::fs::remove_dir_all(&after);
@@ -3920,6 +4026,7 @@ mod tests {
             Some(Stalled {
                 retry_at: now + 900,
                 paused: false,
+                wait: 900,
             }),
             now,
         );
@@ -3941,7 +4048,13 @@ mod tests {
     #[test]
     fn a_payment_behind_a_failed_read_is_work_in_hand_only_while_it_is_read_again_soon() {
         let now = 1_000_000;
-        let stalled = |retry_at: u64, paused: bool| Some(Stalled { retry_at, paused });
+        let stalled = |retry_at: u64, paused: bool| {
+            Some(Stalled {
+                retry_at,
+                paused,
+                wait: retry_at - now,
+            })
+        };
         let weighed = |chains: &[Option<Stalled>]| {
             let mut unread = Unread::default();
             for (at, stalled) in chains.iter().enumerate() {
@@ -3965,6 +4078,79 @@ mod tests {
         let unread = weighed(&[stalled(now + 5, true)]);
         assert!(!unread.now, "{unread:?}");
         assert_eq!(unread.retry_at, Some(now + 5));
+    }
+
+    /// A chain whose time to be read again has come is work in hand until it
+    /// is read, even one whose record proves nothing: a start the plan's
+    /// retry time woke reads it before it goes idle, and goes idle after.
+    #[test]
+    fn a_chain_due_to_be_read_again_is_read_before_the_build_service_goes_idle() {
+        let now = 1_000_000;
+        for (retry_at, paused, busy) in [
+            (now, true, true),
+            (now - 30, true, true),
+            (now + 1, true, false),
+            (now - 30, false, true),
+            (now + 600, false, false),
+        ] {
+            let mut unread = Unread::default();
+            let stalled = Stalled {
+                retry_at,
+                paused,
+                wait: 600,
+            };
+            unread.waiting("998".to_string(), Some(stalled), now);
+            assert_eq!(unread.now, busy, "{stalled:?}");
+            assert_eq!(unread.retry_at, Some(retry_at));
+        }
+    }
+
+    /// The wait before a chain is read again goes on from the last one kept,
+    /// doubling to its cap, rather than starting again from the first: a
+    /// chain stalled for long wakes the build service ever more rarely.
+    #[tokio::test]
+    async fn a_chain_s_wait_to_be_read_again_goes_on_across_a_restart() {
+        let dir = a_scratch("stalls-kept");
+        let service = a_service(&dir, None);
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        let stalled = Stalled {
+            retry_at: 1_000_300,
+            paused: true,
+            wait: 300,
+        };
+        service
+            .payments_stalled
+            .lock()
+            .unwrap()
+            .insert("8453".to_string(), stalled);
+        keep_stalls(&service).await;
+        let kept = stalls_kept(&service.stalls_file);
+        assert_eq!(kept, BTreeMap::from([("8453".to_string(), stalled)]));
+        assert_eq!(kept["8453"].next_wait(), Duration::from_secs(600));
+        // Doubling, to the cap and no further, from wherever a run left it.
+        let mut wait = STALLED_FIRST_WAIT;
+        let mut waits = vec![];
+        for _ in 0..10 {
+            waits.push(wait.as_secs());
+            wait = Stalled {
+                retry_at: 0,
+                paused: true,
+                wait: wait.as_secs(),
+            }
+            .next_wait();
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 320, 640, 900, 900]);
+        // A record from before the wait was kept starts from the first.
+        let older: Stalled = serde_json::from_str(r#"{"retry_at":7,"paused":false}"#).unwrap();
+        assert_eq!(older.next_wait(), STALLED_FIRST_WAIT);
+        // Read again: nothing is kept.
+        service.payments_stalled.lock().unwrap().clear();
+        keep_stalls(&service).await;
+        assert!(stalls_kept(&service.stalls_file).is_empty());
+        // A file that can't be read loses only the times: the start goes on.
+        std::fs::write(&service.stalls_file, b"{").unwrap();
+        assert!(stalls_kept(&service.stalls_file).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The build service is busy with a paid job waiting, being reviewed or
