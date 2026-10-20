@@ -327,8 +327,21 @@ fn sends_asked(node: &Shared) -> usize {
         .count()
 }
 
+/// Revokes the node was asked to estimate or take.
+fn revokes_asked(node: &Shared) -> usize {
+    node.lock()
+        .unwrap()
+        .asked
+        .iter()
+        .filter(|(method, call)| {
+            method != "eth_call"
+                && call.is_some_and(|(_, selector)| selector == IStation::revokeKeyCall::SELECTOR)
+        })
+        .count()
+}
+
 #[tokio::test]
-async fn read_from_an_observation_a_revoke_the_station_would_refuse_is_never_tried() {
+async fn a_revoke_the_station_would_refuse_is_never_tried_whichever_way_the_chain_is_read() {
     let key = Address::repeat_byte(0x77);
     let node = stand_in::node(BETWEEN_SLOTS);
     an_open_vault_with_a_key(&node, key);
@@ -356,10 +369,10 @@ async fn read_from_an_observation_a_revoke_the_station_would_refuse_is_never_tri
         &mut memory,
     )
     .await;
-    let asked_live = sends_asked(&node);
-    assert!(
-        asked_live >= 1,
-        "the active path tries the revoke as before"
+    assert_eq!(
+        revokes_asked(&node),
+        0,
+        "the active path tried a revoke the station refuses"
     );
     // The first look holds what the active path read; the gate's own views
     // are read of the chain that once, and are in every look after.

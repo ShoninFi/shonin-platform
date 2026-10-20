@@ -88,7 +88,7 @@ pub struct Node {
     /// request reaches a node behind, which has no such block.
     pub numbers_behind: u64,
     /// Every request it was asked, by method, with the contract and
-    /// selector of each plain `eth_call`.
+    /// selector of each plain `eth_call`, each estimate and each send.
     pub asked: Vec<(String, Option<(Address, Selector)>)>,
 }
 
@@ -131,9 +131,11 @@ fn answer(node: &Shared, request: &Value) -> Value {
     let method = request["method"].as_str().unwrap_or_default();
     let params = &request["params"];
     let mut node = node.lock().unwrap();
-    let plain_call = (method == "eth_call"
+    let plain_call = ((method == "eth_call"
         && params.get(2).is_none_or(Value::is_null)
         && params.get(3).is_none_or(Value::is_null)
+        || method == "eth_estimateGas"
+        || method == "eth_sendTransaction")
         && params[0].get("to").is_some_and(|to| !to.is_null()))
     .then(|| {
         let (to, data) = tx_fields(params);
@@ -174,7 +176,27 @@ fn answer(node: &Shared, request: &Value) -> Value {
             Ok(serde_json::to_value(block).unwrap())
         }
         "eth_gasPrice" | "eth_maxPriorityFeePerGas" => Ok(json!("0x3b9aca00")),
-        "eth_estimateGas" => Ok(json!("0x5208")),
+        // A call it refuses is refused at its estimate, as a node refuses
+        // one that would revert; anything else costs 21,000.
+        "eth_estimateGas" => {
+            let refused = params[0]["to"]
+                .as_str()
+                .and_then(|to| to.parse::<Address>().ok())
+                .zip(
+                    params[0]
+                        .get("input")
+                        .or_else(|| params[0].get("data"))
+                        .and_then(Value::as_str)
+                        .and_then(|hex| alloy::hex::decode(hex).ok())
+                        .filter(|data| data.len() >= 4),
+                )
+                .and_then(|(to, data)| node.refused.get(&(to, selector_of(&data))));
+            match refused.map(String::as_str) {
+                None => Ok(json!("0x5208")),
+                Some("") => Err("execution reverted".to_string()),
+                Some(reason) => Err(format!("execution reverted: {reason}")),
+            }
+        }
         "eth_getLogs" => {
             let block = |name: &str| {
                 u64::from_str_radix(

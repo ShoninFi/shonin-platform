@@ -457,6 +457,13 @@ pub async fn set_up_public(
 ) -> Result<SolanaDeployments> {
     let keys = client.keys()?;
     let ids = programs_in_place(client).await?;
+    // A public cluster's dollar is one nobody here mints: until it is there,
+    // nothing is sent, not even the roles' coin.
+    if let Dollar::Public(mint) = &settings.mint
+        && client.account(mint).await?.is_none()
+    {
+        bail!("the dollar's mint {mint} is not on {}", client.key);
+    }
     // The slot the first run began in is where an indexer starts reading.
     let earlier = std::fs::read_to_string(file)
         .ok()
