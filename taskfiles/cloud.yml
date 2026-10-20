@@ -467,7 +467,7 @@ tasks:
           --tags=shonin-testnet-market \
           --service-account="{{.TESTNET_MARKET_ACCOUNT}}" --scopes=cloud-platform \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/testnet-market/startup.sh" \
-          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}~enable-oslogin=TRUE"
+          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-testnet-market-solana-secret={{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}~enable-oslogin=TRUE"
 
   redeploy:testnet-market:
     desc: "Point testnet-market's VM at a newly pushed testnet-market image (and the current startup script), and restart it (NETWORK=testnet, TAG= the commit by default)"
@@ -487,7 +487,7 @@ tasks:
         gcloud compute instances add-metadata "shonin-testnet-market-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/testnet-market/startup.sh" \
-          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}"
+          --metadata="^~^shonin-testnet-market-image={{.GCP_REGISTRY}}/testnet-market@${market}~shonin-testnet-market-secret={{.GCP_SECRET_TESTNET_MARKET_KEY}}~shonin-testnet-market-solana-secret={{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}"
         status=$(gcloud compute instances describe "shonin-testnet-market-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
         case "$status" in
           TERMINATED|STOPPED|SUSPENDED) gcloud compute instances start "shonin-testnet-market-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
@@ -527,9 +527,9 @@ tasks:
             echo "secret $secret does not exist yet: run task cloud:secrets, then this again"
           fi
         done
-        # testnet-market's VM reads its own key and the paid endpoints, and
-        # no other secret.
-        for secret in "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" "{{.GCP_SECRET_TESTNET_RPC}}"; do
+        # testnet-market's VM reads its own two keys and the paid endpoints,
+        # and no other secret.
+        for secret in "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" "{{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_RPC}}"; do
           if gcloud secrets describe "$secret" --project="$project" >/dev/null 2>&1; then
             gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
               --member="serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
@@ -698,7 +698,7 @@ tasks:
         echo "uploaded the keeper's keys ($address, and $solana_address on Solana devnet), the tunnel's token and $(printf '%s' "$rpc" | grep -c . || true) paid endpoint(s); the services VM reads them at its next boot"
 
   secrets:testnet-market:
-    desc: "Upload testnet-market's key (derived here: account 101 of the EVM mnemonic, never the mnemonic) to Secret Manager, through stdin, checked first against the mirror feeds it posts to, and let its VM read it (NETWORK=testnet)"
+    desc: "Upload testnet-market's keys (derived here: account 101 of the EVM mnemonic, checked first against the mirror feeds it posts to, and key 111 of the Solana mnemonic; never the mnemonics) to Secret Manager, through stdin, and let its VM read them (NETWORK=testnet)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
@@ -733,6 +733,19 @@ tasks:
         gcloud secrets add-iam-policy-binding "{{.GCP_SECRET_TESTNET_MARKET_KEY}}" --project="$project" \
           --member="serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
         echo "uploaded testnet-market's key ($address); its VM reads it at its next boot"
+        # Its Solana keypair, key 111 of the Solana mnemonic, when it is set.
+        if [ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]; then
+          solana_address=$({{.DEVNET}} solana-keypair --role market --out "$scratch/market-solana.json")
+          gcloud secrets describe "{{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}" --project="$project" >/dev/null 2>&1 ||
+            gcloud secrets create "{{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}" --project="$project" --replication-policy=automatic
+          tr -d '\n' <"$scratch/market-solana.json" |
+            gcloud secrets versions add "{{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}" --project="$project" --data-file=-
+          gcloud secrets add-iam-policy-binding "{{.GCP_SECRET_TESTNET_MARKET_SOLANA_KEY}}" --project="$project" \
+            --member="serviceAccount:{{.TESTNET_MARKET_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
+          echo "uploaded testnet-market's Solana key ($solana_address)"
+        else
+          echo "SHONIN_TESTNET_SOLANA_MNEMONIC is empty: no Solana key uploaded, and the market keeps no Solana pool"
+        fi
 
   drain:
     desc: "Wait until the builder or the reviewer holds nothing a new image or a new root would lose: no paid job unfinished in the API's queue and, for the reviewer, no review waiting to be posted (NAME=builder|reviewer, NETWORK=testnet; DRAIN_MINUTES=60). Run before replacing either image or the executor"

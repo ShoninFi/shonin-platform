@@ -78,6 +78,8 @@ pub struct Trader {
     pub router: Address,
     pub dollar: Address,
     pub dollar_decimals: u8,
+    /// The dollar's symbol, as its token names itself.
+    pub dollar_symbol: String,
     pub max_feed_age: u64,
     pub band_bps: u16,
     pub listed: BTreeMap<String, Listed>,
@@ -98,6 +100,7 @@ impl Trader {
             .await?
             .exitBandBps;
         let dollar_decimals = IStockToken::new(dollar, provider).decimals().call().await?;
+        let dollar_symbol = IStockToken::new(dollar, provider).symbol().call().await?;
         let mut listed = BTreeMap::new();
         for stock in d.stocks().call().await? {
             let token = IStockToken::new(stock.token, provider);
@@ -128,6 +131,7 @@ impl Trader {
             router,
             dollar,
             dollar_decimals,
+            dollar_symbol,
             max_feed_age,
             band_bps,
             listed,
@@ -320,6 +324,7 @@ mod tests {
             router: Address::repeat_byte(5),
             dollar: Address::repeat_byte(6),
             dollar_decimals: 6,
+            dollar_symbol: "USDG".into(),
             max_feed_age: 4 * 86_400,
             band_bps: 500,
             listed,

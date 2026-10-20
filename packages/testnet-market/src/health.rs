@@ -56,6 +56,8 @@ pub struct ChainHealth {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Health {
     pub account: String,
+    /// The Solana account, when Solana is kept.
+    pub solana_account: Option<String>,
     /// Seconds between rounds.
     pub every: u64,
     pub rounds: u64,

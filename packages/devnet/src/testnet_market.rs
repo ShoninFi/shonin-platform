@@ -23,7 +23,21 @@
 //! - `driver`: the Robinhood driver deployed by the admin from the listing
 //!   resolved against the recorded mirrors, recorded in
 //!   `robinhood-driver-evm-<chain>.json`, and with `--propose` proposed to
-//!   the chain's registry as `robinhood`.
+//!   the chain's registry under the name `config/drivers.toml` lists for
+//!   that chain: `robinhood` on Robinhood Chain, `uniswap-base` on Base.
+//!
+//! On Solana devnet the market's own Solana account
+//! ([`testnet_market::SOLANA_MARKET_INDEX`]) keeps Orca's pool:
+//!
+//! - `gas`: the account topped up to `--sol`, or the funding file's
+//!   `market` amount, from the deployer (Solana's funder), never past its
+//!   reserve. Its SOL is also the SOL side of what it trades.
+//! - `inventory`: what it holds, and the faucet to tap: its USDC is
+//!   Circle's devnet USDC, which only Circle's faucet gives.
+//! - `pools`: the pool the Orca driver lists created at Pyth's price if it
+//!   isn't there, walked to Pyth's price with the account's own tokens, and
+//!   the account's seed opened across it with `--orca-usdc` of USDC and as
+//!   much SOL (once: a seed already open is left alone).
 
 use std::path::Path;
 use std::time::Duration;
@@ -138,6 +152,11 @@ pub struct Options {
     pub usdc: f64,
     pub pool_tokens: f64,
     pub propose: bool,
+    /// The market's Solana account's SOL, instead of the funding file's
+    /// amount.
+    pub sol: Option<f64>,
+    /// The USDC the Solana seed opens with.
+    pub orca_usdc: f64,
     /// Every endpoint must be a local fork (anvil): nothing reaches a
     /// public chain.
     pub on_fork: bool,
@@ -212,6 +231,14 @@ pub async fn run(
     println!("testnet-market's account: {market:?}");
     let mut failed = Vec::new();
     for (key, config) in chains {
+        if key.kind == ChainKind::Solana {
+            println!("{} ({key})", config.label);
+            if let Err(error) = solana(network, &key, &config, &funding, &steps, options).await {
+                println!("  failed: {error:#}");
+                failed.push(format!("{key}"));
+            }
+            continue;
+        }
         let Some(venue) = key.evm_chain_id().and_then(listings::test_venue) else {
             continue;
         };
@@ -260,6 +287,124 @@ pub async fn run(
     }
     if !failed.is_empty() {
         bail!("testnet-market-setup failed: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// The market's steps on a Solana cluster (see the module's documentation).
+async fn solana(
+    network: NetworkName,
+    key: &ChainKey,
+    config: &ChainConfig,
+    funding: &Funding,
+    steps: &[Step],
+    options: &Options,
+) -> Result<()> {
+    use chain::solana::Signer;
+    use testnet_market::orca;
+    let phrase = crate::solana::testnet_mnemonic()?;
+    let market = crate::solana::keypair_from_mnemonic(&phrase, crate::devnet_keys::MARKET)?;
+    let who = market.pubkey();
+    let client = chain::connect_solana(network, key, config).await?;
+    if options.on_fork {
+        println!(
+            "  skipped: --on-fork sends nothing to a public chain, and this cluster is not a fork"
+        );
+        return Ok(());
+    }
+    println!("  testnet-market's Solana account: {who}");
+    let sol = |lamports: u64| format!("{:.4} SOL", lamports as f64 / 1e9);
+    for step in steps {
+        match step {
+            Step::Feeds | Step::Driver => {
+                println!(
+                    "  {step:?}: nothing on Solana (Pyth's price is on the cluster; the Orca driver is set up by solana-setup)"
+                );
+            }
+            Step::Gas => {
+                let target = match options.sol {
+                    Some(amount) => (amount.max(0.0) * 1e9) as u64,
+                    None => funding.market_lamports(key)?.ok_or_else(|| {
+                        anyhow!("the funding file has no market amount for {key}: pass --sol")
+                    })?,
+                };
+                let held = client.lamports(&who).await?;
+                let need = target.saturating_sub(held);
+                if need == 0 {
+                    println!("  gas: holds {}, enough", sol(held));
+                    continue;
+                }
+                let deployer =
+                    crate::solana::keypair_from_mnemonic(&phrase, crate::solana::DEPLOYER)?;
+                let reserve = funding.solana(key)?.map_or(0, |amounts| amounts.reserve);
+                let spare = client
+                    .lamports(&deployer.pubkey())
+                    .await?
+                    .saturating_sub(reserve);
+                if spare < need {
+                    bail!(
+                        "the deployer ({}) can give {} past its reserve, short of the {} the market needs: fund the deployer from devnet's faucet",
+                        deployer.pubkey(),
+                        sol(spare),
+                        sol(need)
+                    );
+                }
+                let landed = client
+                    .send(
+                        vec![chain::solana::executor::ix_fund(
+                            &deployer.pubkey(),
+                            &who,
+                            need,
+                        )],
+                        &[&deployer],
+                    )
+                    .await
+                    .context("sending the market its SOL")?;
+                println!("  gas: sent {} ({})", sol(need), landed.record.signature);
+            }
+            Step::Inventory => {
+                let usdc = client.token_balance(&orca::dollars_of(&who)).await?;
+                let wrapped = client
+                    .token_balance(&chain::solana::orca::wsol_of(&who))
+                    .await?;
+                println!(
+                    "  inventory: {} USDC, {} wrapped and {} as coin",
+                    usdc as f64 / 1e6,
+                    sol(wrapped),
+                    sol(client.lamports(&who).await?)
+                );
+                let wanted = (options.orca_usdc.max(0.0) * 1e6) as u64 + 5_000_000;
+                if usdc < wanted {
+                    println!(
+                        "  inventory: short of {} USDC: tap Circle's faucet (Solana devnet, USDC) for {who}",
+                        (wanted - usdc) as f64 / 1e6
+                    );
+                }
+            }
+            Step::Pools => {
+                if client
+                    .account(&chain::solana::orca::POOLS[0].address)
+                    .await?
+                    .is_none()
+                {
+                    let pyth = chain::solana::orca::setup::pyth_now(&client).await?;
+                    chain::solana::orca::setup::ensure_pool(&client, &market, pyth).await?;
+                    println!("  pools: created Orca's pool at Pyth's price");
+                }
+                let price = orca::walk_to_pyth(&client, &market, 25.0, 12, None).await?;
+                println!("  pools: Orca's pool is at ${price:.2}, with Pyth's price");
+                let dollars = (options.orca_usdc.max(0.0) * 1e6) as u64;
+                orca::open_seed(&client, &market, dollars).await?;
+                let seed = chain::solana::orca::setup::seed_position(&client, &market).await?;
+                match seed {
+                    Some(seed) => println!(
+                        "  pools: the market's seed holds liquidity {} across ticks {}..{}",
+                        seed.liquidity, seed.tick_lower, seed.tick_upper
+                    ),
+                    None => println!("  pools: no seed open"),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -743,7 +888,10 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
         .client
         .deployments(&chain::Deployments::file_in(on.dir, on.key))
         .await?;
-    let name = market_id("robinhood");
+    // Under the name `config/drivers.toml` lists it by on this chain:
+    // `robinhood` on Robinhood Chain, `uniswap-base` on Base.
+    let listed_as = on.venue.driver;
+    let name = market_id(listed_as);
     let trading = on
         .client
         .read(
@@ -752,12 +900,12 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
         )
         .await?;
     if trading == address {
-        println!("  driver: the registry trades it as robinhood");
+        println!("  driver: the registry trades it as {listed_as}");
         return Ok(());
     }
     if !propose {
         println!(
-            "  driver: not proposed (the registry trades {trading:?} as robinhood); --propose proposes it"
+            "  driver: not proposed (the registry trades {trading:?} as {listed_as}); --propose proposes it"
         );
         return Ok(());
     }
@@ -774,7 +922,7 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
         .await
         .context("proposing the Robinhood driver")?;
     println!(
-        "  driver: proposed as robinhood ({:#x}, gas {})",
+        "  driver: proposed as {listed_as} ({:#x}, gas {})",
         receipt.transaction_hash, receipt.gas_used
     );
     Ok(())

@@ -263,6 +263,8 @@ vars:
   GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY: "shonin-testnet-keeper-solana-key"
   GCP_SECRET_TESTNET_TUNNEL_TOKEN: "shonin-testnet-tunnel-token"
   GCP_SECRET_TESTNET_RPC: "shonin-testnet-rpc"
-  # testnet-market's own test network key (account 101 of the EVM mnemonic,
-  # never the mnemonic), read by its VM's account alone.
+  # testnet-market's own test network keys (account 101 of the EVM mnemonic,
+  # and key 111 of the Solana one, never the mnemonics), read by its VM's
+  # account alone.
   GCP_SECRET_TESTNET_MARKET_KEY: "shonin-testnet-market-key"
+  GCP_SECRET_TESTNET_MARKET_SOLANA_KEY: "shonin-testnet-market-solana-key"

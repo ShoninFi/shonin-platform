@@ -14,8 +14,12 @@ use clap::Parser;
 use robinhood::listings::{self, MirrorFeeds};
 use testnet_market::bindings::IMirrorFeed;
 use testnet_market::health::{self, Health};
+use testnet_market::homes::Homes;
 use testnet_market::market::{ChainMarket, Endpoints, Market, Settings};
-use testnet_market::{KEY_ENV, MARKET_INDEX, MNEMONIC_ENV};
+use testnet_market::orca::SolanaMarket;
+use testnet_market::{
+    KEY_ENV, MARKET_INDEX, MNEMONIC_ENV, SOLANA_KEY_ENV, SOLANA_MARKET_INDEX, SOLANA_MNEMONIC_ENV,
+};
 
 #[derive(Parser)]
 #[command(about = "Keeps the test networks' pools at the real market price")]
@@ -34,10 +38,18 @@ struct Args {
         default_value = ".shonin/testnet/deployments"
     )]
     deployments_dir: PathBuf,
-    /// Keep only this chain (as `evm:<id>`), instead of every one the
-    /// network has a venue on.
+    /// Keep only this chain (as `evm:<id>` or `solana:devnet`), instead of
+    /// every one the network has a venue on.
     #[arg(long)]
     only: Option<ChainKey>,
+    /// Where what each finite asset is bought back to is kept, so a restart
+    /// keeps it; none keeps it in memory alone.
+    #[arg(
+        long,
+        env = "SHONIN_TESTNET_MARKET_HOMES",
+        default_value = ".shonin/testnet/testnet-market-homes.json"
+    )]
+    homes: Option<PathBuf>,
     /// Seconds between rounds.
     #[arg(long, default_value_t = 60)]
     every: u64,
@@ -166,9 +178,48 @@ async fn main() -> Result<()> {
         tracing::info!(chain = %key, label = venue.label, pools = market.pools.len(), mirrors = market.mirrors.len(), "keeping");
         chains.push(market);
     }
-    if chains.is_empty() {
+    // Solana devnet's Orca pool, with the Solana account's own key.
+    let mut solana = None;
+    for (_, key) in network.iter() {
+        if key.kind != ChainKind::Solana
+            || args.only.as_ref().is_some_and(|only| !only.same_chain(key))
+        {
+            continue;
+        }
+        let Some(signer) = solana_key()? else {
+            tracing::warn!(chain = %key, "no Solana key ({SOLANA_KEY_ENV} or {SOLANA_MNEMONIC_ENV}): this chain is not kept");
+            continue;
+        };
+        let config = configs
+            .get(key)
+            .ok_or_else(|| anyhow!("the chain config has no {key}"))?;
+        let kept = async {
+            let client = chain::solana::SolanaClient::connect_with(key, config, None).await?;
+            SolanaMarket::new(key.to_string(), config.label.clone(), client, signer).await
+        }
+        .await;
+        match kept {
+            Ok(market) => {
+                tracing::info!(chain = %key, account = %market.account(), pool = %chain::solana::orca::POOLS[0].address, "keeping");
+                if let Ok(mut health) = health.lock() {
+                    health.solana_account = Some(market.account().to_string());
+                }
+                solana = Some(market);
+            }
+            Err(error) => {
+                tracing::warn!(chain = %key, error = format!("{error:#}"), "this chain is not kept");
+                if let Ok(mut health) = health.lock() {
+                    let chain = health.chain(&key.to_string());
+                    chain.label = config.label.clone();
+                    chain.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+    }
+    if chains.is_empty() && solana.is_none() {
         bail!("no chain to keep");
     }
+    let homes = Homes::load(args.homes.clone())?;
 
     if args.port != 0 {
         let address = SocketAddr::from((args.listen, args.port));
@@ -185,8 +236,10 @@ async fn main() -> Result<()> {
         account,
         source,
         chains,
+        solana,
         settings,
         health,
+        homes,
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(args.every.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -196,6 +249,28 @@ async fn main() -> Result<()> {
         if args.once {
             return Ok(());
         }
+    }
+}
+
+/// The Solana account's keypair: handed over whole (in the cloud), or
+/// derived from the test networks' Solana mnemonic at its own index (on a
+/// developer's machine); none if neither is there.
+fn solana_key() -> Result<Option<chain::solana::Keypair>> {
+    let set = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    if let Some(text) = set(SOLANA_KEY_ENV) {
+        return chain::solana::keys::keypair_from_text(&text)
+            .map(Some)
+            .map_err(|error| anyhow!("{SOLANA_KEY_ENV}: {error}"));
+    }
+    match set(SOLANA_MNEMONIC_ENV) {
+        Some(phrase) => {
+            chain::solana::keys::keypair_from_mnemonic(&phrase, SOLANA_MARKET_INDEX).map(Some)
+        }
+        None => Ok(None),
     }
 }
 

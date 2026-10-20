@@ -236,6 +236,32 @@ pub fn read_tick(
     })
 }
 
+/// Every initialized tick of the tick array at `address` of a pool of
+/// `tick_spacing`, with its net liquidity, lowest first; none for an array
+/// that isn't there.
+pub fn initialized_ticks(
+    address: &Pubkey,
+    account: Option<&Account>,
+    tick_spacing: u16,
+) -> Result<Vec<(i32, i128)>> {
+    let Some(account) = account else {
+        return Ok(Vec::new());
+    };
+    read(address, account, |info| {
+        let Some(array) = TickArray::load(info)? else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        let mut offset = -1;
+        while let Some(at) = array.next_initialized(offset, false) {
+            let tick = array.start + at * tick_spacing as i32;
+            found.push((tick, array.tick(tick, tick_spacing)?.liquidity_net));
+            offset = at;
+        }
+        Ok(found)
+    })
+}
+
 /// A token account's balance, or nothing if there is no such account.
 pub fn token_amount(account: Option<&Account>) -> u64 {
     account

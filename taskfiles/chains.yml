@@ -68,14 +68,14 @@ tasks:
       - "{{.DEVNET}} deploy"
 
   solana-setup:
-    desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), the dollar's mint at its fixed index of the team's mnemonic, the registry (no timelock, the development checker), the operator's project, the stand-in driver and the venue's markets, the orca driver and the pool it lists, created at Pyth's price and seeded by the operator with ORCA_SEED_SOL of SOL (40 by default, the depth a $100 demo vault needs) and as many dollars, at a position of its own, every role's dollar account, then deployments/solana-devnet.json with the roles. No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
+    desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), Circle's devnet USDC as the dollar (no stand-in venue or driver, nothing minted: dollars come from Circle's faucet), the registry (no timelock, the development checker), the operator's project, the orca driver, every role's dollar account, then deployments/solana-devnet.json with the roles. Orca's pool is seeded and kept by testnet-market (task chains:testnet-market-setup STEPS=gas,pools). No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "testnet" ]'
         msg: "The Solana set-up is for devnet (NETWORK=testnet); the local cluster is set up with the chains (NETWORK={{.NETWORK}})."
       - sh: '[ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]'
         msg: "SHONIN_TESTNET_SOLANA_MNEMONIC is empty in .env: the roles and the deployer are its keys."
     cmds:
-      - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}{{if .ORCA_SEED_SOL}} --orca-seed-sol {{.ORCA_SEED_SOL}}{{end}}"
+      - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}"
 
   solana-migrate-stations:
     desc: "After task contracts:solana:deploy NETWORK=testnet upgrades the station program in place, rewrite every station the first station program wrote in the current layout: one migrate_station each, paid by the deployer, each read back with every value unchanged; sends nothing when none needs it, and DRY_RUN=1 only lists them. Safe to run again (NETWORK=testnet)"
@@ -136,7 +136,7 @@ tasks:
       - "{{.DEVNET}} fund"
 
   testnet-market-setup:
-    desc: "Set up what testnet-market needs on the testnets, from the funder (STEPS=feeds,gas,inventory by default; also pools and driver): the mirror feeds of the mainnet feeds the Robinhood Chain testnet's stocks are priced by (recorded in the deployments directory as mirror-feeds-evm-<chain>.json), the market account's gas (GAS=<coin>, or the funding file's market amount), its inventory (STOCK_TOKENS=10 of each stock token, WETH=0.01, USDC=50, from what the funder holds), POOL_TOKENS=<n> of each token added to its pool full-range (each time it runs), and the Robinhood driver built from the listings (PROPOSE=1 proposes it as robinhood); ON_FORK=1 refuses any endpoint but a local fork. Each step but pools is safe to run again; VAULT_CHAIN=<name> for one chain (NETWORK=testnet)"
+    desc: "Set up what testnet-market needs on the testnets, from the funder (STEPS=feeds,gas,inventory by default; also pools and driver): the mirror feeds of the mainnet feeds the Robinhood Chain testnet's stocks are priced by (recorded in the deployments directory as mirror-feeds-evm-<chain>.json), the market account's gas (GAS=<coin>, or the funding file's market amount), its inventory (STOCK_TOKENS=10 of each stock token, WETH=0.01, USDC=50, from what the funder holds), POOL_TOKENS=<n> of each token added to its pool full-range (each time it runs), and the Robinhood driver built from the listings (PROPOSE=1 proposes it under the name config/drivers.toml lists for the chain: robinhood on Robinhood Chain, uniswap-base on Base); on Solana devnet, gas is the market's SOL (SOL=<n>, or the funding file's market amount) from the deployer, and pools creates Orca's pool the driver lists if it isn't there, brings it to Pyth's price and opens the market's position across it with ORCA_USDC=<n> of the market's devnet USDC (75 by default, from Circle's faucet) and as much SOL; ON_FORK=1 refuses any endpoint but a local fork. Each step but pools is safe to run again; VAULT_CHAIN=<name> for one chain (NETWORK=testnet)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "testnet" ]'
         msg: "testnet-market is for the testnets (NETWORK={{.NETWORK}})."
@@ -144,8 +144,10 @@ tasks:
         msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env: the funder and the market's account are its keys."
     cmds:
       - task: :contracts:build
+      # Built with the devnet ids: Orca's pool and dollar are the ones the
+      # devnet build of the driver lists.
       - >-
-        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} testnet-market-setup
+        {{.DEVNET_SOLANA}} {{.VAULT_CHAIN_ARG}} testnet-market-setup
         --steps {{.STEPS | default "feeds,gas,inventory"}}
         {{if .GAS}}--gas {{.GAS}}{{end}}
         {{if .STOCK_TOKENS}}--stock-tokens {{.STOCK_TOKENS}}{{end}}
@@ -153,6 +155,8 @@ tasks:
         {{if .USDC}}--usdc {{.USDC}}{{end}}
         {{if .POOL_TOKENS}}--pool-tokens {{.POOL_TOKENS}}{{end}}
         {{if .PROPOSE}}--propose{{end}}
+        {{if .SOL}}--sol {{.SOL}}{{end}}
+        {{if .ORCA_USDC}}--orca-usdc {{.ORCA_USDC}}{{end}}
         {{if .ON_FORK}}--on-fork{{end}}
 
   testnet-market:
@@ -162,7 +166,7 @@ tasks:
         msg: "testnet-market keeps the testnets' pools alone (NETWORK={{.NETWORK}})."
     cmds:
       - >-
-        cargo run -p shonin-testnet-market --
+        cargo run -p shonin-testnet-market --features devnet --
         --network "{{.NETWORK}}"
         --chains "{{.PATH_CHAINS}}"
         --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
@@ -170,6 +174,24 @@ tasks:
         {{if .ONLY}}--only {{.ONLY}}{{end}}
         {{if .DRY_RUN}}--dry-run{{end}}
         {{if .ONCE}}--once{{end}}
+
+  hyperliquid-vaults:
+    desc: "On Hyperliquid testnet: the Hyperliquid driver deployed and proposed as hyperliquid on HyperEVM's registry (a generation already in HyperEVM's USDC needs nothing more; an older one gets a USDC factory beside it), recorded as hyperliquid-998.json; with AGENT=<agent dir> (and API_URL=<the API>, the testnet's by default) that agent is then published, activated with a USDC tank, a depositor's DEPOSIT dollars (the factory's least by default; mm-quoter needs about 650) sent home from the funder's HyperCore balance and deposited, the station's HyperCore account funded with STATION_DOLLARS (30) from the funder, TRADE_MINUTES (10) of trading watched, then a claim booked and paid; the services that serve it are the network's own (the cloud's), none here. Each step is recorded beside the deployment and skipped when run again (NETWORK=testnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Hyperliquid's real book is on the testnet alone (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "${SHONIN_TESTNET_EVM_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env: the funder, the author and the depositor are its keys."
+    vars:
+      HL_API: '{{.API_URL | default .URL_API_TESTNET}}'
+    cmds:
+      - task: :contracts:build
+      - >-
+        {{.DEVNET}} --vault-chain hyperliquid hyperliquid-vaults
+        {{if .AGENT}}--api "{{.HL_API}}" --agent "{{.AGENT}}"{{end}}
+        {{if .DEPOSIT}}--deposit {{.DEPOSIT}}{{end}}
+        {{if .STATION_DOLLARS}}--station-dollars {{.STATION_DOLLARS}}{{end}}
+        {{if .TRADE_MINUTES}}--trade-minutes {{.TRADE_MINUTES}}{{end}}
 
   fund-wallet:
     desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the stand-in dollar (minted on each EVM chain for a 0x address, on Solana devnet for a Solana one), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"

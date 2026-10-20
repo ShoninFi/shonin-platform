@@ -142,6 +142,12 @@ pub(crate) const STAYING_DEPOSIT: u64 = 5_000_000_000;
 /// With `publish_only`, it is published and nothing more: no vault is
 /// activated, and [`on_strategy`] runs the live part later (on a testnet
 /// whose development checker is retired in between, say).
+///
+/// On a public test network (no stand-ins) it publishes and activates in the
+/// chain's own dollar: the author is given the fee and the tank where that
+/// dollar's mint is open (USDG on Robinhood Chain's testnet) and must hold
+/// them already where it isn't (Circle's USDC, from its faucet). The live
+/// part needs the stand-ins and is refused there.
 #[allow(clippy::too_many_arguments)]
 pub async fn one(
     client: &Client,
@@ -154,7 +160,9 @@ pub async fn one(
     publish_only: bool,
     take_on: u64,
 ) -> Result<()> {
-    crate::deploy::require_stand_ins(deployments, "the seed's reference agents")?;
+    if live {
+        crate::deploy::require_stand_ins(deployments, "the seed's live part")?;
+    }
     let agents = agents
         .map(Path::to_path_buf)
         .or_else(guess_agents)
@@ -169,6 +177,9 @@ pub async fn one(
     let moved = on_vault_chain(&agents, project, vault_chain)?;
     let project = moved.as_deref().unwrap_or(project);
     let author = client.account(Role::Author)?;
+    if !crate::deploy::has_stand_ins(deployments) {
+        author_pays_in_the_chain_s_dollar(client, deployments, author, !publish_only).await?;
+    }
     say_who_the_author_is(client, deployments, author).await?;
     tracing::info!(project = %project.display(), "publishing");
     let published = crate::publish::publish(
@@ -539,6 +550,48 @@ pub async fn demo(
     println!(
         "The bill is collected and auto-fill runs on the keeper's daily keep; the author's fee shares are minted at the first valuation on or after Monday 00:00 UTC."
     );
+    Ok(())
+}
+
+/// On a public test network, make sure the author holds the publishing fee
+/// and, if it activates, the least tank, in the chain's own dollar: minted
+/// where anyone may mint it, else held already (a faucet's).
+async fn author_pays_in_the_chain_s_dollar(
+    client: &Client,
+    deployments: &Deployments,
+    author: alloy::primitives::Address,
+    activates: bool,
+) -> Result<()> {
+    use chain::bindings::publishing::IPublishing;
+    let fee = client
+        .read(deployments.publishing, IPublishing::feeCall {})
+        .await?;
+    let tank = if activates {
+        client
+            .read(deployments.factory, IVaultFactory::configCall {})
+            .await?
+            .minimumTank
+    } else {
+        U256::ZERO
+    };
+    let need = fee + tank;
+    let mintable = crate::deploy::public_dollar(deployments.chain_id)
+        .is_some_and(|dollar| dollar.address == deployments.usd && dollar.mintable);
+    if mintable {
+        return have(client, deployments, author, need).await;
+    }
+    let held = client
+        .read(deployments.usd, IERC20::balanceOfCall { account: author })
+        .await?;
+    if held < need {
+        bail!(
+            "the author ({author}) holds {} of the chain's dollar ({}), short of the {} the fee{} takes: it comes from the dollar's faucet",
+            held.to::<u128>() as f64 / 1e6,
+            deployments.usd,
+            need.to::<u128>() as f64 / 1e6,
+            if activates { " and the tank" } else { "" }
+        );
+    }
     Ok(())
 }
 

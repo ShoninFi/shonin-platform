@@ -310,8 +310,9 @@ impl<'a> Seed<'a> {
         Ok(())
     }
 
-    /// Make sure `who` holds `amount` of the stand-in dollar, the admin
-    /// minting what it lacks.
+    /// Make sure `who` holds `amount` of the dollar: the admin mints what it
+    /// lacks of the stand-in dollar, and a dollar the admin can't mint
+    /// (Circle's USDC on devnet) comes from its faucet alone.
     async fn have(&self, who: &Keypair, amount: u64) -> Result<()> {
         let held = self
             .client
@@ -320,6 +321,15 @@ impl<'a> Seed<'a> {
             .unwrap_or(0);
         if held >= amount {
             return Ok(());
+        }
+        if !crate::solana::admin_mints(self.client, self.platform).await? {
+            bail!(
+                "{} holds {} of the dollar ({}), short of {}: it comes from Circle's faucet, not from the admin",
+                who.pubkey(),
+                held as f64 / 1e6,
+                self.platform.mint,
+                amount as f64 / 1e6
+            );
         }
         let admin = self.client.role(Role::Admin)?;
         let ix = self
@@ -706,6 +716,14 @@ pub async fn operate(served: &SolanaServed, every: Duration) -> Result<()> {
     use crate::market::{Tape, TapeParams};
     let client = &served.client;
     let platform = &served.platform;
+    if client
+        .account(&local_venue::venue_address())
+        .await?
+        .is_none()
+    {
+        tracing::info!(cluster = %served.key, "no stand-in venue on this cluster: nothing to operate");
+        return Ok(());
+    }
     let operator = client.role(Role::Operator)?;
     if operator.pubkey() != platform.operator {
         return Err(anyhow::Error::new(WrongOperator {
@@ -794,15 +812,6 @@ pub async fn operate(served: &SolanaServed, every: Duration) -> Result<()> {
             Err(error) => {
                 tracing::warn!(cluster = %served.key, error = %format!("{error:#}"), "the post did not land; the next one accrues for this stretch too")
             }
-        }
-        // Orca's pool, brought back to Pyth's price if it has strayed: on a
-        // testnet nobody else arbitrages it.
-        let kept = async {
-            let admin = client.role(Role::Admin)?;
-            crate::solana_orca::keep_with_pyth(client, platform, admin, operator).await
-        };
-        if let Err(error) = kept.await {
-            tracing::warn!(cluster = %served.key, error = %format!("{error:#}"), "Orca's pool could not be brought to Pyth's price; tried again next time");
         }
     }
 }

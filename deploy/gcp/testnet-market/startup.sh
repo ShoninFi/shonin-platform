@@ -3,12 +3,16 @@
 # root on every boot. It starts, on the host's network:
 #
 #   shonin-testnet-market   the market, health on :19088, open to the VPC,
-#                           with its own test network key alone
+#                           with its own test network keys alone (EVM and
+#                           Solana), and what it buys back to kept in
+#                           /var/lib/shonin/testnet-market across restarts
 #
 # What it runs is named in the instance's metadata (`task
 # cloud:deploy:testnet-market` sets it): shonin-testnet-market-image (by
-# digest), shonin-testnet-market-secret (its key's secret) and
-# shonin-rpc-secret (the paid endpoints, optional).
+# digest), shonin-testnet-market-secret (its EVM key's secret),
+# shonin-testnet-market-solana-secret (its Solana keypair's secret, optional:
+# without it Solana is not kept) and shonin-rpc-secret (the paid endpoints,
+# optional).
 #
 # The key is read from Secret Manager with the VM's own token and written to
 # a file only root can read; it is never echoed, never put on a command
@@ -52,15 +56,28 @@ secret() {
 project=$(metadata project/project-id)
 image=$(attribute shonin-testnet-market-image)
 key_secret=$(attribute shonin-testnet-market-secret)
+solana_secret=$(attribute shonin-testnet-market-solana-secret 2>/dev/null || true)
 rpc_secret=$(attribute shonin-rpc-secret 2>/dev/null || true)
 
-mkdir -p "$STATE/secrets" "$STATE/docker"
+mkdir -p "$STATE/secrets" "$STATE/docker" "$STATE/testnet-market"
 chmod 700 "$STATE/secrets" "$STATE/docker"
+# The market's own directory: the image runs as distroless's nonroot user.
+chown 65532:65532 "$STATE/testnet-market"
+chmod 700 "$STATE/testnet-market"
 
 key=$(secret "$project" "$key_secret")
 [ -n "$key" ] || { say "the market's key could not be read"; exit 1; }
 printf 'SHONIN_TESTNET_MARKET_KEY=%s\n' "$key" >"$STATE/secrets/market.env"
 unset key
+if [ -n "$solana_secret" ]; then
+  solana_key=$(secret "$project" "$solana_secret" | tr -d '[:space:]' || true)
+  if [ -n "$solana_key" ]; then
+    printf 'SHONIN_TESTNET_MARKET_SOLANA_KEY=%s\n' "$solana_key" >>"$STATE/secrets/market.env"
+  else
+    say "the market's Solana key could not be read: Solana is not kept"
+  fi
+  unset solana_key
+fi
 # The paid endpoints (SHONIN_RPC_* lines); without them the market reads the
 # committed public endpoints.
 : >"$STATE/secrets/rpc.env"
@@ -87,5 +104,6 @@ docker rm -f shonin-testnet-market >/dev/null 2>&1 || true
 docker run -d --name shonin-testnet-market --network host --restart unless-stopped \
   --log-driver gcplogs \
   --env-file "$STATE/secrets/market.env" --env-file "$STATE/secrets/rpc.env" \
+  -v "$STATE/testnet-market:/var/lib/testnet-market" \
   "$image" >/dev/null
 say "up"

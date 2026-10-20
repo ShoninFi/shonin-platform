@@ -14,8 +14,14 @@ name = "testnet_market"
 name = "testnet-market"
 path = "src/main.rs"
 
+[features]
+# Orca's pool and dollar as the devnet build of the Orca driver lists them
+# (the chain crate's devnet ids): the image and the local task build with
+# it. Without it the Solana side knows the local cluster's pool alone.
+devnet = ["chain/devnet"]
+
 [dependencies]
-chain = { workspace = true, features = ["rpc"] }
+chain = { workspace = true, features = ["rpc", "solana"] }
 robinhood.workspace = true
 alloy.workspace = true
 anyhow.workspace = true

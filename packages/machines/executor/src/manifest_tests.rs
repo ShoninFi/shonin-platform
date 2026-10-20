@@ -19,7 +19,9 @@ fn canonical(id: u64, bundle: B256, component: &[u8]) -> shared::Canonical {
         toolchain: "rust".into(),
         builder_image: "sha256:builder".into(),
         manifest: shared::Manifest::from_toml(
-            "[vault]\nchain = \"solana\"\n[description]\ntitle = \"Carry\"\ntext = \"An agent\"\n[drivers.local]\n",
+            // A driver offered on the testnet: the stand-in venue is
+            // offered on the local chains alone.
+            "[vault]\nchain = \"solana\"\n[description]\ntitle = \"Carry\"\ntext = \"An agent\"\n[drivers.orca]\n",
         ).unwrap(),
     }
 }

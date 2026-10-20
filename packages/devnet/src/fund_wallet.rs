@@ -256,6 +256,13 @@ async fn solana(
     let need = target.saturating_sub(held);
     if need == 0 {
         println!("  dollars: holds {}, enough", lamport_units(held, decimals));
+    } else if !crate::solana::admin_mints(&client, &platform).await? {
+        // Circle's USDC on devnet: nobody here mints it.
+        println!(
+            "  dollars: holds {}; the dollar ({}) comes from Circle's faucet alone, so none is minted",
+            lamport_units(held, decimals),
+            platform.mint
+        );
     } else {
         let admin = client.role(Role::Admin)?;
         let landed = client

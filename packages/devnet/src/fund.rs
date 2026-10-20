@@ -115,6 +115,16 @@ impl Funding {
         coin(*self.testnet.get(&chain.to_string())?.roles.get(MARKET)?).ok()
     }
 
+    /// What `testnet-market`'s Solana account is topped up to on a cluster,
+    /// in lamports: its own amount, never the default.
+    pub fn market_lamports(&self, cluster: &ChainKey) -> Result<Option<u64>> {
+        self.testnet
+            .get(&cluster.to_string())
+            .and_then(|amounts| amounts.roles.get(MARKET))
+            .map(|amount| lamports(*amount))
+            .transpose()
+    }
+
     /// What a person's own wallet is topped up to on an EVM chain
     /// (`fund-wallet --gas`): the chain's `default`, if it is listed.
     pub fn wallet_coin(&self, chain: &ChainKey) -> Option<U256> {

@@ -348,8 +348,17 @@ impl Trading {
         Ok((mark, exit))
     }
 
-    /// Every market the venue lists.
+    /// Every market the venue lists: none on a cluster without the stand-in
+    /// venue.
     pub async fn markets(&self) -> Result<Vec<MarketState>> {
+        if self
+            .client
+            .account(&local_venue::venue_address())
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
         on_chain::venue_markets(&self.client)
             .await?
             .iter()

@@ -26,6 +26,14 @@ use tokio::sync::Mutex;
 /// The names `shonin.toml` writes for them.
 pub const ROBINHOOD: &str = "robinhood";
 pub const LIGHTER: &str = "lighter";
+/// The `robinhood` driver's contract deployed on Base and approved there
+/// under its own name: the same half trades it.
+pub const UNISWAP_BASE: &str = "uniswap-base";
+
+/// Whether the driver named `name` is traded by [`StockHalf`].
+pub fn trades_stocks(name: &str) -> bool {
+    name == ROBINHOOD || name == UNISWAP_BASE
+}
 
 /// How often the attested read of a station's Lighter accounts is posted:
 /// the driver stages a claim's close only on a post at most three minutes
@@ -242,6 +250,7 @@ impl StockHalf {
                 }
                 Ok(strategy_sdk::to_payload(&AccountState {
                     safe: self.trader.safe.to_string(),
+                    dollar: self.trader.dollar_symbol.clone(),
                     dollars: units(dollars, self.trader.dollar_decimals),
                     holdings,
                 }))

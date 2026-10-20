@@ -1,9 +1,11 @@
 //! What an agent says to the `robinhood` driver, and what it hears back.
 //!
 //! The driver trades Robinhood Chain's stock tokens on Uniswap from a Safe
-//! the vault's station owns. Everything an agent can ask for is here: swap a
-//! listed stock token for the dollar or the dollar for one, for no less than
-//! a minimum it names. The executor checks the minimum against the token's
+//! the vault's station owns; the same driver on Base, named
+//! [`BASE_DRIVER`], trades WETH against USDC the same way. Which dollar it
+//! trades against is in [`AccountState::dollar`]. Everything an agent can
+//! ask for is here: swap a listed token for the dollar or the dollar for
+//! one, for no less than a minimum it names. The executor checks the minimum against the token's
 //! Chainlink price before it signs, and the Safe's role checks it again
 //! on-chain, so a swap far from the feed is refused twice. Nothing here can
 //! name a recipient, a pool or a token outside the driver's list.
@@ -16,11 +18,12 @@ use serde::{Deserialize, Serialize};
 /// The decimal every driver's payloads use.
 pub type Decimal = fastnum::D128;
 
-/// The driver's name, as `shonin.toml` writes it.
+/// The driver's name on Robinhood Chain, as `shonin.toml` writes it.
 pub const DRIVER: &str = "robinhood";
 
-/// The dollar's symbol: USDG, the chain's native dollar.
-pub const DOLLAR: &str = "USDG";
+/// The same driver's contract on Base (WETH against USDC), approved there
+/// under its own name, as `shonin.toml` writes it.
+pub const BASE_DRIVER: &str = "uniswap-base";
 
 /// What a strategy submits.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +105,10 @@ pub struct Holding {
 pub struct AccountState {
     /// The Safe's address.
     pub safe: String,
+    /// The symbol of the dollar the driver trades against on this chain
+    /// (USDG on Robinhood Chain, USDC on Base), as its token names itself.
+    #[serde(default)]
+    pub dollar: String,
     /// Idle dollars in the Safe.
     pub dollars: Decimal,
     pub holdings: Vec<Holding>,

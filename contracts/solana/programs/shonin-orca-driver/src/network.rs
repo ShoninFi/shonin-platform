@@ -76,19 +76,20 @@ mod listed {
     use super::*;
     /// Orca's devnet settings.
     pub const CONFIG: Pubkey = pubkey!("FcrweFY1G9HJAHG5inkGB6pKg1HZ6x9UC2WioAfWrGkR");
-    /// The platform's testnet dollar on devnet.
-    pub const DOLLAR_MINT: Pubkey = pubkey!("4Gw9TmkKDvnGtBcMpJwR4rRDEWc6KVujegc1j4ebtHTK");
-    /// Wrapped SOL against the testnet dollar at tick spacing 64, created at
-    /// Pyth's price for the platform's own use. Its threshold is a
-    /// twentieth of the operator's seed: 40 SOL across ±2% of the price is
-    /// liquidity of about 40e9 × 0.332 / 0.00985 = 1.35e12 at SOL near $110
-    /// (square-root price 0.332; ±2% is a factor of 1.00995 in it), so
-    /// 6.7e10, which holds about $71 across one spacing (a factor of 1.0032
-    /// in the square-root price): some ninety positions' rent.
+    /// Circle's USDC on devnet, as on every public network: no dollar of
+    /// the platform's own.
+    pub const DOLLAR_MINT: Pubkey = pubkey!("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+    /// Wrapped SOL against Circle's devnet USDC at tick spacing 64, kept at
+    /// Pyth's price by the testnet's market account, which seeds it with
+    /// what a faucet gives. Its threshold is a twentieth of that seed: 0.7
+    /// SOL across ±5% of the price is liquidity of about 0.7e9 × 0.324 /
+    /// 0.0247 = 9.2e9 at SOL near $105 (square-root price 0.324; ±5% is a
+    /// factor of 1.0247 in it), so 4.6e8, which holds about $0.5 across one
+    /// spacing (a factor of 1.0032 in the square-root price).
     pub const POOLS: &[Pool] = &[Pool {
-        address: pubkey!("Dwk9XXFQJPiLuyXhgbVayAErCfZK2zSKhw2cPAimTUGQ"),
+        address: pubkey!("EQ5KAPVdHvSP5aBqYos4vtEsZApx43iM9AnibexL4WYA"),
         tick_spacing: 64,
-        theta: 67_000_000_000,
+        theta: 460_000_000,
     }];
     pub const MAX_AGE: u64 = 900;
 }

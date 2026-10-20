@@ -1612,13 +1612,14 @@ async fn serve(
     // the Safe's role; its Lighter account by a Lighter key made now, which
     // the station registers, and whose accounts this executor posts on the
     // board for as long as it serves the vault.
-    let stocks = if names(robinhood::ROBINHOOD) {
-        Some(
-            robinhood::StockHalf::connect(&chain, key.clone(), station, robinhood::ROBINHOOD)
-                .await?,
-        )
-    } else {
-        None
+    let stock_driver = [robinhood::ROBINHOOD, robinhood::UNISWAP_BASE]
+        .into_iter()
+        .find(|name| names(name));
+    let stocks = match stock_driver {
+        Some(name) => {
+            Some(robinhood::StockHalf::connect(&chain, key.clone(), station, name).await?)
+        }
+        None => None,
     };
     let (lighter, _lighter_posts) = if names(robinhood::LIGHTER) {
         let half =
@@ -2923,14 +2924,19 @@ fn recorded_in(
     // tokens and Lighter), which an agent may use together.
     let drivers: Vec<String> = canonical.manifest.drivers.keys().cloned().collect();
     let robinhood_chain = |name: &str| name == robinhood::ROBINHOOD || name == robinhood::LIGHTER;
-    let alone = [host::LOCAL, hyperliquid::DRIVER, solana::ORCA];
+    let alone = [
+        host::LOCAL,
+        hyperliquid::DRIVER,
+        solana::ORCA,
+        robinhood::UNISWAP_BASE,
+    ];
     let carried = match drivers.as_slice() {
         [only] if alone.contains(&only.as_str()) => true,
         some => !some.is_empty() && some.iter().all(|name| robinhood_chain(name)),
     };
     anyhow::ensure!(
         carried,
-        "this image carries the local, hyperliquid or orca driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
+        "this image carries the local, hyperliquid, orca or uniswap-base driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
     );
     Ok(Recorded {
         drivers,
