@@ -171,6 +171,9 @@ pub(crate) const EVERY: Duration = Duration::from_secs(15);
 
 /// How long a `bless` that went through holds the next one for the same
 /// leaf back: long enough for any node the keeper asks to have its block.
+/// A hold ends sooner once the chain shows the key blessed for longer than
+/// when the `bless` was sent: the send is seen to have landed, and on a fast
+/// clock the next renewal can be due before this is over.
 const DONE_HOLD: Duration = Duration::from_secs(90);
 
 /// How long a `bless` that may still land holds the next one back: as long
@@ -181,9 +184,10 @@ const LANDING_HOLD: Duration = Duration::from_secs(600);
 /// rounds.
 #[derive(Default)]
 pub(crate) struct Memory {
-    /// Each leaf whose `bless` was sent, and until when no other is sent
-    /// for it.
-    held: HashMap<(u64, Address, B256, Address), Instant>,
+    /// Each leaf whose `bless` was sent, until when no other is sent for
+    /// it, and when the key's blessing ended as the send went out: a
+    /// blessing read to end later says the send landed, and ends the hold.
+    held: HashMap<(u64, Address, B256, Address), (Instant, u64)>,
     /// Each leaf whose blessing the registry stopped counting although it
     /// runs on, and the issue time of the seal sent again for it: that seal
     /// is not sent again until the registry has counted the key once more,
@@ -260,7 +264,7 @@ pub(crate) async fn round(
     let published_ids: HashSet<_> = leaves.iter().map(|leaf| leaf.id()).collect();
     memory
         .held
-        .retain(|id, until| published_ids.contains(id) && at < *until);
+        .retain(|id, (until, _)| published_ids.contains(id) && at < *until);
     memory.resent.retain(|id, _| published_ids.contains(id));
     if leaves.is_empty() {
         return Ok(done);
@@ -302,6 +306,13 @@ pub(crate) async fn round(
         let (Some(seal), Some(journal)) = (&published.seal, &published.journal) else {
             continue;
         };
+        if memory
+            .held
+            .get(&leaf.id())
+            .is_some_and(|(_, sent_over)| until > *sent_over)
+        {
+            memory.held.remove(&leaf.id());
+        }
         if memory.held.contains_key(&leaf.id()) {
             continue;
         }
@@ -317,7 +328,7 @@ pub(crate) async fn round(
             Sent::Failed => None,
         };
         if let Some(hold) = hold {
-            memory.held.insert(leaf.id(), at + hold);
+            memory.held.insert(leaf.id(), (at + hold, until));
         }
         if sent == Sent::Done {
             if recounts && let Some(issued) = issued {
@@ -1199,6 +1210,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stand.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_blessing_seen_to_land_does_not_hold_back_the_next_renewal() {
+        // On a development chain's fast clock a blessing can be due again
+        // before a relay that went through has stopped holding the next.
+        let mut stand = stand();
+        stand.until.insert(Address::repeat_byte(1), NOW + TTL / 4);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        round(&stand, CHAIN, &published(vec![leaf(1)]), &mut memory, start)
+            .await
+            .unwrap();
+        assert_eq!(stand.sent.lock().unwrap().len(), 1);
+        // It landed (the blessing ends later than when it was sent), the
+        // clock ran on to a third left, and a newer seal is out.
+        stand.until.insert(Address::repeat_byte(1), NOW - 60 + TTL);
+        stand.now = NOW - 60 + TTL - TTL / 4;
+        let mut newer = published(vec![leaf(1)]);
+        newer.journal = Some(journal(stand.now));
+        round(
+            &stand,
+            CHAIN,
+            &newer,
+            &mut memory,
+            start + Duration::from_secs(45),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stand.sent.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

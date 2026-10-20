@@ -51,6 +51,9 @@ pub struct Chain {
     pub down: bool,
     /// How often the factory's list of vaults was read. The list is empty.
     pub vault_list_reads: usize,
+    /// Logs the chain holds besides a halt, each answered to a query for its
+    /// address over a range that holds its block.
+    pub logs: Vec<alloy::rpc::types::Log>,
 }
 
 pub type Shared = Arc<Mutex<Chain>>;
@@ -80,6 +83,7 @@ pub fn chain(balance: u64, settled: u64) -> Shared {
         in_the_pool: false,
         down: false,
         vault_list_reads: 0,
+        logs: Vec::new(),
     }))
 }
 
@@ -198,6 +202,16 @@ async fn rpc(State(state): State<Shared>, Json(request): Json<Value>) -> Respons
                     .as_str()
                     .unwrap_or_default()
                     .to_lowercase();
+                let held: Vec<&alloy::rpc::types::Log> = state
+                    .logs
+                    .iter()
+                    .filter(|log| {
+                        format!("{:?}", log.address()).to_lowercase() == asked
+                            && log
+                                .block_number
+                                .is_some_and(|at| range.0 <= at && at <= range.1)
+                    })
+                    .collect();
                 match state.halted {
                     Some((vault, at))
                         if asked == format!("{vault:?}").to_lowercase()
@@ -206,7 +220,7 @@ async fn rpc(State(state): State<Shared>, Json(request): Json<Value>) -> Respons
                     {
                         halted_log(vault, at)
                     }
-                    _ => json!([]),
+                    _ => json!(held),
                 }
             }
             "eth_sendTransaction" => {

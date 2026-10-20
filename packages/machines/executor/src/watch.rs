@@ -29,11 +29,14 @@ pub use crate::host::shonin::agent::vault::{Claim, VaultEvent};
 /// woken for nothing most of the time.
 ///
 /// An agent follows a market it names in an account read, holds, or sends an
-/// order for. An account read that names none follows every market, as an
-/// agent built before it could name them always has, and keeps following
-/// every market for the rest of that start: such an agent may want to enter
-/// any market it reads, and nothing it does says which. Its own fills always
-/// reach it, whatever it follows.
+/// order for. Until it has named one, and while its station holds none, it
+/// follows every market: an agent just started, holding nothing, may be
+/// waiting for the venue's news before it first reads its account, and
+/// hearing nothing it would never look. An account read that names none
+/// follows every market, as an agent built before it could name them always
+/// has, and keeps following every market for the rest of that start: such an
+/// agent may want to enter any market it reads, and nothing it does says
+/// which. Its own fills always reach it, whatever it follows.
 #[derive(Clone, Default)]
 pub struct Following(Arc<Mutex<Followed>>);
 
@@ -61,7 +64,9 @@ impl Following {
     pub fn follows(&self, market: &str) -> bool {
         self.0
             .lock()
-            .map(|followed| followed.every || followed.markets.contains(market))
+            .map(|followed| {
+                followed.every || followed.markets.is_empty() || followed.markets.contains(market)
+            })
             .unwrap_or(true)
     }
 }
@@ -598,12 +603,64 @@ mod tests {
     #[test]
     fn an_agent_that_names_no_markets_follows_every_market_from_then_on() {
         let following = Following::default();
-        assert!(!following.follows("ETH"));
         following.market("BTC");
         assert!(following.follows("BTC") && !following.follows("ETH"));
         following.every();
         following.market("BTC");
         assert!(following.follows("ETH"));
+    }
+
+    #[test]
+    fn an_agent_that_has_named_no_market_and_holds_none_hears_every_market() {
+        let station = Address::repeat_byte(0x55);
+        let following = Following::default();
+        let follows = |market: &str| following.follows(market);
+        let (said, _) = venue_events(&[funding("BTC-PERP")], station, &follows).unwrap();
+        assert_eq!(markets_of(&said), ["BTC-PERP"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_agent_whose_station_holds_nothing_hears_the_venue_s_funding() {
+        // A vault just taken on: its station holds nothing at the venue, and
+        // its agent waits for the venue's news before it reads its account.
+        // The operator posts funding at block 18.
+        let vault = Address::repeat_byte(0x11);
+        let station = Address::repeat_byte(0x55);
+        let venue = Address::repeat_byte(0x33);
+        let state = stand_in::chain(1_000_000_000, 0);
+        let mut post = funding("BTC-PERP");
+        post.inner.address = venue;
+        post.block_number = Some(18);
+        state.lock().unwrap().head = 20;
+        state.lock().unwrap().logs.push(post);
+        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
+        let account = crate::feed::Feed::<Vec<u8>>::default();
+        let vault_events = crate::feed::Feed::<VaultEvent>::default();
+        let watching = tokio::spawn(run(
+            client,
+            vault,
+            station,
+            Some(venue),
+            Following::default(),
+            Arc::new(AtomicU64::new(10)),
+            account.sender(),
+            vault_events.sender(),
+        ));
+        let reader = account.reader();
+        let heard = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            std::future::poll_fn(|cx| reader.lock().unwrap().poll_recv(cx)),
+        )
+        .await;
+        watching.abort();
+        let heard = heard
+            .ok()
+            .flatten()
+            .map(|payload| strategy_sdk::from_payload::<AccountEvent>(&payload).unwrap());
+        assert!(
+            matches!(&heard, Some(AccountEvent::Funding { market, .. }) if market == "BTC-PERP"),
+            "the agent never heard the venue's funding, so it never looks: {heard:?}"
+        );
     }
 
     #[test]
