@@ -10,7 +10,7 @@
 //! named it. The same pass keeps the vault's events for the page and what
 //! each holder has paid in and taken out.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
@@ -85,11 +85,27 @@ struct VaultLog {
     killed: Option<VaultEvent>,
     /// What each holder has paid in, less what they have taken out.
     paid: HashMap<Pubkey, f64>,
-    /// Who booked each claim, by its id: a claim the closed vault pays says
-    /// only its id.
-    claim_owners: HashMap<u64, Pubkey>,
+    /// Every claim the vault booked, by its id, as its history tells of it.
+    /// A claim's id is the id of the withdrawal it was booked from, not its
+    /// place in the vault's count of claims, so this is how the record finds
+    /// each claim's account; and a claim the closed vault pays says only its
+    /// id, so this is who it is taken off the cost of.
+    claims: BTreeMap<u64, Booked>,
     /// Whether the whole history listed has been read.
     read_through: bool,
+}
+
+/// A claim as the vault's history tells of it: what is known of it once its
+/// account is closed.
+#[derive(Clone, Copy)]
+struct Booked {
+    owner: Pubkey,
+    /// The shares it was booked for.
+    shares: u128,
+    /// When the transaction that booked it landed.
+    at: u64,
+    /// What it paid, over every part paid.
+    paid: u64,
 }
 
 /// How many of a vault's transactions are listed per request.
@@ -333,8 +349,8 @@ fn wanted(
         let Some(vault) = decode::<sv::state::Vault>(accounts, address) else {
             continue;
         };
-        for id in 1..=vault.claim_count {
-            wanted.insert(sv::state::claim_address(address, id).0);
+        for at in claim_addresses(history, address) {
+            wanted.insert(at);
         }
         wanted.insert(sv::state::restricted_address(address).0);
         wanted.insert(vault.station);
@@ -526,13 +542,27 @@ pub(crate) async fn job(served: &SolanaServed, store: &Store, mut job: Job) -> R
     Ok(job)
 }
 
-/// What a vault's accounts come to, to tell whether they changed.
-fn digest(accounts: &Accounts, address: &Pubkey, vault: &sv::state::Vault) -> u64 {
+/// The accounts of every claim the vault's history says it booked.
+fn claim_addresses(history: &History, vault: &Pubkey) -> Vec<Pubkey> {
+    history
+        .vaults
+        .get(vault)
+        .into_iter()
+        .flat_map(|log| log.claims.keys())
+        .map(|id| sv::state::claim_address(vault, *id).0)
+        .collect()
+}
+
+/// What a vault's accounts (the vault, its claims as far as its history
+/// names them, its list of restricted places) come to, to tell whether they
+/// changed.
+fn digest(accounts: &Accounts, address: &Pubkey, claims: &[Pubkey]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data(accounts, address).hash(&mut hasher);
-    for id in 1..=vault.claim_count {
-        data(accounts, &sv::state::claim_address(address, id).0).hash(&mut hasher);
+    for at in claims {
+        at.hash(&mut hasher);
+        data(accounts, at).hash(&mut hasher);
     }
     data(accounts, &sv::state::restricted_address(address).0).hash(&mut hasher);
     hasher.finish()
@@ -562,19 +592,40 @@ async fn one(
 
     // Its requests and history, read again only once its accounts changed,
     // or while its history is still being read.
-    let digest = digest(accounts, &address, vault);
+    let before = digest(accounts, &address, &claim_addresses(history, &address));
     let log = history.vaults.entry(address).or_default();
-    let changed = history.digests.get(&address) != Some(&digest);
+    let changed = history.digests.get(&address) != Some(&before);
+    // The accounts of claims the history names for the first time, read now
+    // rather than a refresh later.
+    let mut claim_accounts = Accounts::new();
     if changed || !log.queue.is_empty() || !history.requests.contains_key(&address) {
         read_history(client, &address, log, transactions_per_refresh).await?;
         let waiting = requests(client, &address).await?;
         history.requests.insert(address, waiting);
-        history.digests.insert(address, digest);
+        let named = claim_addresses(history, &address);
+        let unread: Vec<Pubkey> = named
+            .iter()
+            .filter(|at| !accounts.contains_key(at))
+            .copied()
+            .collect();
+        if !unread.is_empty() {
+            let (_, read) = client
+                .rpc
+                .accounts_since(&unread, history.slot)
+                .await
+                .context("reading the vault's claims")?;
+            claim_accounts.extend(unread.into_iter().zip(read));
+        }
+        let mut seen = accounts.clone();
+        seen.extend(claim_accounts.clone());
+        history
+            .digests
+            .insert(address, digest(&seen, &address, &named));
     }
     let log = history.vaults.entry(address).or_default();
     let requests = history.requests.get(&address).cloned().unwrap_or_default();
 
-    let claims = claims(accounts, &address, vault)?;
+    let claims = claims(accounts, &claim_accounts, &address, vault, &log.claims)?;
     let restricted: Vec<String> =
         decode::<sv::state::Restricted>(accounts, &sv::state::restricted_address(&address).0)
             .map(|list| {
@@ -950,48 +1001,81 @@ fn review_of(store: &Store, review: &publishing::state::Review) -> Review {
     }
 }
 
-/// Every claim the vault has booked, each at the address its id derives,
-/// as the accounts read have them.
-fn claims(accounts: &Accounts, address: &Pubkey, vault: &sv::state::Vault) -> Result<Vec<Claim>> {
+/// Every claim the vault's history says it booked, each at the address its
+/// id derives: as its account has it while the account is there (`accounts`,
+/// or `more` for one only just named), and as the history tells of it once
+/// the account is closed.
+fn claims(
+    accounts: &Accounts,
+    more: &Accounts,
+    address: &Pubkey,
+    vault: &sv::state::Vault,
+    booked: &BTreeMap<u64, Booked>,
+) -> Result<Vec<Claim>> {
     let mut out = Vec::new();
-    for id in 1..=vault.claim_count {
+    for (&id, told) in booked {
         let at = sv::state::claim_address(address, id).0;
-        if !accounts.contains_key(&at) {
+        let read = if accounts.contains_key(&at) {
+            accounts
+        } else if more.contains_key(&at) {
+            more
+        } else {
             anyhow::bail!("claim {id} was not read");
-        }
-        // A claim closed once it was paid and its rent taken back is gone
-        // from the cluster: what it was is in the vault's history.
-        let Some(bytes) = data(accounts, &at) else {
-            continue;
         };
-        let claim = sv::state::Claim::try_deserialize(&mut &bytes[..])
-            .map_err(|error| anyhow!("claim {id} does not read as one: {error}"))?;
-        let paid = claim.state == ChainClaimState::Paid;
+        let (owner, shares, booked_at, state, paid) = match data(read, &at) {
+            Some(bytes) => {
+                let claim = sv::state::Claim::try_deserialize(&mut &bytes[..])
+                    .map_err(|error| anyhow!("claim {id} does not read as one: {error}"))?;
+                // A claim paid in parts counts down its shares as it goes:
+                // what it is shown at is what it was booked for.
+                (
+                    claim.owner,
+                    told.shares.max(claim.shares),
+                    claim.booked_at,
+                    claim.state,
+                    claim.paid,
+                )
+            }
+            // Closed once it was paid (or taken through the fallback) and
+            // its rent taken back: what it was is in the vault's history.
+            None => (
+                told.owner,
+                told.shares,
+                told.at,
+                if told.paid > 0 {
+                    ChainClaimState::Paid
+                } else {
+                    ChainClaimState::Fallback
+                },
+                told.paid,
+            ),
+        };
+        let burnt = matches!(state, ChainClaimState::Paid | ChainClaimState::Fallback);
         // A paid claim's shares are burnt, so the supply no longer counts
         // them: its share is measured with them put back.
-        let supply = if paid {
-            vault.total_supply.saturating_add(claim.shares)
+        let supply = if burnt {
+            vault.total_supply.saturating_add(shares)
         } else {
             vault.total_supply
         };
         out.push(Claim {
-            id: claim.id as u32,
-            owner: claim.owner.to_string(),
-            shares: claim.shares as f64 / SHARE,
+            id: id as u32,
+            owner: owner.to_string(),
+            shares: shares as f64 / SHARE,
             fraction_closed: if supply == 0 {
                 0.0
             } else {
-                claim.shares as f64 / supply as f64
+                shares as f64 / supply as f64
             },
-            booked: day(claim.booked_at),
-            state: match claim.state {
+            booked: day(booked_at),
+            state: match state {
                 ChainClaimState::Paid => ClaimState::Paid,
                 ChainClaimState::Waiting => ClaimState::Waiting,
                 ChainClaimState::Queued => ClaimState::Queued,
                 ChainClaimState::Fallback => ClaimState::Fallback,
                 ChainClaimState::Pending | ChainClaimState::None => ClaimState::Pending,
             },
-            settled_for: (claim.paid > 0).then(|| claim.paid as f64 / DOLLAR),
+            settled_for: (paid > 0).then(|| paid as f64 / DOLLAR),
         });
     }
     Ok(out)
@@ -1209,12 +1293,19 @@ fn fold(log: &mut VaultLog, vault: &Pubkey, record: &TransactionRecord) {
         } else if let Some(paid) = decoded::<ev::UnitsPaid>(&data) {
             *log.paid.entry(paid.owner).or_default() -= paid.assets as f64 / DOLLAR;
         } else if let Some(booked) = decoded::<ev::ClaimBooked>(&data) {
-            log.claim_owners.insert(booked.claim_id, booked.owner);
+            log.claims.entry(booked.claim_id).or_insert(Booked {
+                owner: booked.owner,
+                shares: booked.shares,
+                at,
+                paid: 0,
+            });
         } else if let Some(paid) = decoded::<ev::ClaimPaid>(&data)
-            && withdrawn_before != Some(paid.assets)
-            && let Some(owner) = log.claim_owners.get(&paid.claim_id).copied()
+            && let Some(claim) = log.claims.get_mut(&paid.claim_id)
         {
-            *log.paid.entry(owner).or_default() -= paid.assets as f64 / DOLLAR;
+            claim.paid = claim.paid.saturating_add(paid.assets);
+            if withdrawn_before != Some(paid.assets) {
+                *log.paid.entry(claim.owner).or_default() -= paid.assets as f64 / DOLLAR;
+            }
         }
         if let Some((kind, summary, amount)) = event_of(&data) {
             let event = VaultEvent {
