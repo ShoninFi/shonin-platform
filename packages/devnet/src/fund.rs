@@ -55,6 +55,11 @@ pub const ROLES: [Role; 10] = [
     Role::Platform,
 ];
 
+/// The roles that sign nothing on a test network, so are never funded
+/// there, whatever the file's `default`: the operator posts the stand-in
+/// venue's prices, and no test network has the stand-in venue.
+const UNFUNDED: [Role; 1] = [Role::Operator];
+
 /// `config/funding.toml`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +76,20 @@ pub struct Amounts {
     default: f64,
     #[serde(flatten)]
     roles: BTreeMap<String, f64>,
+}
+
+impl Amounts {
+    /// A role's amount: its own, or the default; nothing for a role that
+    /// signs nothing on a test network.
+    fn amount(&self, role: Role) -> f64 {
+        if UNFUNDED.contains(&role) {
+            return 0.0;
+        }
+        self.roles
+            .get(role.label())
+            .copied()
+            .unwrap_or(self.default)
+    }
 }
 
 #[derive(Deserialize)]
@@ -92,6 +111,12 @@ impl Funding {
                 if name != MARKET && !ROLES.iter().any(|role| role.label() == name) {
                     bail!("{} names {name:?}, which is not a role", path.display());
                 }
+                if UNFUNDED.iter().any(|role| role.label() == name) {
+                    bail!(
+                        "{} names {name:?}, which signs nothing on a test network and is never funded there",
+                        path.display()
+                    );
+                }
             }
         }
         Ok(funding)
@@ -99,13 +124,7 @@ impl Funding {
 
     /// What a role on a chain is topped up to, if the chain is listed.
     pub fn target(&self, chain: &ChainKey, role: Role) -> Option<U256> {
-        let amounts = self.testnet.get(&chain.to_string())?;
-        let amount = amounts
-            .roles
-            .get(role.label())
-            .copied()
-            .unwrap_or(amounts.default);
-        coin(amount).ok()
+        coin(self.testnet.get(&chain.to_string())?.amount(role)).ok()
     }
 
     /// What `testnet-market`'s account is topped up to on a chain: its own
@@ -154,14 +173,7 @@ impl Funding {
         let reserve = lamports(amounts.reserve)?;
         let roles = ROLES
             .iter()
-            .map(|role| {
-                let amount = amounts
-                    .roles
-                    .get(role.label())
-                    .copied()
-                    .unwrap_or(amounts.default);
-                Ok((*role, lamports(amount)?))
-            })
+            .map(|role| Ok((*role, lamports(amounts.amount(*role))?)))
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(SolanaAmounts { reserve, roles }))
     }
@@ -650,6 +662,31 @@ activation_usd = 2.0
     }
 
     #[test]
+    fn the_stand_in_venue_s_operator_is_never_funded_on_a_test_network() {
+        let funding: Funding = toml::from_str(FILE).unwrap();
+        let key: ChainKey = "evm:84532".parse().unwrap();
+        assert_eq!(funding.target(&key, Role::Operator), Some(U256::ZERO));
+        let with_cluster: Funding = toml::from_str(&format!(
+            "{FILE}\n[testnet.\"solana:devnet\"]\nreserve = 1\ndefault = 0.2\n"
+        ))
+        .unwrap();
+        let cluster: ChainKey = "solana:devnet".parse().unwrap();
+        let amounts = with_cluster.solana(&cluster).unwrap().unwrap();
+        assert!(amounts.roles.contains(&(Role::Operator, 0)));
+        // A file that funds it is refused rather than half obeyed.
+        let dir = std::env::temp_dir().join(format!("shonin-funding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("funding.toml");
+        std::fs::write(
+            &file,
+            FILE.replace("admin = 0.03", "admin = 0.03\noperator = 0.005"),
+        )
+        .unwrap();
+        assert!(Funding::read(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_wallet_is_topped_up_to_its_chain_s_default_and_an_unlisted_chain_gives_nothing() {
         let funding: Funding = toml::from_str(FILE).unwrap();
         let key: ChainKey = "evm:84532".parse().unwrap();
@@ -785,7 +822,7 @@ activation_usd = 2.0
             .expect("solana:devnet is in the funding file");
         assert!(reserve > 0);
         // The keys that sign the set-up and keep the vaults are funded.
-        for role in [Role::Admin, Role::Operator, Role::Keeper] {
+        for role in [Role::Admin, Role::Keeper] {
             assert!(roles.iter().any(|(r, amount)| *r == role && *amount > 0));
         }
     }

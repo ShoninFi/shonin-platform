@@ -13,8 +13,10 @@ of the repository):
       "mirrors": {"<symbol>": "0x…", …}     # Robinhood Chain testnet's mirror feeds
     }
 
-testnet-market's account goes under "evm" as "market", so its gas is watched
-like a role's.
+A role is listed only where it signs: the operator, which posts the stand-in
+venue's prices, has no venue on a test network and is never funded there, so
+it is not listed. testnet-market's account goes under "evm" (and "solana") as
+"market", so its gas is watched like a role's.
 
 Public endpoints keep no history, so each run adds a sample to a history file
 (kept between runs by the workflow's cache) and judges from it:

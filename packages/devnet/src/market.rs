@@ -2,24 +2,17 @@
 //!
 //! On the local network a block is mined every second and moves the chain's
 //! clock an hour, so a vault reaches the ninety live days it needs to be
-//! ranked in about thirty-six minutes. On each block the venue is given new
-//! prices and the funding that has accrued since the last one.
+//! ranked in about thirty-six minutes. On each block the stand-in venue is
+//! given new prices and the funding that has accrued since the last one.
 //!
-//! On a testnet nothing moves the stand-in venue but its operator, so
-//! [`operate`] plays it from the laptop in real time: every few minutes it
-//! posts new prices and the funding accrued since the last post, from a tape
-//! whose numbers look like a real market's ([`TapeParams::TESTNET`]).
-//!
-//! Either way the venue is kept able to pay what its accounts are owed
-//! ([`top_up`]). The venue is every trade's counterparty and the funding it
+//! The venue is kept able to pay what its accounts are owed ([`top_up`]). The venue is every trade's counterparty and the funding it
 //! credits shorts comes from nobody, so without it the dollars its accounts
 //! could withdraw drift above the dollars it holds; the operator mints the
 //! difference to it, standing in for the longs who would have paid.
 //!
 //! The local walk is deterministic. A development chain that tells a
 //! different story every time it starts is a poor place to debug one, and a
-//! reproducible market means a demo can be run twice. The testnet walk is
-//! seeded from the chain's clock, so a restart doesn't replay the same day.
+//! reproducible market means a demo can be run twice.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -31,12 +24,9 @@ use anyhow::{Context, Result};
 use chain::bindings::erc20::IERC20;
 use chain::bindings::usd::ILocalUsd;
 use chain::bindings::venue::{Funding, ILocalVenue, Quote};
-use chain::{Client, Deployments, Role};
+use chain::{Client, Deployments};
 
 use crate::deploy::{PERP, SPOT, STARTING_PRICE, market_id};
-
-/// A day, in seconds: funding rates are quoted per day.
-pub(crate) const DAY: u64 = 86_400;
 
 /// How a tape walks. Each volatility is a standard deviation over an hour.
 #[derive(Clone, Copy, Debug)]
@@ -54,22 +44,7 @@ pub(crate) struct TapeParams {
     /// Funding is settled this many times a day, so a basis of `b` is worth
     /// this many times `b` over a day.
     pub funding_per_day: f64,
-    /// Spells when the market goes quiet and funding sinks towards nothing.
-    pub lulls: Option<Lulls>,
 }
-
-/// Quiet spells: the basis is pulled towards `basis` instead of its mean for
-/// `hours`, starting at random about once every `every_hours`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Lulls {
-    pub every_hours: f64,
-    pub hours: f64,
-    pub basis: f64,
-}
-
-/// The testnet tape's funding over the long run, lulls included, as a
-/// fraction of the price a day: 10% a year. A test holds the tape to it.
-pub(crate) const TESTNET_MEAN_FUNDING: f64 = 0.10 / 365.0;
 
 impl TapeParams {
     /// The local chain's market: a lively basis worth about 66% a year, so a
@@ -82,34 +57,9 @@ impl TapeParams {
         basis_pull: 0.06,
         half_spread: 0.0001,
         funding_per_day: 3.0,
-        lulls: None,
     };
 
-    /// A testnet's market, in real time, shaped like bitcoin's: the spot
-    /// moves about 0.6% an hour, and the perpetual's funding averages about
-    /// 10% a year (0.000274 of the price a day). Outside a lull it sits near
-    /// 0.000295 a day, within about 0.00003 either way, and is pulled back
-    /// with a half-life of two hours; about once every four days it goes
-    /// quiet for eight hours and sinks to near nothing, which is when a
-    /// carry's exit (0.00005 a day) and entry (0.0002 a day) are crossed.
-    pub(crate) const TESTNET: Self = Self {
-        hourly_volatility: 0.006,
-        basis_mean: 0.000_295 / 3.0,
-        // A stationary spread of 0.00003 a day in funding, for the pull
-        // below: sigma * sqrt(2 * pull).
-        basis_volatility: 0.000_03 / 3.0 * 0.836_660_026_5,
-        basis_pull: 0.35,
-        half_spread: 0.0001,
-        funding_per_day: 3.0,
-        lulls: Some(Lulls {
-            every_hours: 96.0,
-            hours: 8.0,
-            basis: 0.000_01 / 3.0,
-        }),
-    };
-
-    /// The funding the basis mean pays outside a lull, as a fraction of the
-    /// price a day.
+    /// The funding the basis mean pays, as a fraction of the price a day.
     pub(crate) fn funding_mean(&self) -> f64 {
         self.basis_mean * self.funding_per_day
     }
@@ -151,8 +101,6 @@ pub(crate) struct Tape {
     walk: Walk,
     spot: f64,
     basis: f64,
-    /// What is left of the lull the market is in, in hours.
-    lull_left: f64,
     /// How far [`Tape::step`] moves the market.
     hours_per_block: f64,
 }
@@ -169,6 +117,7 @@ pub(crate) struct Tick {
 impl Tick {
     /// The funding rate as a fraction of the perpetual's price a day, which
     /// is how a strategy reads it.
+    #[cfg(test)]
     pub(crate) fn funding_fraction(&self) -> f64 {
         if self.perp <= 0.0 {
             0.0
@@ -202,7 +151,6 @@ impl Tape {
             walk: Walk::new(seed),
             spot,
             basis,
-            lull_left: 0.0,
             hours_per_block: 1.0,
         }
     }
@@ -215,16 +163,7 @@ impl Tape {
     /// Move the market on by `hours`.
     pub(crate) fn step_by(&mut self, hours: f64) -> Tick {
         let p = self.params;
-        let mut mean = p.basis_mean;
-        if let Some(lulls) = p.lulls {
-            if self.lull_left <= 0.0 && self.walk.next() < hours / lulls.every_hours {
-                self.lull_left = lulls.hours;
-            }
-            if self.lull_left > 0.0 {
-                mean = lulls.basis;
-                self.lull_left -= hours;
-            }
-        }
+        let mean = p.basis_mean;
         self.spot *= 1.0 + p.hourly_volatility * self.walk.noise() * hours.sqrt();
         self.basis += (mean - self.basis) * (p.basis_pull * hours).min(1.0)
             + p.basis_volatility * self.walk.noise() * hours.sqrt();
@@ -297,7 +236,7 @@ pub async fn run(client: &Client, deployments: &Deployments, seconds_per_block: 
         // One transaction a block: the chain mines on a timer, and waiting for
         // four receipts would leave the market four blocks behind its own
         // clock.
-        let posting = client.send(
+        let posting = client.send_estimated(
             operator,
             venue,
             ILocalVenue::postCall {
@@ -339,238 +278,6 @@ async fn set_clock(client: &Client, seconds_per_block: u64) -> Result<()> {
         .await
         .context("setting how far a block moves the clock")?;
     Ok(())
-}
-
-// The testnet operator ------------------------------------------------------
-
-/// The longest stretch one post accrues funding for. An operator stopped for
-/// longer starts again without paying out days at a rate nobody saw quoted.
-pub(crate) const LONGEST_ACCRUAL: u64 = DAY;
-
-/// What one unit of a perpetual pays over `elapsed` seconds at `rate_per_day`
-/// (the market's funding rate, in the asset's units per unit a day), rounded
-/// towards zero.
-pub(crate) fn paid_per_unit(rate_per_day: I256, elapsed: u64) -> I256 {
-    rate_per_day * I256::try_from(elapsed).unwrap_or(I256::ZERO) / I256::try_from(DAY).unwrap()
-}
-
-/// Run the stand-in venue's market on a testnet, in real time: a post of
-/// both markets' prices and the perpetual's funding every `every`, signed by
-/// the operator, and the venue kept able to pay before each.
-///
-/// It starts from the venue's prices as they stand, so it can be stopped and
-/// started again. Each post accrues the funding of the rate that was quoted
-/// from the last accrual until now, by the chain's clock, so a slow block or
-/// a missed post is paid for exactly once.
-pub async fn operate(
-    client: &Client,
-    deployments: &Deployments,
-    every: Duration,
-    params: TapeParams,
-) -> Result<()> {
-    crate::deploy::require_stand_ins(deployments, "the stand-in venue's market")?;
-    let operator = client.account(Role::Operator)?;
-    if operator != deployments.roles.operator {
-        return Err(anyhow::Error::new(WrongOperator {
-            ours: operator,
-            venue: deployments.roles.operator,
-        }));
-    }
-    let venue = deployments.venue;
-    let spot = read_market(client, venue, SPOT).await?;
-    let perp = read_market(client, venue, PERP).await?;
-    let spot_price = to_f64(spot.mark);
-    let basis = starting_basis(&params, spot_price, to_f64(perp.mark), perp.fundingRate);
-    let now = client.block_timestamp().await?;
-    let mut tape = Tape::with(params, now, spot_price, basis);
-    let mut book = Book::new(deployments.deployed_block);
-    let mut gas = GasTally::default();
-    let posts_a_day = DAY as f64 / every.as_secs_f64();
-
-    tracing::info!(
-        chain = client.chain_id,
-        minutes = every.as_secs_f64() / 60.0,
-        spot = spot_price / 1e6,
-        funding_a_year = basis * params.funding_per_day * 365.0,
-        "the market operator is running: a post each interval, from the venue's prices as they stand"
-    );
-
-    let mut timer = tokio::time::interval(every);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last = tokio::time::Instant::now();
-    loop {
-        timer.tick().await;
-        let hours = last.elapsed().as_secs_f64().max(1.0) / 3_600.0;
-        last = tokio::time::Instant::now();
-        let tick = tape.step_by(hours);
-        match post_once(client, deployments, operator, &mut book, &tape, &tick).await {
-            Ok(posted) => {
-                gas.add(&posted);
-                tracing::info!(
-                    chain = client.chain_id,
-                    spot = format!("{:.2}", tick.spot / 1e6),
-                    perp = format!("{:.2}", tick.perp / 1e6),
-                    funding_a_day = format!("{:.6}", tick.funding_fraction()),
-                    funding_a_year = format!("{:.2}%", tick.funding_fraction() * 36_500.0),
-                    paid_per_unit = %posted.paid,
-                    minted = %posted.minted,
-                    gas = posted.post_gas,
-                    gas_a_day = format!("{:.0}", gas.average() * posts_a_day),
-                    coin_a_day = format!("{:.8}", gas.average_coin() * posts_a_day),
-                    "posted"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(chain = client.chain_id, error = %format!("{error:#}"), "the post did not land; the next one accrues for this stretch too");
-            }
-        }
-    }
-}
-
-/// The mnemonic here is not the one the deployment was made with: no retry
-/// changes that.
-#[derive(Debug)]
-pub(crate) struct WrongOperator {
-    ours: Address,
-    venue: Address,
-}
-
-impl std::fmt::Display for WrongOperator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this key's operator is {}, and the venue's is {}: the mnemonic is not the one this deployment was made with",
-            self.ours, self.venue
-        )
-    }
-}
-
-impl std::error::Error for WrongOperator {}
-
-/// How long a chain's operator waits after it stopped (its endpoint down
-/// when it started, say) before it starts again.
-pub(crate) const RESTART_AFTER: Duration = Duration::from_secs(60);
-
-/// Whether an operator that stopped with `error` is worth starting again:
-/// everything but a key that isn't the venue's operator.
-pub(crate) fn worth_restarting(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<WrongOperator>().is_none()
-        && error
-            .downcast_ref::<crate::solana_testnet::WrongOperator>()
-            .is_none()
-}
-
-/// Where a restarted operator's basis starts: the gap between the venue's
-/// two prices, or failing that the funding rate it quotes, or the mean.
-fn starting_basis(params: &TapeParams, spot: f64, perp: f64, rate: I256) -> f64 {
-    let from_gap = if spot > 0.0 && perp > 0.0 && perp != spot {
-        Some(perp / spot - 1.0)
-    } else {
-        None
-    };
-    let from_rate =
-        (perp > 0.0 && !rate.is_zero()).then(|| i256_to_f64(rate) / perp / params.funding_per_day);
-    from_gap
-        .or(from_rate)
-        .filter(|basis| basis.is_finite() && basis.abs() < 0.01)
-        .unwrap_or(params.basis_mean)
-}
-
-/// What one post did.
-struct Posted {
-    paid: I256,
-    minted: U256,
-    post_gas: u64,
-    /// Every transaction's gas in the coin, the mint's too.
-    coin: f64,
-}
-
-async fn post_once(
-    client: &Client,
-    deployments: &Deployments,
-    operator: Address,
-    book: &mut Book,
-    tape: &Tape,
-    tick: &Tick,
-) -> Result<Posted> {
-    let venue = deployments.venue;
-    let perp = read_market(client, venue, PERP).await?;
-    let now = client.block_timestamp().await?;
-    let elapsed = now
-        .saturating_sub(perp.fundingUpdatedAt)
-        .min(LONGEST_ACCRUAL);
-    let paid = paid_per_unit(perp.fundingRate, elapsed);
-    // A day ahead at the new rate, so a mint is needed about once a day
-    // rather than at every post.
-    let ahead = paid_per_unit(to_signed(tick.rate_per_day), DAY);
-    let (minted, mint_coin) =
-        keep_solvent(client, deployments, operator, book, paid, ahead).await?;
-    let receipt = client
-        .send(
-            operator,
-            venue,
-            ILocalVenue::postCall {
-                quotes: vec![tape.quote(SPOT, tick.spot), tape.quote(PERP, tick.perp)],
-                funding: vec![Funding {
-                    market: market_id(PERP),
-                    ratePerDay: to_signed(tick.rate_per_day),
-                    paidPerUnit: paid,
-                }],
-            },
-        )
-        .await
-        .context("posting the venue's prices")?;
-    Ok(Posted {
-        paid,
-        minted,
-        post_gas: receipt.gas_used,
-        coin: coin_spent(&receipt) + mint_coin,
-    })
-}
-
-/// What a landed transaction cost in the chain's coin.
-fn coin_spent(receipt: &alloy::rpc::types::TransactionReceipt) -> f64 {
-    receipt.gas_used as f64 * receipt.effective_gas_price as f64 / 1e18
-}
-
-/// The operator's gas so far, for the per-day figure each post logs.
-#[derive(Default)]
-struct GasTally {
-    posts: u64,
-    gas: u64,
-    coin: f64,
-}
-
-impl GasTally {
-    fn add(&mut self, posted: &Posted) {
-        self.posts += 1;
-        self.gas += posted.post_gas;
-        self.coin += posted.coin;
-    }
-
-    fn average(&self) -> f64 {
-        self.gas as f64 / self.posts.max(1) as f64
-    }
-
-    fn average_coin(&self) -> f64 {
-        self.coin / self.posts.max(1) as f64
-    }
-}
-
-async fn read_market(
-    client: &Client,
-    venue: Address,
-    name: &str,
-) -> Result<chain::bindings::venue::Market> {
-    client
-        .read(
-            venue,
-            ILocalVenue::marketOfCall {
-                market: market_id(name),
-            },
-        )
-        .await
-        .with_context(|| format!("reading the venue's {name} market"))
 }
 
 // Solvency ------------------------------------------------------------------
@@ -654,7 +361,7 @@ pub(crate) fn top_up(balance: U256, accounts: &[Owed], paid: I256, ahead: I256) 
 
 /// Make sure the venue holds what its accounts are owed once `paid` per unit
 /// has accrued, minting the development dollar to it (anyone may) when it
-/// doesn't. Returns what was minted and what the mint cost in the coin.
+/// doesn't. Returns what was minted.
 async fn keep_solvent(
     client: &Client,
     deployments: &Deployments,
@@ -662,7 +369,7 @@ async fn keep_solvent(
     book: &mut Book,
     paid: I256,
     ahead: I256,
-) -> Result<(U256, f64)> {
+) -> Result<U256> {
     let venue = deployments.venue;
     book.refresh(client, venue).await?;
     let mut accounts = Vec::with_capacity(book.masters.len());
@@ -689,10 +396,10 @@ async fn keep_solvent(
         .await?;
     let mint = top_up(balance, &accounts, paid, ahead);
     if mint.is_zero() {
-        return Ok((U256::ZERO, 0.0));
+        return Ok(U256::ZERO);
     }
-    let receipt = client
-        .send(
+    client
+        .send_estimated(
             operator,
             deployments.usd,
             ILocalUsd::mintCall {
@@ -708,7 +415,7 @@ async fn keep_solvent(
         accounts = accounts.len(),
         "the venue was short of what its accounts are owed: minted it the difference, for the longs who pay the funding"
     );
-    Ok((mint, coin_spent(&receipt)))
+    Ok(mint)
 }
 
 fn to_signed(value: f64) -> I256 {
@@ -716,77 +423,9 @@ fn to_signed(value: f64) -> I256 {
     if value < 0.0 { -magnitude } else { magnitude }
 }
 
-fn to_f64(value: U256) -> f64 {
-    value.to_string().parse().unwrap_or(0.0)
-}
-
-fn i256_to_f64(value: I256) -> f64 {
-    value.to_string().parse().unwrap_or(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Ten simulated years at a post every ten minutes.
-    fn run_testnet(seed: u64) -> Vec<f64> {
-        let hours = 10.0 / 60.0;
-        let steps = (10.0 * 365.0 * 24.0 / hours) as usize;
-        let mut tape = Tape::with(
-            TapeParams::TESTNET,
-            seed,
-            STARTING_PRICE as f64,
-            TapeParams::TESTNET.basis_mean,
-        );
-        (0..steps)
-            .map(|_| tape.step_by(hours).funding_fraction())
-            .collect()
-    }
-
-    #[test]
-    fn the_testnet_tape_averages_about_ten_percent_a_year() {
-        for seed in [1, 7, 1_000_003] {
-            let funding = run_testnet(seed);
-            let mean = funding.iter().sum::<f64>() / funding.len() as f64;
-            let a_year = mean * 365.0;
-            assert!(
-                (0.09..=0.11).contains(&a_year),
-                "seed {seed}: {a_year} a year"
-            );
-            // Its spread: a standard deviation of a few points a year, lulls
-            // included.
-            let variance =
-                funding.iter().map(|f| (f - mean).powi(2)).sum::<f64>() / funding.len() as f64;
-            let spread = variance.sqrt() * 365.0;
-            assert!((0.005..=0.04).contains(&spread), "seed {seed}: {spread}");
-        }
-    }
-
-    /// A carry exits below 0.00005 a day and enters again above 0.0002. The
-    /// market should make it do so now and then, never every hour.
-    #[test]
-    fn the_testnet_tape_rarely_crosses_below_the_exit() {
-        const EXIT: f64 = 0.000_05;
-        const ENTRY: f64 = 0.000_2;
-        for seed in [1, 7, 1_000_003] {
-            let funding = run_testnet(seed);
-            let below = funding.iter().filter(|f| **f < EXIT).count() as f64;
-            let share = below / funding.len() as f64;
-            assert!((0.002..=0.05).contains(&share), "seed {seed}: {share}");
-            // Exits that follow an entry, as the carry would see them.
-            let (mut exits, mut entered) = (0, true);
-            for f in &funding {
-                if entered && *f < EXIT {
-                    exits += 1;
-                    entered = false;
-                } else if *f >= ENTRY {
-                    entered = true;
-                }
-            }
-            let a_day = exits as f64 / (10.0 * 365.0);
-            assert!((0.05..=0.5).contains(&a_day), "seed {seed}: {a_day} a day");
-        }
-    }
 
     #[test]
     fn the_local_tape_is_the_one_it_always_was() {
@@ -797,20 +436,6 @@ mod tests {
         let again = Tape::new(3_600).step();
         assert_eq!(first.spot, again.spot);
         assert_eq!(first.perp, again.perp);
-    }
-
-    #[test]
-    fn paid_per_unit_is_the_rate_over_the_time_elapsed() {
-        // $18 a unit a day (0.0003 of $60,000), for ten minutes.
-        let rate = I256::try_from(18_000_000i64).unwrap();
-        assert_eq!(
-            paid_per_unit(rate, 600),
-            I256::try_from(125_000i64).unwrap()
-        );
-        assert_eq!(paid_per_unit(rate, DAY), rate);
-        assert_eq!(paid_per_unit(rate, 0), I256::ZERO);
-        // Negative funding pays the longs, and rounds towards zero.
-        assert_eq!(paid_per_unit(-rate, 1), -I256::try_from(208i64).unwrap());
     }
 
     fn size(units: i64) -> I256 {
@@ -857,35 +482,6 @@ mod tests {
         let paid = -paid;
         let mint = top_up(U256::ZERO, &accounts, paid, I256::ZERO);
         assert!(mint >= U256::from(26_000_000_000u64 + 125_000));
-    }
-
-    #[test]
-    fn a_restarted_operator_starts_from_the_venues_prices() {
-        let params = TapeParams::TESTNET;
-        let basis = starting_basis(&params, 60_000e6, 60_006e6, I256::ZERO);
-        assert!((basis - 0.0001).abs() < 1e-12);
-        // Equal prices: from the quoted rate, 0.0003 of the price a day.
-        let rate = I256::try_from(18_000_000i64).unwrap();
-        let basis = starting_basis(&params, 60_000e6, 60_000e6, rate);
-        assert!((basis - 0.0001).abs() < 1e-12);
-        // Nothing to go on: the mean.
-        assert_eq!(
-            starting_basis(&params, 60_000e6, 60_000e6, I256::ZERO),
-            params.basis_mean
-        );
-    }
-
-    #[test]
-    fn only_a_key_that_is_not_the_venue_s_operator_stops_the_operator_for_good() {
-        let wrong = anyhow::Error::new(WrongOperator {
-            ours: Address::repeat_byte(1),
-            venue: Address::repeat_byte(2),
-        })
-        .context("the market on evm:84532");
-        assert!(!worth_restarting(&wrong));
-        assert!(worth_restarting(&anyhow::anyhow!(
-            "the node did not answer"
-        )));
     }
 
     // On a local chain -----------------------------------------------------
@@ -938,86 +534,21 @@ mod tests {
         Some((anvil, port))
     }
 
-    /// A copy of the built contracts (every file under the contracts' `src`),
-    /// so a build running beside this test changes nothing under it; none if
-    /// they are not built.
-    fn artifacts(into: &std::path::Path) -> Option<std::path::PathBuf> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/evm");
-        let built = root.join("out");
-        if !built
-            .join("LocalVenue.sol")
-            .join("LocalVenue.json")
+    fn artifacts() -> Option<std::path::PathBuf> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/evm/out");
+        path.join("LocalVenue.sol/LocalVenue.json")
             .exists()
-        {
-            return None;
-        }
-        let mut sources = vec![root.join("src")];
-        while let Some(dir) = sources.pop() {
-            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    sources.push(path);
-                    continue;
-                }
-                let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let from = built.join(file);
-                if !file.ends_with(".sol") || !from.is_dir() {
-                    continue;
-                }
-                let to = into.join(file);
-                std::fs::create_dir_all(&to).unwrap();
-                for json in std::fs::read_dir(&from).unwrap().flatten() {
-                    std::fs::copy(json.path(), to.join(json.file_name())).unwrap();
-                }
-            }
-        }
-        Some(into.to_path_buf())
+            .then_some(path)
     }
 
-    async fn total_owed(client: &Client, venue: Address, master: Address) -> U256 {
-        client
-            .read(venue, ILocalVenue::accountValueCall { master })
-            .await
-            .unwrap()
-    }
-
-    async fn venue_holds(client: &Client, deployments: &Deployments) -> U256 {
-        client
-            .read(
-                deployments.usd,
-                IERC20::balanceOfCall {
-                    account: deployments.venue,
-                },
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn pass_time(client: &Client, seconds: u64) {
-        client
-            .raw_request("evm_increaseTime", serde_json::json!([seconds]))
-            .await
-            .unwrap();
-        client
-            .raw_request("evm_mine", serde_json::json!([]))
-            .await
-            .unwrap();
-    }
-
-    /// On a local chain, as the operator posts on a testnet: each post
-    /// moves both markets to the tape's prices, accrues exactly the funding
-    /// the venue quoted for the time elapsed by the chain's clock, and
-    /// leaves the venue holding at least what its accounts could take out,
-    /// minting it the difference when a short is owed more than it holds.
+    /// The local market's posts go out at their own estimate of gas (a node
+    /// that signs for the operator would otherwise send a post it refuses):
+    /// each lands, so both markets' prices and the perpetual's funding move
+    /// block after block.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn each_post_pays_the_quoted_rate_for_the_time_elapsed_and_keeps_the_venue_solvent() {
-        use chain::bindings::venue::OrderRequest;
-        let dir = std::env::temp_dir().join(format!("shonin-market-post-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let Some(artifacts) = artifacts(&dir.join("out")) else {
+    async fn the_local_market_moves_the_venue_s_prices_and_funding_block_after_block() {
+        use chain::bindings::venue::ILocalVenue;
+        let Some(artifacts) = artifacts() else {
             eprintln!("the contracts are not built: skipping");
             return;
         };
@@ -1025,6 +556,9 @@ mod tests {
             eprintln!("anvil is not installed: skipping");
             return;
         };
+        let dir = std::env::temp_dir().join(format!("shonin-local-market-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let url = format!("http://127.0.0.1:{port}");
         let config = chain::ChainConfig {
             label: "a local chain".to_string(),
@@ -1051,133 +585,45 @@ mod tests {
         )
         .await
         .unwrap();
-        let venue = deployments.venue;
-        let operator = deployments.roles.operator;
-
-        // A trader short a tenth of a unit, with $10,000 at the venue.
-        let trader = client.account(Role::Viewer).unwrap();
-        let dollars = U256::from(10_000_000_000u64);
-        client
-            .send(
-                trader,
-                deployments.usd,
-                ILocalUsd::mintCall {
-                    to: trader,
-                    amount: dollars,
-                },
-            )
-            .await
-            .unwrap();
-        client
-            .send(
-                trader,
-                deployments.usd,
-                IERC20::approveCall {
-                    spender: venue,
-                    value: dollars,
-                },
-            )
-            .await
-            .unwrap();
-        client
-            .send(trader, venue, ILocalVenue::depositCall { amount: dollars })
-            .await
-            .unwrap();
-        client
-            .send(
-                trader,
-                venue,
-                ILocalVenue::placeCall {
-                    master: trader,
-                    orders: vec![OrderRequest {
-                        market: market_id(PERP),
-                        isBuy: false,
-                        size: U256::from(100_000_000_000_000_000u128),
-                        limitPrice: U256::from(1u64),
-                        reduceOnly: false,
-                    }],
-                },
-            )
-            .await
-            .unwrap();
-        let short = client
-            .read(
-                venue,
-                ILocalVenue::positionOfCall {
-                    master: trader,
-                    market: market_id(PERP),
-                },
-            )
-            .await
-            .unwrap()
-            .size;
-        assert!(short.is_negative(), "the trader holds no short: {short}");
-
-        let mut book = Book::new(deployments.deployed_block);
-        let mut tape = Tape::with(
-            TapeParams::TESTNET,
-            7,
-            STARTING_PRICE as f64,
-            TapeParams::TESTNET.basis_mean,
-        );
-        for _ in 0..3 {
-            pass_time(&client, 600).await;
-            let before = read_market(&client, venue, PERP).await.unwrap();
-            let now = client.block_timestamp().await.unwrap();
-            let tick = tape.step_by(10.0 / 60.0);
-            let posted = post_once(&client, &deployments, operator, &mut book, &tape, &tick)
-                .await
-                .unwrap();
-            let after = read_market(&client, venue, PERP).await.unwrap();
-            let elapsed = now - before.fundingUpdatedAt;
-            assert_eq!(posted.paid, paid_per_unit(before.fundingRate, elapsed));
-            assert_eq!(after.fundingIndex - before.fundingIndex, posted.paid);
-            assert_eq!(after.fundingRate, to_signed(tick.rate_per_day));
-            assert_eq!(after.mark, tape.quote(PERP, tick.perp).mark);
-            let spot = read_market(&client, venue, SPOT).await.unwrap();
-            assert_eq!(spot.mark, tape.quote(SPOT, tick.spot).mark);
-            assert!(
-                venue_holds(&client, &deployments).await
-                    >= total_owed(&client, venue, trader).await
-            );
+        let market = |name: &'static str| {
+            let client = client.clone();
+            let venue = deployments.venue;
+            async move {
+                client
+                    .read(
+                        venue,
+                        ILocalVenue::marketOfCall {
+                            market: market_id(name),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let before = market(PERP).await;
+        let running = {
+            let (client, deployments) = (client.clone(), deployments.clone());
+            tokio::spawn(async move { run(&client, &deployments, 3_600).await })
+        };
+        let mut moved = 0;
+        let mut last = before.fundingUpdatedAt;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = market(PERP).await;
+            if now.fundingUpdatedAt > last {
+                moved += 1;
+                last = now.fundingUpdatedAt;
+            }
+            if moved >= 3 {
+                break;
+            }
         }
-        assert!(
-            !read_market(&client, venue, PERP)
-                .await
-                .unwrap()
-                .fundingRate
-                .is_zero()
-        );
-
-        // A rate of a tenth of the price a day, for a day: the short is owed
-        // far more than the trades left the venue, so it is minted the
-        // difference before the post.
-        let rate = to_signed(STARTING_PRICE as f64 / 10.0);
-        client
-            .send(
-                operator,
-                venue,
-                ILocalVenue::setFundingCall {
-                    market: market_id(PERP),
-                    ratePerDay: rate,
-                },
-            )
-            .await
-            .unwrap();
-        pass_time(&client, DAY).await;
-        let tick = tape.step_by(24.0);
-        let posted = post_once(&client, &deployments, operator, &mut book, &tape, &tick)
-            .await
-            .unwrap();
-        assert!(
-            posted.paid >= paid_per_unit(rate, DAY - 5),
-            "{}",
-            posted.paid
-        );
-        assert!(!posted.minted.is_zero(), "nothing was minted");
-        let holds = venue_holds(&client, &deployments).await;
-        let owed = total_owed(&client, venue, trader).await;
-        assert!(holds >= owed, "the venue holds {holds} and owes {owed}");
+        running.abort();
+        assert!(moved >= 3, "the perpetual's funding moved {moved} times");
+        let perp = market(PERP).await;
+        let spot = market(SPOT).await;
+        assert_ne!(perp.mark, before.mark);
+        assert_ne!(spot.mark, U256::from(STARTING_PRICE));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

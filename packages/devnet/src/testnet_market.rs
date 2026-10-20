@@ -636,6 +636,10 @@ async fn inventory(on: &OnChain<'_>, options: &Options) -> Result<()> {
             continue;
         }
         let funder_holds = erc20.balanceOf(on.from).call().await?;
+        // The funder's balance once it has wrapped, read at the wrap's own
+        // block: a public endpoint may answer "latest" from a node a block
+        // behind, which doesn't yet show the wrap.
+        let mut wrapped_at = None;
         if wrapped && funder_holds < need {
             let wrap = need - funder_holds;
             let coin = on.funder.get_balance(on.from).await?;
@@ -645,7 +649,7 @@ async fn inventory(on: &OnChain<'_>, options: &Options) -> Result<()> {
                     format_ether(wrap)
                 );
             }
-            send(
+            let receipt = send(
                 on,
                 TransactionRequest::default()
                     .with_to(token.address)
@@ -654,6 +658,7 @@ async fn inventory(on: &OnChain<'_>, options: &Options) -> Result<()> {
                 "wrapping the funder's coin",
             )
             .await?;
+            wrapped_at = receipt.block_number;
         } else if funder_holds < need {
             println!(
                 "  inventory: the market needs {} {} and the funder holds {}: sending what it has",
@@ -662,7 +667,11 @@ async fn inventory(on: &OnChain<'_>, options: &Options) -> Result<()> {
                 format_units(funder_holds, token.decimals)?
             );
         }
-        let sent = need.min(erc20.balanceOf(on.from).call().await?);
+        let funder_holds = match wrapped_at {
+            Some(block) => balance_at(&erc20, on.from, block).await?,
+            None => funder_holds,
+        };
+        let sent = need.min(funder_holds);
         if sent.is_zero() {
             continue;
         }
@@ -714,6 +723,33 @@ async fn inventory(on: &OnChain<'_>, options: &Options) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `who`'s balance of `token` as of `block`, waiting for the endpoint to
+/// reach that block if it hasn't yet.
+async fn balance_at<P: Provider>(
+    token: &IToken::ITokenInstance<P>,
+    who: Address,
+    block: u64,
+) -> Result<U256> {
+    let mut tries = 0;
+    loop {
+        match token
+            .balanceOf(who)
+            .block(alloy::eips::BlockId::number(block))
+            .call()
+            .await
+        {
+            Ok(balance) => return Ok(balance),
+            Err(_) if tries < 10 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading the balance at block {block}"));
+            }
+        }
+    }
 }
 
 /// The lowest and highest ticks a pool at `spacing` can hold a position
