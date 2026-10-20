@@ -36,7 +36,7 @@ async fn a_pending_request_unread_is_not_shown_as_gone() {
             }
             if data.starts_with(&selector::<IVault::requestAtCall>()) {
                 if flag.load(Ordering::SeqCst) {
-                    return Some(Err("a node hiccup".to_string()));
+                    return Some(Err(format!("{REVERTED}: a read the vault does not answer")));
                 }
                 // owner, kind (Deposit), earliest, done = false, amount, ref.
                 return Some(Ok(json!(format!(
