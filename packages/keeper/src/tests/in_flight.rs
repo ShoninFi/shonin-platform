@@ -992,6 +992,7 @@ async fn a_node_that_signs_is_handed_one_send_at_a_time() {
                     Json(match asked["method"].as_str().unwrap_or_default() {
                         "eth_chainId" => ok(json!(format!("0x{SIGNED_FOR:x}"))),
                         "eth_accounts" => ok(json!([keeper])),
+                        "eth_estimateGas" => ok(json!("0x5208")),
                         "eth_sendTransaction" => {
                             let number = {
                                 let mut taking = taking.lock().unwrap();

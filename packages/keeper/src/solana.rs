@@ -194,7 +194,7 @@ pub async fn keep_chain(
     );
     let mut said = Said::default();
     let mut slowed = 0u32;
-    let mut path_on_wakes: Option<bool> = None;
+    let mut path_said: Option<crate::PathSaid> = None;
     let mut earlier = Earlier::default();
     let counted = format!("solana:{}", served.client.cluster);
     let mut requests_before = requests_so_far(&counted);
@@ -252,6 +252,7 @@ pub async fn keep_chain(
         };
         earlier.note(&served.key, &observation.factory);
         let mut active_because = None;
+        let mut clock_unbounded = None;
         match observation.now {
             Some(time) => clock.note(time, observation.wall_ms),
             None => active_because = Some("the node did not answer the clock".to_string()),
@@ -260,6 +261,7 @@ pub async fn keep_chain(
             && let Err(unbounded) = clock.state()
         {
             active_because = Some(format!("the cluster's clock is not bounded: {unbounded:?}"));
+            clock_unbounded = Some(unbounded);
         }
         let reads = match &active_because {
             None => {
@@ -370,15 +372,15 @@ pub async fn keep_chain(
         }
         // A change of path is said at info: an operator sees a cluster read
         // every round, and why.
-        let on_wakes = active_because.is_none();
-        if path_on_wakes != Some(on_wakes) {
+        let said_as = crate::path_said_as(active_because.is_none(), clock_unbounded.as_ref());
+        if path_said.as_ref() != Some(&said_as) {
             match &active_because {
                 None => tracing::info!(chain = %served.key, "the cluster is read at its wakes"),
                 Some(because) => {
                     tracing::info!(chain = %served.key, because, "the cluster is read every round")
                 }
             }
-            path_on_wakes = Some(on_wakes);
+            path_said = Some(said_as);
         }
         sleep_or_answer(next.at, &answered).await;
     }

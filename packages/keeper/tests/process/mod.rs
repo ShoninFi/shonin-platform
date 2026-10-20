@@ -40,6 +40,12 @@ alloy::sol! {
     interface IReplacesFactory {
         function previous() external view returns (address);
     }
+
+    /// Where a station was made, and the registry its keys are blessed in.
+    interface IMadeBy {
+        function factory() external view returns (address);
+        function attestation() external view returns (address);
+    }
 }
 
 pub const DAY: u64 = 86_400;
@@ -671,4 +677,85 @@ pub fn one_vault(node: &Shared) {
         IReplacesFactory::previousCall {},
         Address::ZERO,
     );
+}
+
+/// Where [`a_registry`] puts the station's factory and its registry.
+pub const MADE_BY: Address = Address::repeat_byte(0x61);
+pub const REGISTRY: Address = Address::repeat_byte(0x62);
+
+/// The registry, as `revokeKey` reads it for `driver`'s `key` at the
+/// station of [`a_spec`]: the station runs, the driver is neither reclaimed
+/// nor revoked, and the key is an executor's, blessed for the vault or not.
+pub fn a_registry(node: &Shared, driver: B256, key: Address, blessed: bool) {
+    use chain::bindings::attestation::{IAttestationRegistry, ImageKind, KeyInfo};
+    use chain::bindings::station::IStation;
+    let implementation = Address::repeat_byte(0x63);
+    answers(node, STATION, IStation::stoppedCall {}, false);
+    answers_exactly(node, STATION, IStation::reclaimedCall { driver }, false);
+    answers(node, STATION, IMadeBy::factoryCall {}, MADE_BY);
+    answers(node, MADE_BY, IMadeBy::attestationCall {}, REGISTRY);
+    answers_exactly(
+        node,
+        STATION,
+        IStation::pinnedDriverCall { driver },
+        implementation,
+    );
+    answers_exactly(
+        node,
+        REGISTRY,
+        IAttestationRegistry::isDriverRevokedCall {
+            name: driver,
+            implementation,
+        },
+        false,
+    );
+    answers_exactly(
+        node,
+        REGISTRY,
+        IAttestationRegistry::isBlessedForCall {
+            signer: key,
+            vaultChain: U256::from(31337u64),
+            vault: VAULT,
+            strategyHash: B256::ZERO,
+        },
+        blessed,
+    );
+    answers_exactly(
+        node,
+        REGISTRY,
+        IAttestationRegistry::keyInfoCall { signer: key },
+        KeyInfo {
+            imageDigest: B256::ZERO,
+            projectId: B256::ZERO,
+            kind: ImageKind::Executor,
+            strategyHash: B256::ZERO,
+            vaultChain: U256::from(31337u64),
+            vault: VAULT,
+            trustRoot: B256::ZERO,
+            verifier: Address::ZERO,
+            blessedUntil: 0,
+        },
+    );
+}
+
+/// Count the node's gas estimates of calls to `to` with `selector`, in
+/// `counted`; an estimate `refuse` names is answered as the revert it gives.
+pub fn count_estimates(
+    node: &Shared,
+    to: Address,
+    selector: [u8; 4],
+    counted: Arc<Mutex<usize>>,
+    refuse: Option<&'static str>,
+) {
+    node.lock().unwrap().on_request = Some(Arc::new(move |method, params| {
+        if method != "eth_estimateGas" {
+            return None;
+        }
+        let (at, data) = tx_fields(&params[0]);
+        if at != to || data.get(..4) != Some(selector.as_slice()) {
+            return None;
+        }
+        *counted.lock().unwrap() += 1;
+        refuse.map(|reason| json!({"code": 3, "message": format!("execution reverted: {reason}")}))
+    }));
 }

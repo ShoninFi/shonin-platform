@@ -484,12 +484,6 @@ impl Observed {
             .map(|wake| &wake.snapshot)
     }
 
-    /// Whether this wake's reads are answered from an observation (even if
-    /// a send has since moved them to the chain itself).
-    pub fn is_served(&self) -> bool {
-        self.wake.is_some()
-    }
-
     /// The chain's block interval as last measured, in seconds.
     pub fn block_interval_seen(&self) -> Option<u64> {
         self.learned().and_then(|learned| learned.block_interval)
@@ -785,11 +779,12 @@ impl Observed {
     }
 
     /// Everything read after a send that may have gone out is read of the
-    /// chain itself: one the node refused at its estimate changed nothing,
-    /// and anything else may have.
+    /// chain itself: one the node refused at its estimate, or one that was
+    /// never handed to it, changed nothing, and anything else may have.
     fn sent<T>(&self, sent: Result<T>) -> Result<T> {
         let refused = sent.as_ref().is_err_and(|error| {
-            crate::execution_reverted(error)
+            (crate::execution_reverted(error)
+                || error.chain().any(|cause| cause.is::<chain::NeverSent>()))
                 && !error.chain().any(|cause| cause.is::<chain::Reverted>())
         });
         if !refused {
@@ -806,14 +801,18 @@ impl Observed {
         sent
     }
 
-    /// Send a call as `from`, and wait for it to land.
+    /// Send a call as `from` with the gas its estimate gives, and wait for
+    /// it to land. The estimate is asked first whoever signs (see
+    /// [`Client::send_estimated`]): a call it refuses is not sent, so none
+    /// the chain would revert is paid for, the block's whole gas limit with
+    /// it on a node that signs.
     pub async fn send<C: SolCall>(
         &self,
         from: Address,
         to: Address,
         call: C,
     ) -> Result<TransactionReceipt> {
-        self.sent(self.client.send(from, to, call).await)
+        self.sent(self.client.send_estimated(from, to, call).await)
     }
 
     /// Send a call as `from` with the gas limit given, and wait for it to

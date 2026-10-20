@@ -2114,6 +2114,32 @@ impl Client {
         self.send_with(from, to, call, Some(gas_limit)).await
     }
 
+    /// Send a call as `from` with the gas its estimate gives, asked here
+    /// before anything is sent, and wait for it to land. A node that signs
+    /// for its accounts fills a missing gas limit in itself, and one whose
+    /// estimate reverts it fills with the block's whole limit and sends
+    /// anyway, to be paid for as a revert. Estimated here first, a call the
+    /// chain would refuse is not sent, whoever signs: the estimate's refusal
+    /// is the error, and nothing went out.
+    pub async fn send_estimated<C: SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: C,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(call.abi_encode());
+        let gas = self
+            .provider
+            .estimate_gas(request)
+            .await
+            .with_context(|| format!("estimating the gas of {}", C::SIGNATURE))
+            .map_err(NeverSent::wrap)?;
+        self.send_with(from, to, call, Some(gas)).await
+    }
+
     async fn send_with<C: SolCall>(
         &self,
         from: Address,

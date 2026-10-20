@@ -554,7 +554,7 @@ async fn keep_vaults(
     let notice = Duration::from_millis(policy.keeper_notice_ms);
     let mut previous: Option<std::sync::Arc<observed::Snapshot>> = None;
     let mut logs_said = Said::default();
-    let mut path_on_wakes: Option<bool> = None;
+    let mut path_said: Option<PathSaid> = None;
     let mut stations: HashMap<Address, Address> = HashMap::new();
     // A read stays in the looks for as long as spans the key loop's looks
     // and a few notice bounds.
@@ -575,6 +575,7 @@ async fn keep_vaults(
             .unwrap_or_default();
         let step = follower.step(&plan, chain::follow::At::Latest).await;
         let mut active_because: Option<String> = None;
+        let mut clock_unbounded = None;
         match &step.continuity {
             Continuity::Extends => {}
             Continuity::Replaced { fork_at, depth } => {
@@ -605,6 +606,7 @@ async fn keep_vaults(
             && let Err(unbounded) = follower.clock.state()
         {
             active_because = Some(format!("the chain's clock is not bounded: {unbounded:?}"));
+            clock_unbounded = Some(unbounded);
         }
         let mut snapshot = match (&active_because, &step.observed) {
             (None, Some(observed)) => Some(std::sync::Arc::new(observed::Snapshot::new(
@@ -771,21 +773,39 @@ async fn keep_vaults(
         }
         // A change of path is said at info: an operator sees a chain read
         // every round, and why.
-        let on_wakes = active_because.is_none();
-        if path_on_wakes != Some(on_wakes) {
+        let said_as = path_said_as(active_because.is_none(), clock_unbounded.as_ref());
+        if path_said.as_ref() != Some(&said_as) {
             match &active_because {
                 None => tracing::info!(chain = %served.key, "the chain is read at its wakes"),
                 Some(because) => {
                     tracing::info!(chain = %served.key, because, "the chain is read every round")
                 }
             }
-            path_on_wakes = Some(on_wakes);
+            path_said = Some(said_as);
         }
         previous = snapshot;
         tokio::select! {
             () = tokio::time::sleep_until(next.at.into()) => {}
             () = answered.notified() => {}
         }
+    }
+}
+
+/// How a chain's path was last said: whether it is read at its wakes, and,
+/// read every round for a clock that isn't bounded, why not by kind, without
+/// the figures. A clock is unbounded at first while it settles, and is said
+/// again once it is judged: a local chain whose clock runs ahead is read
+/// every round for that, not for the few looks it took to tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathSaid {
+    on_wakes: bool,
+    clock: Option<std::mem::Discriminant<chain::follow::clock::Unbounded>>,
+}
+
+fn path_said_as(on_wakes: bool, clock: Option<&chain::follow::clock::Unbounded>) -> PathSaid {
+    PathSaid {
+        on_wakes,
+        clock: clock.map(std::mem::discriminant),
     }
 }
 
@@ -3145,8 +3165,9 @@ fn ask_for_escape(
 
 /// Take back the venue approval of a key whose blessing has gone, or whose
 /// driver the registry revoked. The station refuses while the key still
-/// stands, so a refusal here only means there is nothing to do. Whether any
-/// key may still be approved afterwards.
+/// stands, so one still blessed is not tried, and a refusal at its estimate
+/// only means there is nothing to do. Whether any key may still be approved
+/// afterwards.
 async fn revoke_keys(client: &Observed, keeper: Address, station: Address) -> bool {
     let Ok(spec) = client.read(station, IStation::specCall {}).await else {
         return true;
@@ -3163,10 +3184,11 @@ async fn revoke_keys(client: &Observed, keeper: Address, station: Address) -> bo
         if key == Address::ZERO {
             continue;
         }
-        // Read from an observation, a revoke the station would refuse is not
-        // tried: its estimate would only be refused. On the active path it
-        // is tried, and the station judges it.
-        if client.is_served() && still_blessed(client, station, driver, key).await == Some(true) {
+        // A revoke the station would refuse is not tried, whichever way the
+        // chain is read: the key's blessing is read either way. One whose
+        // facts can't all be read is left to its estimate, which the send
+        // asks first: a refused estimate sends nothing.
+        if still_blessed(client, station, driver, key).await == Some(true) {
             left = true;
             continue;
         }
@@ -3188,7 +3210,7 @@ async fn revoke_keys(client: &Observed, keeper: Address, station: Address) -> bo
 /// and the registry counts the key as blessed for the station's vault and
 /// bundle, as an executor's key. The registry is the one the station's
 /// factory names. `None` when any of that can't be read: the revoke is then
-/// tried, and the station judges it.
+/// left to its estimate, and the station judges it there.
 async fn still_blessed(
     client: &Observed,
     station: Address,
@@ -3285,7 +3307,7 @@ async fn revoke_skipped(
     let mut taken_back = Vec::new();
     for &(driver, key) in &memory.skipped {
         // As for a key that no longer stands (see [`revoke_keys`]).
-        if client.is_served() && still_blessed(client, station, driver, key).await == Some(true) {
+        if still_blessed(client, station, driver, key).await == Some(true) {
             continue;
         }
         if send(
@@ -6686,6 +6708,33 @@ mod tests {
     use alloy::sol_types::SolCall;
     use chain::bindings::station::StationSpec;
     use chain::bindings::vault::{Claim, Valuation};
+
+    #[test]
+    fn a_clock_judged_after_it_settles_is_said_again_and_its_figures_moving_are_not() {
+        use chain::follow::clock::Unbounded;
+        let settling = |have| Unbounded::Settling { have, need: 3 };
+        let rate = |chain_ms| Unbounded::Rate {
+            chain_ms,
+            wall_ms: 5_000,
+        };
+        assert_eq!(
+            path_said_as(false, Some(&settling(1))),
+            path_said_as(false, Some(&settling(2)))
+        );
+        assert_ne!(
+            path_said_as(false, Some(&settling(2))),
+            path_said_as(false, Some(&rate(3_600_000)))
+        );
+        assert_eq!(
+            path_said_as(false, Some(&rate(3_600_000))),
+            path_said_as(false, Some(&rate(7_200_000)))
+        );
+        assert_ne!(
+            path_said_as(false, None),
+            path_said_as(true, None),
+            "a move to wakes is said"
+        );
+    }
 
     #[test]
     fn units_a_staged_close_holds_off_are_never_frozen_for_meanwhile() {

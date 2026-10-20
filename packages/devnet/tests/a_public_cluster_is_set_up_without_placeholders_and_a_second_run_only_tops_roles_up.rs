@@ -5,13 +5,17 @@
 //! of a team's mnemonic), and the testnet network's Solana cluster pointed
 //! at it.
 //!
-//! The set-up funds every role by transfer from the deployer, keeping its
-//! reserve; puts the dollar's mint at its fixed index of the team's
-//! mnemonic; sets the registry up with no timelock and allows the operator's
-//! real project and no image at all; and writes the deployment file with the
-//! chain list's endpoint. Run again, it changes no record and mints no
-//! dollar; a role that spent is topped back up to its amount and no other is
-//! given anything; the file is the same, its first slot kept. The admin's
+//! The dollar is Circle's USDC, which nobody here mints: the stand-in
+//! cluster is given its mint at its devnet address, as devnet has it. Until
+//! it is there the set-up refuses and sends nothing. Then the set-up funds
+//! every role by transfer from the deployer, keeping its reserve; takes
+//! Circle's USDC as the dollar, minting none and setting up no stand-in
+//! venue or driver, which only a local cluster has; sets the registry up
+//! with no timelock and allows the operator's real project and no image at
+//! all; and writes the deployment file with the chain list's endpoint. Run
+//! again, it changes no record and mints no dollar; a role that spent is
+//! topped back up to its amount and no other is given anything; the file is
+//! the same, its first slot kept. The admin's
 //! changes then reach the Solana registry: an image proposed once and
 //! revoked, a holder skipped, the project already allowed, the development
 //! checker kept while it is the only one. A team phrase that is the
@@ -39,11 +43,9 @@ const TEAM: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const PROJECT: &str = "shonin-testnet";
 const DIGEST: &str = "sha256:5ea1ed0000000000000000000000000000000000000000000000000000c0ffee";
-/// The dollar's mint's index in the team's mnemonic.
-const DOLLAR_MINT: u32 = 108;
+/// Circle's USDC on Solana devnet: a public cluster's dollar.
+const CIRCLE_USDC: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
-/// What the author, the viewer, the keeper and the admin start with.
-const STARTING_DOLLARS: u64 = 1_000_000_000_000;
 
 /// Every program, by its library name, and whether it is deployed final.
 const PROGRAMS: [(&str, bool); 11] = [
@@ -271,33 +273,9 @@ async fn place_programs(cluster: &Cluster, client: &SolanaClient) {
         .airdrop(&deployer.pubkey(), 100 * LAMPORTS_PER_SOL)
         .await
         .unwrap();
-    let http = reqwest::Client::new();
+    let loader = bpf_loader_upgradeable::ID.to_string();
     let set = |address: String, data: Vec<u8>, lamports: u64, executable: bool| {
-        let http = http.clone();
-        let rpc = cluster.rpc.clone();
-        async move {
-            let hex: String = data.iter().map(|byte| format!("{byte:02x}")).collect();
-            let answer: serde_json::Value = http
-                .post(&rpc)
-                .json(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "surfnet_setAccount",
-                    "params": [address, {
-                        "lamports": lamports,
-                        "data": hex,
-                        "owner": bpf_loader_upgradeable::ID.to_string(),
-                        "executable": executable,
-                    }],
-                }))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert!(answer.get("error").is_none(), "{answer}");
-        }
+        set_account(cluster, address, data, lamports, &loader, executable)
     };
     let dir = programs().unwrap();
     for (program, fixed) in PROGRAMS {
@@ -324,6 +302,72 @@ async fn place_programs(cluster: &Cluster, client: &SolanaClient) {
         let rent = client.rpc.rent_exempt_minimum(account.len()).await.unwrap();
         set(id.to_string(), account, rent, true).await;
     }
+}
+
+/// Write an account in place with Surfpool's `surfnet_setAccount`.
+async fn set_account(
+    cluster: &Cluster,
+    address: String,
+    data: Vec<u8>,
+    lamports: u64,
+    owner: &str,
+    executable: bool,
+) {
+    let hex: String = data.iter().map(|byte| format!("{byte:02x}")).collect();
+    let answer: serde_json::Value = reqwest::Client::new()
+        .post(&cluster.rpc)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setAccount",
+            "params": [address, {
+                "lamports": lamports,
+                "data": hex,
+                "owner": owner,
+                "executable": executable,
+            }],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(answer.get("error").is_none(), "{answer}");
+}
+
+/// Circle's USDC mint, as devnet has it: six decimals, some supply, and a
+/// mint authority that is Circle's, not any of the team's keys. An offline
+/// cluster can't fetch it, so it is written in place.
+async fn place_circle_usdc(cluster: &Cluster, client: &SolanaClient) {
+    use chain::solana::programs::anchor_spl::token;
+    let circle = [0xc1; 32];
+    // The token program's mint layout: an optional mint authority, the
+    // supply, the decimals, whether it is initialised, an optional freeze
+    // authority.
+    let mut data = vec![1, 0, 0, 0];
+    data.extend_from_slice(&circle);
+    data.extend_from_slice(&1_000_000_000_000u64.to_le_bytes());
+    data.push(6);
+    data.push(1);
+    data.extend_from_slice(&[0; 36]);
+    let rent = client.rpc.rent_exempt_minimum(data.len()).await.unwrap();
+    set_account(
+        cluster,
+        CIRCLE_USDC.to_string(),
+        data,
+        rent,
+        &token::ID.to_string(),
+        false,
+    )
+    .await;
+}
+
+/// The dollar's mint account's data: a mint that minted nothing more is
+/// unchanged.
+async fn usdc_mint(client: &SolanaClient) -> Vec<u8> {
+    let mint: chain::solana::Pubkey = CIRCLE_USDC.parse().unwrap();
+    client.account(&mint).await.unwrap().unwrap().data
 }
 
 fn read_file(cluster: &Cluster) -> SolanaDeployments {
@@ -353,6 +397,25 @@ async fn a_public_cluster_is_set_up_without_placeholders_and_a_second_run_only_t
 
     place_programs(&cluster, &client).await;
 
+    // Without Circle's USDC on the cluster the set-up refuses, and sends
+    // nothing: no role is given any coin.
+    let without_usdc = devnet(&cluster, TEAM, &["solana-setup", "--project", PROJECT]);
+    assert!(!without_usdc.status.success());
+    assert!(
+        said(&without_usdc).contains(CIRCLE_USDC) && said(&without_usdc).contains("is not on"),
+        "{}",
+        said(&without_usdc)
+    );
+    for role in [Role::Keeper, Role::Admin, Role::Viewer] {
+        assert_eq!(
+            client.lamports(&team.address(role)).await.unwrap(),
+            0,
+            "{role:?}"
+        );
+    }
+    place_circle_usdc(&cluster, &client).await;
+    let usdc_before = usdc_mint(&client).await;
+
     // The published development phrase is never a public cluster's.
     let refused = devnet(
         &cluster,
@@ -374,16 +437,13 @@ async fn a_public_cluster_is_set_up_without_placeholders_and_a_second_run_only_t
     assert!(first.contains("set up"), "{first}");
     let written = read_file(&cluster);
 
-    // The file: the roles, the dollar at its fixed index, the chain list's
+    // The file: the roles, Circle's USDC as the dollar, the chain list's
     // endpoint, the programs at this build's ids.
     let roles = written.roles.clone().expect("the roles are written");
     assert_eq!(roles.keeper, team.address(Role::Keeper).to_string());
     assert_eq!(roles.admin, team.address(Role::Admin).to_string());
     assert_eq!(roles.deployer, team.deployer.pubkey().to_string());
-    let mint = keys::keypair_from_mnemonic(TEAM, DOLLAR_MINT)
-        .unwrap()
-        .pubkey();
-    assert_eq!(written.mint.as_deref(), Some(mint.to_string().as_str()));
+    assert_eq!(written.mint.as_deref(), Some(CIRCLE_USDC));
     assert_eq!(written.rpc_url, cluster.rpc);
     assert_eq!(written.cluster, "localnet");
     assert_eq!(written.programs.len(), PROGRAMS.len());
@@ -442,41 +502,48 @@ async fn a_public_cluster_is_set_up_without_placeholders_and_a_second_run_only_t
             "a placeholder {service} image is proposed"
         );
     }
-    // Both drivers proposed, each final.
-    for driver in [local_driver::NAME, orca_driver::NAME] {
-        assert!(
-            client
-                .account(&registry::read::approval_address(
-                    registry::state::ApprovalKind::Driver,
-                    &driver,
-                ))
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-    // The venue's markets and reserves, and the dollars handed out.
-    for market in ["BTC", "BTC-PERP"] {
-        assert!(
-            client
-                .account(&local_venue::market_address(&name(market)))
-                .await
-                .unwrap()
-                .is_some(),
-            "{market} is listed"
-        );
-    }
-    let platform = chain::solana::Platform::from_deployments(&written).unwrap();
-    let author_dollars = platform.dollars(&team.address(Role::Author));
-    assert_eq!(
-        client.token_balance(&author_dollars).await.unwrap(),
-        STARTING_DOLLARS
+    // Orca's driver proposed; the stand-in driver, a local cluster's, not.
+    let driver_proposed = async |driver: [u8; 32]| {
+        client
+            .account(&registry::read::approval_address(
+                registry::state::ApprovalKind::Driver,
+                &driver,
+            ))
+            .await
+            .unwrap()
+            .is_some()
+    };
+    assert!(driver_proposed(orca_driver::NAME).await);
+    assert!(
+        !driver_proposed(local_driver::NAME).await,
+        "the stand-in driver is proposed on a public cluster"
     );
-    let reserves = client
-        .token_balance(&local_venue::vault_address())
-        .await
-        .unwrap();
-    assert!(reserves > 0);
+    // No stand-in venue, markets or reserves.
+    for at in [
+        local_venue::venue_address(),
+        local_venue::market_address(&name("BTC")),
+        local_venue::market_address(&name("BTC-PERP")),
+        local_venue::vault_address(),
+    ] {
+        assert!(
+            client.account(&at).await.unwrap().is_none(),
+            "a stand-in venue account is at {at}"
+        );
+    }
+    // Every role's dollar account opened, and no dollar minted to any:
+    // Circle's USDC comes from Circle's faucet alone.
+    let platform = chain::solana::Platform::from_deployments(&written).unwrap();
+    for role in [Role::Author, Role::Viewer, Role::Keeper, Role::Admin] {
+        assert_eq!(
+            client
+                .token_balance(&platform.dollars(&team.address(role)))
+                .await
+                .unwrap(),
+            0,
+            "{role:?}"
+        );
+    }
+    assert_eq!(usdc_mint(&client).await, usdc_before);
 
     // Again: nothing changes.
     let watched = [Role::Admin, Role::Keeper, Role::Viewer, Role::Author];
@@ -490,17 +557,7 @@ async fn a_public_cluster_is_set_up_without_placeholders_and_a_second_run_only_t
         &["solana-setup", "--project", PROJECT],
     ));
     assert_eq!(read_file(&cluster), written);
-    assert_eq!(
-        client.token_balance(&author_dollars).await.unwrap(),
-        STARTING_DOLLARS
-    );
-    assert_eq!(
-        client
-            .token_balance(&local_venue::vault_address())
-            .await
-            .unwrap(),
-        reserves
-    );
+    assert_eq!(usdc_mint(&client).await, usdc_before);
     for (role, before) in watched.into_iter().zip(funded) {
         let held = client.lamports(&team.address(role)).await.unwrap();
         if role == Role::Admin {
