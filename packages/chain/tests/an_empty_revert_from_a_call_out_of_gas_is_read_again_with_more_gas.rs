@@ -23,6 +23,11 @@ const CALLER: Address = Address::new([
 /// no data when the probe's call failed, whatever the reason: as a
 /// Solidity view calling another contract does.
 fn forwarder() -> Bytes {
+    forwarder_to(PROBE)
+}
+
+/// [`forwarder`], passing its calldata on to `target`.
+fn forwarder_to(target: Address) -> Bytes {
     let mut code = vec![
         0x36, // CALLDATASIZE
         0x60, 0x00, // PUSH1 0
@@ -34,7 +39,7 @@ fn forwarder() -> Bytes {
         0x60, 0x00, // PUSH1 0: argument offset
         0x73, // PUSH20 the probe
     ];
-    code.extend_from_slice(PROBE.as_slice());
+    code.extend_from_slice(target.as_slice());
     code.extend_from_slice(&[
         0x5a, // GAS
         0xfa, // STATICCALL
@@ -198,5 +203,50 @@ async fn where_no_read_can_have_more_gas_the_observation_stands_as_the_helper_an
         (known.multicall3, known.hash_pin),
         (Some(false), Some(false)),
         "both were asked about"
+    );
+}
+
+/// Where the tests put a contract that spends every bit of gas it is given
+/// (an `INVALID`, as an assert in old Solidity does).
+const EATER: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xea, 0x7e, 0x40, 1,
+]);
+
+/// Where the tests put a forwarder to [`EATER`], which reverts with no data
+/// once the eater has spent all but a sixty-fourth of its gas.
+const EATING: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xea, 0x7e, 0x40, 2,
+]);
+
+/// Two reads the helper answers with an empty revert, the first of which
+/// spends all the gas it is given when read again: the second is still
+/// read again with a call's whole gas, and answers, rather than being
+/// starved by the first and taken for a revert with nothing to say.
+#[tokio::test]
+async fn a_read_again_that_spends_all_its_gas_leaves_the_next_its_own() {
+    let anvil = chain(31_490_005, true).await;
+    anvil.set_code(EATER, &Bytes::from(vec![0xfe])).await;
+    anvil.set_code(EATING, &forwarder_to(EATER)).await;
+    anvil.mine(1, 1).await;
+    let mut follower = stand_in_node::follower(&[&anvil.url], policy()).await;
+    let mut plan = Plan::default();
+    plan.read(EATING, &FollowProbe::valueCall {});
+    plan.read(
+        CALLER,
+        &FollowProbe::burnCall {
+            rounds: U256::from(ROUNDS),
+        },
+    );
+    let observed = follower
+        .observe(&plan, At::Latest)
+        .await
+        .expect("an observation");
+    assert_eq!(observed.path, Path::ViewReads);
+    assert_eq!(
+        observed.items,
+        vec![
+            Item::Reverted(Bytes::new()),
+            Item::Returned(Bytes::from(U256::from(5 + ROUNDS).to_be_bytes::<32>())),
+        ]
     );
 }

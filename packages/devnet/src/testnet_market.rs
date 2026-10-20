@@ -835,11 +835,29 @@ async fn pools(on: &OnChain<'_>, pool_tokens: f64) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a driver for a deployment whose dollar (what its stations take
+/// deposits in) is not the dollar the venue trades against: nothing on the
+/// chain ties the two, and a station whose driver trades another dollar
+/// counts that dollar as its own.
+fn same_dollar(deployment: Address, venue: Address) -> Result<()> {
+    if deployment != venue {
+        bail!(
+            "the deployment's dollar is {deployment:?} and the venue trades against {venue:?}: deploy the platform again with the venue's dollar before its driver"
+        );
+    }
+    Ok(())
+}
+
 async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
     let chain_id = on.venue.chain;
     let mirrors = MirrorFeeds::read(on.dir, chain_id)?;
     let resolved = on.venue.resolve(&mirrors)?;
     let admin = on.client.account(Role::Admin)?;
+    let deployments = on
+        .client
+        .deployments(&chain::Deployments::file_in(on.dir, on.key))
+        .await?;
+    same_dollar(deployments.usd, on.venue.dollar.address)?;
     let existing = DriverRecord::read(on.dir, chain_id)?;
     let address = match existing {
         Some(record) if on.client.has_code(record.address).await? => {
@@ -884,10 +902,6 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
             address
         }
     };
-    let deployments = on
-        .client
-        .deployments(&chain::Deployments::file_in(on.dir, on.key))
-        .await?;
     // Under the name `config/drivers.toml` lists it by on this chain:
     // `robinhood` on Robinhood Chain, `uniswap-base` on Base.
     let listed_as = on.venue.driver;
@@ -926,4 +940,16 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
         receipt.transaction_hash, receipt.gas_used
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_driver_is_refused_for_a_deployment_whose_dollar_is_not_the_venue_s() {
+        let venue = Address::repeat_byte(0x0d);
+        assert!(same_dollar(venue, venue).is_ok());
+        assert!(same_dollar(Address::repeat_byte(0x1e), venue).is_err());
+    }
 }

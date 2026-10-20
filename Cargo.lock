@@ -7666,6 +7666,7 @@ dependencies = [
  "fastnum",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

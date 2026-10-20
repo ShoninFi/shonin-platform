@@ -25,6 +25,13 @@
 //!   filler, an external send of the same key, a send of the process before
 //!   a restart) can never land, and is said to have been [`Superseded`]:
 //!   whatever it was for may be sent again, and only that send can land.
+//!   That takes a sign that another transaction used it: a filler's
+//!   receipt, or the send's own receipt still missing [`USED_BLOCKS`] blocks
+//!   after the nonce was first seen used, which no node a few blocks behind
+//!   another explains. A nonce used with neither is the send's own whose
+//!   receipt hasn't reached the node asked yet: its receipt is looked for
+//!   until the send's deadline, and past it the send is said
+//!   [`NeverLanded`], not superseded, since it may have landed.
 
 use std::time::Duration;
 
@@ -59,10 +66,13 @@ impl std::error::Error for Superseded {}
 /// whether the node still knows it, and whether its nonce has been used.
 const LOOK_EVERY: u32 = 3;
 
-/// How many looks a nonce must read used, with no receipt of the send's,
-/// before the send is taken as superseded: a node a block behind the one
-/// that answered the count may not have the receipt yet.
-const USED_LOOKS: u32 = 2;
+/// How many blocks past the head at which a nonce was first seen used the
+/// chain must be, with no receipt of the send's or its fillers' found all
+/// along, before the send is taken as superseded. Behind a load balancer the
+/// node answering for receipts may be a few blocks behind the one that
+/// counts the account's sends, so a missing receipt alone says nothing
+/// until it has stayed missing far longer than such a node lags.
+const USED_BLOCKS: u64 = 32;
 
 /// How many looks a send may wait behind a nonce no send holds before that
 /// nonce is filled.
@@ -283,8 +293,9 @@ impl Fees {
 /// What a look at a send in flight found.
 #[derive(Debug, PartialEq)]
 enum Seen {
-    /// The account's nonce count has passed it with no receipt of its own.
-    Used,
+    /// The account's nonce count has passed it with no receipt of its own
+    /// found; `head` is the chain's latest block, as the node says.
+    Used { head: u64 },
     /// No node asked knows any transaction signed for it, and its nonce is
     /// unused.
     Unknown,
@@ -335,7 +346,9 @@ impl Watch {
         let mut hashes = vec![flight.hash];
         let mut fees = flight.fees;
         let mut polls = 0u32;
-        let mut used_looks = 0u32;
+        // The head at which the nonce was first seen used with no receipt,
+        // and the highest head seen since.
+        let mut used_at: Option<(u64, u64)> = None;
         let mut gap_looks = 0u32;
         loop {
             if let Some(receipt) = self.receipt_of_any(&hashes).await {
@@ -355,15 +368,24 @@ impl Watch {
             }
             if polls.is_multiple_of(LOOK_EVERY) || now >= fill_at {
                 match self.look(&hashes).await {
-                    Some(Seen::Used) => {
-                        used_looks += 1;
-                        if used_looks >= USED_LOOKS {
-                            self.nonces.landed(self.from, self.nonce);
+                    Some(Seen::Used { head }) => {
+                        // Used, by this send or another: no later send is
+                        // numbered at it.
+                        self.nonces.landed(self.from, self.nonce);
+                        let (first, highest) = used_at.get_or_insert((head, head));
+                        *highest = (*highest).max(head);
+                        if *highest >= first.saturating_add(USED_BLOCKS) {
                             return Err(anyhow::Error::new(Superseded));
+                        }
+                        // Its receipt may still be on its way: nothing says
+                        // it didn't land, so it is never said superseded
+                        // for want of time.
+                        if now >= started + within {
+                            return Err(anyhow::Error::new(NeverLanded));
                         }
                     }
                     Some(Seen::Unknown) => {
-                        used_looks = 0;
+                        used_at = None;
                         // The same bytes again: they can land only once.
                         // Refused (its fee too low now, say), the nonce is
                         // filled instead.
@@ -380,7 +402,7 @@ impl Watch {
                         }
                     }
                     Some(Seen::Waiting { gap }) => {
-                        used_looks = 0;
+                        used_at = None;
                         // A transaction the node holds at that nonce (one
                         // of a process before a restart, or an external
                         // send) usually lands within a block or two: only
@@ -443,10 +465,14 @@ impl Watch {
         .ok()?;
         if mined > self.nonce {
             // A receipt that came between the two reads is its own.
-            return match self.receipt_of_any(hashes).await {
-                Some(_) => None,
-                None => Some(Seen::Used),
-            };
+            if self.receipt_of_any(hashes).await.is_some() {
+                return None;
+            }
+            let head = tokio::time::timeout(POLL_TIMEOUT, self.provider.get_block_number())
+                .await
+                .ok()?
+                .ok()?;
+            return Some(Seen::Used { head });
         }
         for hash in hashes {
             let known =

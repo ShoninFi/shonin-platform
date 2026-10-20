@@ -809,17 +809,18 @@ impl Follower {
     }
 
     /// Read again the items the helper answered with an empty revert, with
-    /// more gas than it gives an item: in one Multicall3 call at the block
-    /// (each read given all the gas left, the call's whole budget) where
-    /// Multicall3 is known to be here, the block it ran at checked as every
-    /// Multicall3 answer is. What reverts empty there, with that much gas,
-    /// is a revert with nothing to say, as a read of its own would find.
-    /// Where Multicall3 is not known to be here (or its call is refused),
-    /// the items are returned, to be read one by one, each pinned to the
-    /// block's hash, where hash pins are known to be honoured. Where neither
-    /// is known, they are taken as the helper answered them (a revert with
-    /// no data, as before), and both are asked about before the next
-    /// observation, so it can tell.
+    /// more gas than it gives an item: each in a Multicall3 call of its own
+    /// at the block (given the call's whole budget, which no item read
+    /// before it can have spent) where Multicall3 is known to be here, the
+    /// block it ran at checked as every Multicall3 answer is. What reverts
+    /// empty there, with that much gas, is a revert with nothing to say, as
+    /// a read of its own would find. Where Multicall3 is not known to be
+    /// here (or its call is refused), the items not yet read are returned,
+    /// to be read one by one, each pinned to the block's hash, where hash
+    /// pins are known to be honoured. Where neither is known, they are
+    /// taken as the helper answered them (a revert with no data, as
+    /// before), and both are asked about before the next observation, so it
+    /// can tell.
     async fn empty_reverts(
         &mut self,
         endpoint: usize,
@@ -842,29 +843,38 @@ impl Follower {
             }
             return Ok(Vec::new());
         };
-        let reads: Vec<Read> = empty.iter().map(|i| plan.reads[*i].clone()).collect();
         let numbers = if block.number > 0 {
             vec![block.number - 1]
         } else {
             Vec::new()
         };
-        let batch = Batch::new(self.options.multicall3, source, numbers, &[], &reads);
-        let parts = match self.multicall_at(provider, &batch, block, gathered).await {
-            Ok(parts) => parts,
-            // Refused here: read one by one instead, where pins are honoured;
-            // otherwise taken as the helper answered them.
-            Err(Failure::Unsupported(_) | Failure::TooBig | Failure::OutOfGas | Failure::Fewer) => {
-                if known.hash_pin == Some(true) {
-                    return Ok(empty.to_vec());
+        for (done, index) in empty.iter().enumerate() {
+            let read = std::slice::from_ref(&plan.reads[*index]);
+            let batch = Batch::new(self.options.multicall3, source, numbers.clone(), &[], read);
+            let parts = match self.multicall_at(provider, &batch, block, gathered).await {
+                Ok(parts) => parts,
+                // Refused here: what is left is read one by one instead,
+                // where pins are honoured; otherwise taken as the helper
+                // answered it.
+                Err(
+                    Failure::Unsupported(_) | Failure::TooBig | Failure::OutOfGas | Failure::Fewer,
+                ) => {
+                    let left = &empty[done..];
+                    if known.hash_pin == Some(true) {
+                        return Ok(left.to_vec());
+                    }
+                    for index in left {
+                        gathered.items[*index] = Some(Item::Reverted(Bytes::new()));
+                    }
+                    return Ok(Vec::new());
                 }
-                for index in empty {
-                    gathered.items[*index] = Some(Item::Reverted(Bytes::new()));
-                }
-                return Ok(Vec::new());
-            }
-            Err(failure) => return Err(failure),
-        };
-        for (index, result) in empty.iter().zip(parts.reads.iter()) {
+                Err(failure) => return Err(failure),
+            };
+            let Some(result) = parts.reads.first() else {
+                return Err(Failure::Trouble(anyhow!(
+                    "a Multicall3 call with one read answered none"
+                )));
+            };
             gathered.items[*index] = Some(if result.success {
                 Item::Returned(result.returnData.clone())
             } else {

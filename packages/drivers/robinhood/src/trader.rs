@@ -24,6 +24,36 @@ use crate::payload::{Action, Decimal};
 
 const BPS: u64 = 10_000;
 
+/// Whether `token`'s issuer has paused its oracle. A token without the call
+/// (WETH, a testnet's stand-in) has nothing to pause: the read reverts, or
+/// returns nothing a `bool` decodes from. Any other failure (no answer, a
+/// node's own error) is an error, since whether it is paused is not known.
+pub async fn oracle_paused(provider: &DynProvider, token: Address) -> Result<bool> {
+    match IStockToken::new(token, provider)
+        .oraclePaused()
+        .call()
+        .await
+    {
+        Ok(paused) => Ok(paused),
+        Err(error) if lacks_the_call(&error) => Ok(false),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("reading whether {token}'s oracle is paused"))),
+    }
+}
+
+/// Whether a read failed because the contract has no such call: it
+/// reverted, or answered with something that isn't the call's answer.
+fn lacks_the_call(error: &alloy::contract::Error) -> bool {
+    use alloy::contract::Error;
+    match error {
+        Error::ZeroData(..) | Error::AbiError(_) => true,
+        Error::TransportError(error) => error.as_error_resp().is_some_and(|refusal| {
+            refusal.code == 3 || refusal.message.to_lowercase().contains("revert")
+        }),
+        _ => false,
+    }
+}
+
 /// One listed stock token, as the driver lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listed {
@@ -148,12 +178,7 @@ impl Trader {
         if round.answer.is_negative() || round.answer.is_zero() {
             bail!("the {token} feed's price is not positive");
         }
-        // A token without the call (the testnet's) has nothing to pause.
-        let paused = IStockToken::new(listed.token, provider)
-            .oraclePaused()
-            .call()
-            .await
-            .unwrap_or(false);
+        let paused = oracle_paused(provider, listed.token).await?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -301,6 +326,54 @@ pub fn to_units(amount: Decimal, decimals: u8) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider whose node gives `answers` in turn, and fails to answer
+    /// once they run out.
+    fn a_node(answers: &[alloy::rpc::json_rpc::ResponsePayload]) -> DynProvider {
+        use alloy::providers::{Provider, ProviderBuilder};
+        let asserter = alloy::transports::mock::Asserter::new();
+        for answer in answers {
+            asserter.push(answer.clone());
+        }
+        ProviderBuilder::new()
+            .connect_mocked_client(asserter)
+            .erased()
+    }
+
+    fn returned(data: &str) -> alloy::rpc::json_rpc::ResponsePayload {
+        alloy::rpc::json_rpc::ResponsePayload::Success(
+            serde_json::value::RawValue::from_string(format!("\"{data}\"")).unwrap(),
+        )
+    }
+
+    fn refused(code: i64, message: &'static str) -> alloy::rpc::json_rpc::ResponsePayload {
+        alloy::rpc::json_rpc::ResponsePayload::Failure(alloy::rpc::json_rpc::ErrorPayload {
+            code,
+            message: message.into(),
+            data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_oracle_read_that_fails_is_not_taken_as_unpaused() {
+        let token = Address::repeat_byte(0x11);
+        let word = |last: u8| format!("0x{}{last:02x}", "00".repeat(31));
+        // Paused, and not.
+        for (answer, paused) in [(word(1), true), (word(0), false)] {
+            let node = a_node(&[returned(&answer)]);
+            assert_eq!(oracle_paused(&node, token).await.unwrap(), paused);
+        }
+        // A token without the call: it reverts, or answers nothing.
+        for answer in [refused(3, "execution reverted"), returned("0x")] {
+            let node = a_node(&[answer]);
+            assert!(!oracle_paused(&node, token).await.unwrap());
+        }
+        // No answer, or the node's own refusal: not known, so an error.
+        for answers in [vec![], vec![refused(-32005, "limit exceeded")]] {
+            let node = a_node(&answers);
+            assert!(oracle_paused(&node, token).await.is_err());
+        }
+    }
 
     fn trader() -> Trader {
         let mut listed = BTreeMap::new();
