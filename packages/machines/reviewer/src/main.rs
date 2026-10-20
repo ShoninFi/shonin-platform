@@ -598,6 +598,7 @@ fn plan(reviewer: &Reviewer, busy: bool) -> cloud::WakePlan {
     cloud::WakePlan {
         busy,
         renew_at: reviewer.attestation.as_ref().and_then(|a| a.renew_at()),
+        retry_at: None,
         payments_seen: BTreeMap::new(),
     }
 }

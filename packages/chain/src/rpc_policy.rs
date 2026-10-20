@@ -1103,7 +1103,7 @@ mod tests {
                 "evm:998",
                 &[
                     ("receipt_poll_ms", 1_000),
-                    ("keeper_balance_floor_micro", 100_000),
+                    ("keeper_balance_floor_micro", 200_000),
                 ],
             ),
             ("evm:999", &[("receipt_poll_ms", 1_000)]),

@@ -34,6 +34,9 @@ fn now() -> u64 {
 }
 
 pub const PUBLISHING: Address = Address::repeat_byte(0x9b);
+/// The sender of each block's one transaction (see
+/// [`Node::honours_past_blocks`]).
+pub const PROBE_SENDER: Address = Address::repeat_byte(0x5e);
 const BUILDER_KEY: Address = Address::repeat_byte(0xb1);
 
 /// The stand-in node.
@@ -53,6 +56,21 @@ pub struct Node {
     /// Whether the registry's record of each payment (`submissionOf`) can't
     /// be read.
     pub record_unreadable: AtomicBool,
+    /// Whether it answers a read at a past block as of that block in a way
+    /// a client can check: each block holds one transaction, from
+    /// [`PROBE_SENDER`] with the block's number as its nonce, and the
+    /// sender's count at each block is answered. Without, its blocks hold no
+    /// transaction, so a client can't find out.
+    pub honours_past_blocks: AtomicBool,
+    /// When not 0, the registry's state it answers from, whatever block is
+    /// asked: the count and the records as of that block, as an endpoint
+    /// whose state is behind its head does.
+    pub stale_state: AtomicU64,
+    /// Whether every block has the same time, so no payment's time tells
+    /// which side of a block it was made on.
+    pub frozen_time: AtomicBool,
+    /// Blocks made in the same second as the block before them.
+    pub same_time: Mutex<Vec<u64>>,
     /// `Submitted` payments, at their block.
     pub payments: Mutex<Vec<(u64, alloy::rpc::types::Log)>>,
     /// Every `eth_getLogs` range asked for.
@@ -98,6 +116,10 @@ pub fn node(head: u64, log_range_cap: Option<u64>) -> Node {
         logs_fail: AtomicBool::new(false),
         unreadable: Mutex::new(Vec::new()),
         record_unreadable: AtomicBool::new(false),
+        honours_past_blocks: AtomicBool::new(true),
+        stale_state: AtomicU64::new(0),
+        frozen_time: AtomicBool::new(false),
+        same_time: Mutex::new(Vec::new()),
         payments: Mutex::new(Vec::new()),
         ranges: Mutex::new(Vec::new()),
         registered: Mutex::new(Vec::new()),
@@ -111,7 +133,27 @@ pub fn node(head: u64, log_range_cap: Option<u64>) -> Node {
 impl Node {
     /// When block `number` was made.
     pub fn stamped(&self, number: u64) -> u64 {
-        self.genesis + number
+        if self.frozen_time.load(Ordering::SeqCst) {
+            self.genesis
+        } else {
+            let repeated = self
+                .same_time
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|block| **block <= number)
+                .count() as u64;
+            self.genesis + number - repeated
+        }
+    }
+
+    /// The block the registry's state is answered as of, for a read asking
+    /// about block `at`.
+    fn state_at(&self, at: u64) -> u64 {
+        match self.stale_state.load(Ordering::SeqCst) {
+            0 => at,
+            stale => stale.min(at),
+        }
     }
 
     /// A payment of the $1 by `author` against `upload`, at `block`.
@@ -187,7 +229,32 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
             block.header.inner.number = number;
             block.header.inner.timestamp = node.stamped(number);
             block.header.inner.base_fee_per_gas = Some(1_000_000_000);
-            serde_json::to_value(block).unwrap()
+            let mut block = serde_json::to_value(block).unwrap();
+            // Asked with its transactions whole.
+            if request["params"][1].as_bool() == Some(true)
+                && node.honours_past_blocks.load(Ordering::SeqCst)
+            {
+                block["transactions"] = json!([{
+                    "type": "0x2",
+                    "from": format!("{PROBE_SENDER:?}"),
+                    "nonce": format!("0x{number:x}"),
+                }]);
+            }
+            block
+        }
+        // Only the sender of each block's one transaction is counted: its
+        // count after block `n` is `n + 1`.
+        "eth_getTransactionCount"
+            if node.honours_past_blocks.load(Ordering::SeqCst)
+                && request["params"][0]
+                    .as_str()
+                    .and_then(|sender| sender.parse::<Address>().ok())
+                    == Some(PROBE_SENDER) =>
+        {
+            let at = hex_u64(&request["params"][1])
+                .filter(|at| *at <= head)
+                .unwrap_or(head);
+            json!(format!("0x{:x}", at + 1))
         }
         "eth_getCode" => json!("0x01"),
         "eth_sign" => {
@@ -263,7 +330,7 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
                 // How many payments the registry had taken by the block asked
                 // about (the head, if none is named).
                 IPublishing::countCall::SELECTOR => {
-                    let at = hex_u64(&request["params"][1]).unwrap_or(head);
+                    let at = node.state_at(hex_u64(&request["params"][1]).unwrap_or(head));
                     let count = node
                         .payments
                         .lock()
@@ -281,11 +348,13 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
                     }
                     let call = IPublishing::submissionOfCall::abi_decode(&input).unwrap();
                     let id: u64 = call.strategyId.try_into().unwrap();
+                    let known = node.state_at(head);
                     let mut payments: Vec<(u64, IPublishing::Submitted)> = node
                         .payments
                         .lock()
                         .unwrap()
                         .iter()
+                        .filter(|(block, _)| *block <= known)
                         .map(|(block, log)| {
                             (
                                 *block,

@@ -6,8 +6,8 @@
 //! Sequence: `queue.json` holds upload 8800 waiting for payment against R.
 //! `queue.json.new` can't be made (here a directory is in the way; in
 //! production, a full disk). The author pays R at block 0x20, and the
-//! builder reads that block again and again, failing each time to write the
-//! queue down. It restarts on what it left in its store, the obstruction
+//! builder reads that block again, failing each time to write the queue
+//! down. It restarts on what it left in its store, the obstruction
 //! gone: job 8800 is admitted on the payment.
 
 mod black_box;
@@ -36,7 +36,8 @@ async fn a_payment_is_not_read_past_while_its_admission_is_unwritten() {
     first.node.pay(paid_at, 5, author, reference);
     first.node.head.store(0x30, Ordering::SeqCst);
 
-    // Wait until the block holding the payment has been read a few times.
+    // Wait until the block holding the payment has been read more than once
+    // (a turn that failed is tried again a few seconds on).
     let started = Instant::now();
     while first
         .node
@@ -46,10 +47,10 @@ async fn a_payment_is_not_read_past_while_its_admission_is_unwritten() {
         .iter()
         .filter(|&&(from, to)| (from..=to).contains(&paid_at))
         .count()
-        < 3
+        < 2
     {
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < Duration::from_secs(30),
             "the payment's block was never read"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;

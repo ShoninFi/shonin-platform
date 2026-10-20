@@ -95,12 +95,15 @@ impl Machine {
 }
 
 /// What a machine says of itself for the waker: whether it stopped busy,
-/// when its blessing is next to be renewed, and how many payments it had
-/// read on each chain, by chain id.
+/// when its blessing is next to be renewed, when a read it could not finish
+/// is next to be tried, and how many payments it had read on each chain, by
+/// chain id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     pub busy: bool,
     pub renew_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<u64>,
     pub payments_seen: BTreeMap<String, u64>,
 }
 
@@ -278,10 +281,12 @@ impl Wake {
 }
 
 /// Whether the waker should start a machine: it was asked for in the last
-/// [`ASK_STANDS`], it stopped busy, its blessing is due for renewal, or (for
-/// the build service, `payments` given) a chain has taken a payment past
-/// what it read. A chain its plan doesn't name is one it doesn't serve, once
-/// it has sent a plan; before that, any payment at all wakes it.
+/// [`ASK_STANDS`], it stopped busy, its blessing is due for renewal, a read
+/// it could not finish is due to be tried again, or (for the build service,
+/// `payments` given) a chain has taken a payment past what it read. Once it
+/// has sent a plan, a chain the plan doesn't name wakes nothing: one it
+/// doesn't serve, or one it can't read for now, which its retry time stands
+/// for. Before that, any payment at all wakes it.
 pub fn wanted(
     asked: bool,
     plan: Option<&Plan>,
@@ -292,7 +297,9 @@ pub fn wanted(
         return true;
     }
     if let Some(plan) = plan
-        && (plan.busy || plan.renew_at.is_some_and(|at| now >= at))
+        && (plan.busy
+            || plan.renew_at.is_some_and(|at| now >= at)
+            || plan.retry_at.is_some_and(|at| now >= at))
     {
         return true;
     }
@@ -1171,6 +1178,7 @@ mod tests {
         let plan = |busy: bool, renew_at: Option<u64>, seen: &[(&str, u64)]| Plan {
             busy,
             renew_at,
+            retry_at: None,
             payments_seen: seen.iter().map(|(c, n)| (c.to_string(), *n)).collect(),
         };
         let paid = |taken: &[(&str, u64)]| -> BTreeMap<String, u64> {
@@ -1213,6 +1221,27 @@ mod tests {
         assert!(!wanted(false, None, now, Some(&paid(&[("84532", 0)]))));
         // The reviewer has no payments clause.
         assert!(!wanted(false, None, now, None));
+    }
+
+    #[test]
+    fn a_chain_left_out_of_the_plan_for_a_failing_read_wakes_the_build_service_at_its_retry_time() {
+        let now = 1_000_000;
+        let plan = Plan {
+            busy: false,
+            renew_at: Some(now + 3600),
+            retry_at: Some(now + 300),
+            payments_seen: BTreeMap::from([("84532".to_string(), 3)]),
+        };
+        // A payment on the chain it left out wakes nothing before then.
+        let paid = BTreeMap::from([("84532".to_string(), 3), ("998".to_string(), 5)]);
+        assert!(!wanted(false, Some(&plan), now + 299, Some(&paid)));
+        assert!(wanted(false, Some(&plan), now + 300, Some(&paid)));
+        // A plan sent without a retry time reads as one with none.
+        let sent: Plan =
+            serde_json::from_slice(br#"{"busy":false,"renew_at":null,"payments_seen":{}}"#)
+                .unwrap();
+        assert_eq!(sent.retry_at, None);
+        assert!(!wanted(false, Some(&sent), u64::MAX, None));
     }
 
     #[tokio::test]

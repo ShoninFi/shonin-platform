@@ -297,7 +297,7 @@ keeper_balance_floor_micro = 2000
 
 [rpc.chains."evm:998"]
 receipt_poll_ms = 1000
-keeper_balance_floor_micro = 100000
+keeper_balance_floor_micro = 200000
 
 [rpc.chains."evm:46630"]
 receipt_poll_ms = 500

@@ -1947,14 +1947,38 @@ impl Client {
                 .await
                 .map_err(anyhow::Error::new)
         } else {
-            self.call_pinned(request, block).await
+            self.call_pinned(request, block, true).await
         }
         .with_context(|| format!("reading {} at block {block:?}", C::SIGNATURE))?;
         C::abi_decode_returns(&returned)
             .with_context(|| format!("decoding what {} returned", C::SIGNATURE))
     }
 
-    /// A call pinned to `block`, through the endpoints that honour it.
+    /// Read a contract as it was at past block `block`, only through the
+    /// endpoints known to answer as of the block asked ([`honours_blocks`]):
+    /// never unchecked. An answer that must be as of the block asked to be
+    /// relied on at all is read this way; while no endpoint is known to
+    /// honour the block, it fails.
+    pub async fn read_at_honoured<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        block: u64,
+    ) -> Result<C::Return> {
+        let request = TransactionRequest::default()
+            .with_to(to)
+            .with_input(call.abi_encode());
+        let block = alloy::eips::BlockId::number(block);
+        let returned = self
+            .call_pinned(request, block, false)
+            .await
+            .with_context(|| format!("reading {} at block {block:?}", C::SIGNATURE))?;
+        C::abi_decode_returns(&returned)
+            .with_context(|| format!("decoding what {} returned", C::SIGNATURE))
+    }
+
+    /// A call pinned to `block`, through the endpoints that honour it; with
+    /// `unchecked`, through one not known to while none is known to.
     ///
     /// An endpoint that says it hasn't reached the block ("header not
     /// found", "unknown block" and their kin) is behind, which is its own
@@ -1969,6 +1993,7 @@ impl Client {
         &self,
         request: TransactionRequest,
         block: alloy::eips::BlockId,
+        unchecked: bool,
     ) -> Result<Bytes> {
         let mut last: Option<anyhow::Error> = None;
         let mut asked_any = false;
@@ -1991,7 +2016,7 @@ impl Client {
                 match endpoint.honours_now().await {
                     Some(false) => continue,
                     Some(true) => {}
-                    None if any_known => continue,
+                    None if any_known || !unchecked => continue,
                     None => tracing::warn!(
                         chain = %self.label,
                         endpoint = at + 1,
@@ -2041,6 +2066,11 @@ impl Client {
         }
         match last {
             Some(error) => Err(error),
+            None if !asked_any && !unchecked => bail!(
+                "no endpoint of {}'s rpc is known to answer a read at a past block as of that \
+                 block, so it is not read",
+                self.label
+            ),
             None if !asked_any => bail!(
                 "no endpoint of {}'s rpc answers a read at a past block as of that block \
                  (each answers with the head's state), so it is not read",
