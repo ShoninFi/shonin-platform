@@ -31,7 +31,7 @@ use crate::deployments::Deployments;
 
 mod in_flight;
 
-pub use in_flight::Superseded;
+pub use in_flight::{Landed, Landing, StillWatched, Superseded};
 
 /// One of the platform's roles, as an account on the chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +167,10 @@ pub struct Client {
     /// The longest any send waits for its receipt, when shorter than its
     /// own wait (see [`Client::waiting_at_most`]).
     receipt_wait: Option<Duration>,
+    /// How long a send's receipt may stay missing after its nonce is seen
+    /// used before the send is taken as superseded, besides a span of
+    /// blocks (see [`Client::receipts_lagging_at_most`]).
+    receipt_lag: Duration,
     /// Where a log query with no numbered range goes: the endpoints
     /// `logs_rpc` names, or the same connection as everything else when it
     /// names none.
@@ -1769,6 +1773,7 @@ impl Client {
             nonces: Default::default(),
             pipelined: false,
             receipt_wait: None,
+            receipt_lag: in_flight::RECEIPT_LAG,
             logs,
             log_endpoints,
             log_range: config.log_range,

@@ -40,7 +40,7 @@ wasmtime::component::bindgen!({
     },
 });
 
-use shonin::agent::transfers::{Account, Balance, Moved, PartialMove, VenueAccount};
+use shonin::agent::transfers::{Account, Balance, BalancesRead, Moved, PartialMove, VenueAccount};
 use shonin::agent::types::Verdict;
 use shonin::agent::vault::VaultEvent;
 use wasi::keyvalue::store::{Error as StoreError, KeyResponse};
@@ -1311,90 +1311,110 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
-        let (place, home, drivers) = accessor.with(|mut access| {
-            let ctx = access.get();
-            (
-                ctx.place.clone(),
-                ctx.home_chain.clone(),
-                ctx.drivers.clone(),
-            )
-        });
-        let driver = drivers.first().cloned().unwrap_or_default();
-        let Evm {
+        Ok(read_balances(accessor).await.read)
+    }
+
+    async fn read_balances(accessor: &Accessor<Ctx, Self>) -> HostResult<BalancesRead> {
+        Ok(read_balances(accessor).await)
+    }
+}
+
+/// Each of the vault's accounts read once: what each read found, and which
+/// reads failed. A failed read is never taken as an empty account.
+async fn read_balances(accessor: &Accessor<Ctx, HasSelf<Ctx>>) -> BalancesRead {
+    let (place, home, drivers) = accessor.with(|mut access| {
+        let ctx = access.get();
+        (
+            ctx.place.clone(),
+            ctx.home_chain.clone(),
+            ctx.drivers.clone(),
+        )
+    });
+    match place {
+        Place::Evm(Evm {
             chain,
             vault,
             station,
             venue,
             usd,
             ..
-        } = match place {
-            Place::Evm(evm) => evm,
-            Place::Solana(trading) => {
-                let (vault, station, venue) = trading.balances().await;
-                let mut out = Vec::new();
-                if let Some(amount) = vault {
-                    out.push(Balance {
-                        account: Account::Vault,
-                        amount,
-                    });
-                }
-                if let Some(amount) = station {
-                    out.push(Balance {
-                        account: Account::Station(home.clone()),
-                        amount,
-                    });
-                }
-                if let Some(amount) = venue {
-                    out.push(Balance {
-                        account: Account::Venue(VenueAccount {
-                            chain: home,
-                            driver,
-                        }),
-                        amount,
-                    });
-                }
-                return Ok(out);
-            }
-        };
-        let units = |value: U256| u64::try_from(value).unwrap_or(u64::MAX);
-        let mut out = Vec::new();
-        if let Ok(cash) = chain.read(vault, IVault::cashCall {}).await {
-            out.push(Balance {
-                account: Account::Vault,
-                amount: units(cash),
-            });
-        }
-        if let Ok(idle) = chain
-            .read(usd, IERC20::balanceOfCall { account: station })
-            .await
-        {
-            out.push(Balance {
-                account: Account::Station(home.clone()),
-                amount: units(idle),
-            });
-        }
-        for driver in drivers {
-            // The stand-in venue reads its own account; every other driver
-            // values the station's account through the driver it pinned.
-            let value = if driver == LOCAL {
-                chain
-                    .read(venue, ILocalVenue::accountValueCall { master: station })
-                    .await
-            } else {
-                pinned_value(&chain, station, &driver).await
+        }) => evm_balances(&chain, (vault, station, venue, usd), &home, drivers).await,
+        Place::Solana(trading) => {
+            let (vault, station, venue) = trading.balances().await;
+            let driver = drivers.first().cloned().unwrap_or_default();
+            let mut out = BalancesRead {
+                read: Vec::new(),
+                unread: Vec::new(),
             };
-            if let Ok(value) = value {
-                out.push(Balance {
-                    account: Account::Venue(VenueAccount {
-                        chain: home.clone(),
+            for (account, amount) in [
+                (Account::Vault, vault),
+                (Account::Station(home.clone()), station),
+                (
+                    Account::Venue(VenueAccount {
+                        chain: home,
                         driver,
                     }),
-                    amount: units(value),
-                });
+                    venue,
+                ),
+            ] {
+                match amount {
+                    Some(amount) => out.read.push(Balance { account, amount }),
+                    None => out.unread.push(account),
+                }
             }
+            out
         }
-        Ok(out)
     }
+}
+
+/// The EVM vault's accounts read once: the vault's cash, its station's idle
+/// dollars, and its account through each of `drivers`.
+async fn evm_balances(
+    chain: &Client,
+    (vault, station, venue, usd): (Address, Address, Address, Address),
+    home: &str,
+    drivers: Vec<String>,
+) -> BalancesRead {
+    let mut out = BalancesRead {
+        read: Vec::new(),
+        unread: Vec::new(),
+    };
+    let mut add = |account: Account, amount: Option<u64>| match amount {
+        Some(amount) => out.read.push(Balance { account, amount }),
+        None => out.unread.push(account),
+    };
+    let units = |value: U256| u64::try_from(value).unwrap_or(u64::MAX);
+    add(
+        Account::Vault,
+        chain.read(vault, IVault::cashCall {}).await.ok().map(units),
+    );
+    add(
+        Account::Station(home.to_string()),
+        chain
+            .read(usd, IERC20::balanceOfCall { account: station })
+            .await
+            .ok()
+            .map(units),
+    );
+    for driver in drivers {
+        // The stand-in venue reads its own account; every other driver
+        // values the station's account through the driver it pinned.
+        let value = if driver == LOCAL {
+            chain
+                .read(venue, ILocalVenue::accountValueCall { master: station })
+                .await
+        } else {
+            pinned_value(chain, station, &driver).await
+        };
+        add(
+            Account::Venue(VenueAccount {
+                chain: home.to_string(),
+                driver,
+            }),
+            value.ok().map(units),
+        );
+    }
+    out
 }
 
 alloy::sol! {
@@ -2245,6 +2265,75 @@ mod tests {
                 .all(|method| method != "eth_call"),
             "nothing is read from a venue that isn't there: {:?}",
             asked.lock().unwrap()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_account_whose_read_fails_is_said_unread_and_never_read_as_empty() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::{Value, json};
+        let vault = Address::repeat_byte(1);
+        let usd = Address::repeat_byte(2);
+        let venue = Address::repeat_byte(3);
+        let station = Address::repeat_byte(4);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| async move {
+                let id = request["id"].clone();
+                let word = |units: u64| json!(format!("0x{:064x}", units));
+                let answer = match request["method"].as_str().unwrap_or_default() {
+                    "eth_chainId" => Ok(json!("0x14a34")),
+                    "eth_call" => {
+                        let to: Address = request["params"][0]["to"]
+                            .as_str()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if to == vault {
+                            Ok(word(1_000_000))
+                        } else if to == venue {
+                            Ok(word(2_000_000))
+                        } else {
+                            // The station's dollars: the node fails the read.
+                            Err("header not found")
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                };
+                Json(match answer {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(message) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": message}}),
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chain = crate::stand_in::client(&url).await;
+        let read = evm_balances(
+            &chain,
+            (vault, station, venue, usd),
+            "base",
+            vec![LOCAL.to_string()],
+        )
+        .await;
+        let accounts: Vec<(&Account, u64)> = read
+            .read
+            .iter()
+            .map(|balance| (&balance.account, balance.amount))
+            .collect();
+        assert!(
+            matches!(
+                accounts.as_slice(),
+                [(Account::Vault, 1_000_000), (Account::Venue(_), 2_000_000)]
+            ),
+            "{accounts:?}"
+        );
+        assert!(
+            matches!(read.unread.as_slice(), [Account::Station(chain)] if chain == "base"),
+            "{:?}",
+            read.unread
         );
         server.abort();
     }

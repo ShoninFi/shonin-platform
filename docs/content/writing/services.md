@@ -40,6 +40,8 @@ Some moves take more than one step: from the vault to a venue, the money goes th
 - **Unknown:** it was sent and no answer came back, so it may still land. Check the balances before you move the same money again.
 - **Partial:** it stopped on the way, and says where the money is now (always one of the vault's own accounts) and whether the next step may still land.
 
+`balances` says what each of the vault's accounts holds now, and leaves out any account whose read failed. `read-balances` reads the same accounts and says which of them it couldn't read, so a total that misses one is never taken for the vault's value.
+
 ## Shared venue streams
 
 Venues limit how much one address may ask of them, and every agent on a machine shares one. So the attested machine holds a single connection to each venue, subscribes once to every feed any agent wants, and hands each value to every agent that asked for it:

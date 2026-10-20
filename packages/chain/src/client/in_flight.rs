@@ -26,13 +26,18 @@
 //!   a restart) can never land, and is said to have been [`Superseded`]:
 //!   whatever it was for may be sent again, and only that send can land.
 //!   That takes a sign that another transaction used it: a filler's
-//!   receipt, or the send's own receipt still missing [`USED_BLOCKS`] blocks
-//!   after the nonce was first seen used, which no node a few blocks behind
-//!   another explains. A nonce used with neither is the send's own whose
-//!   receipt hasn't reached the node asked yet: its receipt is looked for
-//!   until the send's deadline, and past it the send is said
-//!   [`NeverLanded`], not superseded, since it may have landed.
+//!   receipt, or the send's own receipt still missing both [`USED_BLOCKS`]
+//!   blocks and [`RECEIPT_LAG`] after the nonce was first seen used, which
+//!   no node behind another explains, on a chain of slow blocks or fast. A
+//!   nonce used with neither is the send's own whose receipt hasn't reached
+//!   the node asked yet: its receipt is looked for until there is such a
+//!   sign or it comes, however long its caller waits.
+//! - A caller whose wait runs out before what became of its send is known
+//!   is told [`StillWatched`], with a [`Landing`] that says once the watch
+//!   knows: the send may still land until then, and whatever it was for is
+//!   not to be sent again meanwhile, or it could land twice.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::consensus::Transaction as _;
@@ -62,17 +67,88 @@ impl std::fmt::Display for Superseded {
 
 impl std::error::Error for Superseded {}
 
+/// A send whose caller stopped waiting before its receipt came or its nonce
+/// was shown used by another transaction: it may still land, and its
+/// [`Landing`] says when that is known. It is a [`NeverLanded`] as well.
+#[derive(Debug)]
+pub struct StillWatched(pub Landing);
+
+impl std::fmt::Display for StillWatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no receipt came in time, and it is still watched")
+    }
+}
+
+impl std::error::Error for StillWatched {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&NeverLanded)
+    }
+}
+
+/// What a send's watch has come to know of it, shared with its caller.
+#[derive(Clone, Debug, Default)]
+pub struct Landing(Arc<std::sync::Mutex<Option<Landed>>>);
+
+/// What became of a watched send, once known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Landed {
+    /// Its receipt was found: it landed (it may have reverted).
+    Yes,
+    /// Another transaction used its nonce: it never will.
+    No,
+    /// It is no longer watched, and nothing more is known.
+    Unknown,
+}
+
+impl Landing {
+    /// Whether the send may still land: its watch hasn't ended.
+    pub fn may_still_land(&self) -> bool {
+        self.landed().is_none()
+    }
+
+    /// What became of the send, once its watch has ended.
+    pub fn landed(&self) -> Option<Landed> {
+        self.0
+            .lock()
+            .map_or(Some(Landed::Unknown), |landed| *landed)
+    }
+
+    fn settle(&self, landed: Landed) {
+        if let Ok(mut known) = self.0.lock() {
+            known.get_or_insert(landed);
+        }
+    }
+}
+
+/// Settles a [`Landing`] as unknown when its watch ends without saying,
+/// however it ends.
+struct Settles(Landing);
+
+impl Drop for Settles {
+    fn drop(&mut self) {
+        self.0.settle(Landed::Unknown);
+    }
+}
+
 /// How many receipt polls apart a send in flight is looked at more closely:
 /// whether the node still knows it, and whether its nonce has been used.
 const LOOK_EVERY: u32 = 3;
 
 /// How many blocks past the head at which a nonce was first seen used the
 /// chain must be, with no receipt of the send's or its fillers' found all
-/// along, before the send is taken as superseded. Behind a load balancer the
-/// node answering for receipts may be a few blocks behind the one that
-/// counts the account's sends, so a missing receipt alone says nothing
-/// until it has stayed missing far longer than such a node lags.
+/// along, before the send is taken as superseded; and it must have stayed
+/// missing for [`RECEIPT_LAG`] too. Behind a load balancer the node
+/// answering for receipts may be behind the one that counts the account's
+/// sends, so a missing receipt alone says nothing until it has stayed
+/// missing far longer than such a node lags. A node lags by some seconds
+/// whatever the chain's block time, which on a fast chain is many blocks.
 const USED_BLOCKS: u64 = 32;
+
+/// How long a send's receipt must have stayed missing since its nonce was
+/// first seen used before the send is taken as superseded, unless the
+/// client says otherwise ([`Client::receipts_lagging_at_most`]): twice the
+/// most a followed chain's head may lag and still be followed.
+pub(super) const RECEIPT_LAG: Duration = Duration::from_secs(60);
 
 /// How many looks a send may wait behind a nonce no send holds before that
 /// nonce is filled.
@@ -100,6 +176,15 @@ impl Client {
     /// [`Client::pipelined`] client is filled two thirds of the way there.
     pub fn waiting_at_most(mut self, within: Duration) -> Self {
         self.receipt_wait = Some(within);
+        self
+    }
+
+    /// This client, taking a send whose nonce is used and whose receipt
+    /// stays missing (besides [`USED_BLOCKS`] blocks) for `lag` as
+    /// superseded, rather than a minute: for endpoints known to answer for
+    /// receipts no further behind each other than well under that.
+    pub fn receipts_lagging_at_most(mut self, lag: Duration) -> Self {
+        self.receipt_lag = lag;
         self
     }
 
@@ -163,6 +248,7 @@ impl Client {
         sent_as(flight.hash);
         let nonce = claim.keep();
         let (told, outcome) = tokio::sync::oneshot::channel();
+        let landing = Landing::default();
         let watch = Watch {
             provider: self.provider.clone(),
             endpoints: self.endpoints.clone(),
@@ -170,13 +256,17 @@ impl Client {
             nonces: self.nonces.clone(),
             from,
             nonce,
+            receipt_lag: self.receipt_lag,
         };
         // Watched on a task of its own: a caller that stops waiting leaves
         // it watched, and filled if it never lands.
-        tokio::spawn(watch.until_used(flight, started, within, told));
+        tokio::spawn(watch.until_used(flight, started, within, told, landing.clone()));
         match tokio::time::timeout_at(deadline, outcome).await {
             Ok(Ok(outcome)) => outcome.with_context(|| what.to_string()),
-            _ => Err(anyhow::Error::new(NeverLanded)).with_context(|| what.to_string()),
+            Ok(Err(_)) => Err(anyhow::Error::new(NeverLanded)).with_context(|| what.to_string()),
+            Err(_) => {
+                Err(anyhow::Error::new(StillWatched(landing))).with_context(|| what.to_string())
+            }
         }
     }
 }
@@ -312,6 +402,9 @@ struct Watch {
     nonces: NonceFloor,
     from: Address,
     nonce: u64,
+    /// How long a receipt may stay missing after the nonce is seen used
+    /// before the send is taken as superseded (besides [`USED_BLOCKS`]).
+    receipt_lag: Duration,
 }
 
 impl Watch {
@@ -321,15 +414,22 @@ impl Watch {
     /// caller's deadline (`within` from `started`), a send that hasn't
     /// landed and is the account's next to land is filled, and filled again
     /// with higher fees every third of `within` after while the nonce stays
-    /// unused.
+    /// unused. `landing` says what became of it once known.
     async fn until_used(
         self,
         flight: Flight,
         started: Instant,
         within: Duration,
         told: tokio::sync::oneshot::Sender<Result<TransactionReceipt>>,
+        landing: Landing,
     ) {
+        let settles = Settles(landing);
         let outcome = self.watched(flight, started, within).await;
+        settles.0.settle(match &outcome {
+            Ok(_) => Landed::Yes,
+            Err(error) if error.is::<Superseded>() => Landed::No,
+            Err(_) => Landed::Unknown,
+        });
         let _ = told.send(outcome);
     }
 
@@ -347,8 +447,8 @@ impl Watch {
         let mut fees = flight.fees;
         let mut polls = 0u32;
         // The head at which the nonce was first seen used with no receipt,
-        // and the highest head seen since.
-        let mut used_at: Option<(u64, u64)> = None;
+        // the highest head seen since, and when it was first seen used.
+        let mut used_at: Option<(u64, u64, Instant)> = None;
         let mut gap_looks = 0u32;
         loop {
             if let Some(receipt) = self.receipt_of_any(&hashes).await {
@@ -372,17 +472,19 @@ impl Watch {
                         // Used, by this send or another: no later send is
                         // numbered at it.
                         self.nonces.landed(self.from, self.nonce);
-                        let (first, highest) = used_at.get_or_insert((head, head));
+                        let (first, highest, seen) = used_at.get_or_insert((head, head, now));
                         *highest = (*highest).max(head);
-                        if *highest >= first.saturating_add(USED_BLOCKS) {
+                        // Both spans: a node lags in blocks on a slow chain
+                        // and in seconds on a fast one.
+                        if *highest >= first.saturating_add(USED_BLOCKS)
+                            && now >= *seen + self.receipt_lag
+                        {
                             return Err(anyhow::Error::new(Superseded));
                         }
                         // Its receipt may still be on its way: nothing says
-                        // it didn't land, so it is never said superseded
-                        // for want of time.
-                        if now >= started + within {
-                            return Err(anyhow::Error::new(NeverLanded));
-                        }
+                        // it didn't land, so it is looked for until it
+                        // comes or the spans have passed, past its caller's
+                        // deadline if need be.
                     }
                     Some(Seen::Unknown) => {
                         used_at = None;

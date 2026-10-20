@@ -28,6 +28,7 @@ pub mod bindings {
             "shonin:agent/transfers@0.1.0#move",
             "shonin:agent/transfers@0.1.0#bridge",
             "shonin:agent/transfers@0.1.0#balances",
+            "shonin:agent/transfers@0.1.0#read-balances",
             "shonin:agent/data@0.1.0#query",
             "shonin:agent/websocket@0.1.0#connect",
             "shonin:agent/websocket@0.1.0#[method]connection.send",

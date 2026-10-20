@@ -5937,6 +5937,14 @@ async fn send_outcome_with<C: alloy::sol_types::SolCall>(
             not_sent.went_out(&sent);
         }
     };
+    // An earlier send of the same call whose caller stopped waiting may
+    // still land: until its watch knows whether it did, the call isn't sent
+    // again, or both could land.
+    let held = landing_key(&sent);
+    if still_landing(&held) {
+        tracing::debug!(%to, what, "an earlier send of this call may still land; not sent again yet");
+        return Outcome::NotSent;
+    }
     let sending = if roomy {
         send_roomy(client, keeper, to, call).await
     } else {
@@ -5955,6 +5963,24 @@ async fn send_outcome_with<C: alloy::sol_types::SolCall>(
                 } else {
                     Outcome::Refused
                 }
+            } else if let Some(landing) = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<chain::client::StillWatched>())
+            {
+                // It went out and may yet land: held until its watch knows.
+                went_out();
+                if let Ok(mut landing_now) = LANDING.lock() {
+                    let now = std::time::Instant::now();
+                    landing_now.retain(|_, (_, until)| now < *until);
+                    landing_now.insert(held, (landing.0.clone(), now + LANDING_HOLD));
+                }
+                tracing::info!(
+                    chain_id = client.chain_id,
+                    %to,
+                    what,
+                    "the keeper's send has no receipt yet and may still land; not sent again until that is known"
+                );
+                Outcome::NotSent
             } else {
                 // Not the vault's answer but the node's, or none at all: a
                 // keeper out of gas money, rate limited or underpriced does
@@ -6123,6 +6149,47 @@ impl Failures<Call> {
         whats.join(", ")
     }
 }
+
+/// A call as held while an earlier send of it may still land: its node, its
+/// contract, its function and the hash of the call itself. A `keep` is held
+/// whatever total it carries, since the vault holds one collected total at
+/// a time.
+type Landing = (String, Address, [u8; 4], B256);
+
+fn landing_key(sent: &Call) -> Landing {
+    let hash = if sent.4 == <IVault::keepCall as alloy::sol_types::SolCall>::SELECTOR {
+        B256::ZERO
+    } else {
+        sent.3
+    };
+    (sent.0.clone(), sent.1, sent.4, hash)
+}
+
+/// Whether an earlier send of the call may still land.
+fn still_landing(call: &Landing) -> bool {
+    let Ok(mut landing) = LANDING.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    match landing.get(call) {
+        Some((watched, until)) if now < *until && watched.may_still_land() => true,
+        Some(_) => {
+            landing.remove(call);
+            false
+        }
+        None => false,
+    }
+}
+
+/// The longest a call is held while an earlier send of it may still land:
+/// as long as a send is watched for.
+const LANDING_HOLD: std::time::Duration = chain::client::LANDING_TIMEOUT;
+
+/// Calls whose last send's caller stopped waiting while it might still land,
+/// with what its watch knows and until when it is held at most.
+static LANDING: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Landing, (chain::client::Landing, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Calls that have lately not gone out.
 static NOT_SENT: std::sync::LazyLock<std::sync::Mutex<Failures<Call>>> =
