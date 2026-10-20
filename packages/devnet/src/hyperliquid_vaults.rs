@@ -1,13 +1,20 @@
 //! Hyperliquid vaults on Hyperliquid testnet, whose dollar is HyperEVM's own
 //! USDC rather than the stand-in dollar.
 //!
-//! The testnet deploy puts the stand-in stack on HyperEVM like on every
-//! chain: a vault there settles in the stand-in dollar, which the venue has
-//! never heard of. A vault that trades on Hyperliquid itself needs a factory
-//! whose asset is the USDC that HyperCore sends home, a station factory with
-//! the same asset, the station built with delayed closes, and the Hyperliquid
-//! driver approved. This deploys those beside the testnet deployment, using
-//! its registries, prices and vault implementation:
+//! A testnet generation deployed with the stand-ins put them on HyperEVM like
+//! on every chain: a vault there settles in the stand-in dollar, which the
+//! venue has never heard of. A vault that trades on Hyperliquid itself needs
+//! a factory whose asset is the USDC that HyperCore sends home, a station
+//! factory with the same asset, the station built with delayed closes, and
+//! the Hyperliquid driver approved.
+//!
+//! A generation deployed with the chain's own dollar (every public network
+//! now) already has the factory and station factory in USDC: then only the
+//! driver is deployed and proposed, and the generation's own factory is the
+//! stack's, so the services as deployed (the cloud's among them) serve its
+//! vaults with nothing put in place. Otherwise this deploys the rest beside
+//! the testnet deployment, using its registries, prices and vault
+//! implementation:
 //!
 //! - `HyperliquidDriver`, for the ETH perp and the HYPE/USDC pair (the venue
 //!   numbers them per network, so both are read from its API);
@@ -71,6 +78,9 @@ alloy::sol! {
         function vaultImplementation() external view returns (address);
         function asset() external view returns (address);
         function previous() external view returns (address);
+    }
+    interface IStationFactoryParts {
+        function implementation() external view returns (address);
     }
 }
 
@@ -215,6 +225,46 @@ async fn deploy(
         (USDC, CORE_DEPOSIT_WALLET, vec![perp], vec![spot_pair]).abi_encode_params(),
     )
     .await?;
+    client
+        .send(
+            admin,
+            deployments.attestation,
+            IAttestationRegistry::proposeDriverCall {
+                name: crate::deploy::market_id("hyperliquid"),
+                implementation: driver,
+            },
+        )
+        .await
+        .context("proposing the Hyperliquid driver")?;
+    tracing::info!(%driver, "the Hyperliquid driver is proposed");
+
+    // A generation whose own factory settles in USDC needs nothing more:
+    // its factory and station factory are the stack's.
+    let own_asset = client
+        .read(deployments.factory, IFactoryParts::assetCall {})
+        .await?;
+    if own_asset == USDC {
+        let station_implementation = client
+            .read(
+                deployments.station_factory,
+                IStationFactoryParts::implementationCall {},
+            )
+            .await?;
+        tracing::info!(factory = %deployments.factory, "the generation's own factory settles in USDC: it is the stack's");
+        return Ok(HyperliquidVaults {
+            chain_id: client.chain_id,
+            deployed_block: from_block,
+            usdc: USDC,
+            core_deposit_wallet: CORE_DEPOSIT_WALLET,
+            driver,
+            station_implementation,
+            station_factory: deployments.station_factory,
+            factory: deployments.factory,
+            previous_factory: deployments.factory,
+            generation,
+        });
+    }
+
     // The station's closes run in a library linked into it.
     let closes = put(client, artifacts, admin, "StationCloses", Vec::new()).await?;
     let station_implementation = put_with(client, artifacts, admin, "Station", closes).await?;
@@ -270,18 +320,6 @@ async fn deploy(
         },
     )
     .await?;
-    client
-        .send(
-            admin,
-            deployments.attestation,
-            IAttestationRegistry::proposeDriverCall {
-                name: crate::deploy::market_id("hyperliquid"),
-                implementation: driver,
-            },
-        )
-        .await
-        .context("proposing the Hyperliquid driver")?;
-    tracing::info!(%driver, "the Hyperliquid driver is proposed");
 
     Ok(HyperliquidVaults {
         chain_id: client.chain_id,
@@ -1019,6 +1057,22 @@ pub async fn run(
     let funder = Funder::new(client)?;
     let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
 
+    // A generation in USDC charges its publishing fee in USDC too: the
+    // author is given the fee and the tank before it publishes.
+    if progress.strategy_id.is_none() && deployments.usd == USDC {
+        let fee = client
+            .read(
+                deployments.publishing,
+                chain::bindings::publishing::IPublishing::feeCall {},
+            )
+            .await?;
+        let tank = client
+            .read(vaults.factory, IVaultFactory::configCall {})
+            .await?
+            .minimumTank;
+        let dollars = u64::try_from(fee + tank).unwrap_or(u64::MAX) as f64 / 1e6;
+        funder.dollars_on_hyperevm(client, author, dollars).await?;
+    }
     let strategy_id = match progress.strategy_id {
         Some(id) => id,
         None => {

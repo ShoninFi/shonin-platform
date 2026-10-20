@@ -14,10 +14,11 @@
 //! ([`crate::devnet_keys`]), and [`set_up_public`] sets them up from there
 //! as a development cluster is set up, with a public cluster's choices
 //! ([`Settings::testnet`]): the roles funded by transfer from the deployer,
-//! the dollar's mint at its fixed index of the team's mnemonic, no timelock,
-//! the operator's real project, and no image at all until a real digest is
-//! proposed (`chains:image`). Nothing there is driven: devnet keeps its own
-//! time.
+//! Circle's devnet USDC as the dollar, with no stand-in venue or driver and
+//! nothing minted, as on the EVM testnets, no timelock, the operator's real
+//! project, and no image at all until a real digest is proposed
+//! (`chains:image`). Nothing there is driven: devnet keeps its own time,
+//! and Orca's pool is kept at Pyth's price by `testnet-market`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -119,11 +120,41 @@ async fn upgrade_authority(client: &SolanaClient, id: &Pubkey) -> Result<Option<
     }
 }
 
+/// Circle's USDC on Solana devnet: a public cluster's dollar, which only
+/// Circle's faucet gives out.
+pub const CIRCLE_DEVNET_USDC: Pubkey =
+    Pubkey::from_str_const("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+
+/// The dollar a cluster is set up with.
+pub enum Dollar {
+    /// The platform's own mint at this key, minted by the admin: a
+    /// development cluster's, beside the stand-in venue and driver.
+    Own(Keypair),
+    /// A dollar nobody here mints (Circle's USDC): a public cluster's, with
+    /// no stand-in venue or driver.
+    Public(Pubkey),
+}
+
+impl Dollar {
+    pub fn pubkey(&self) -> Pubkey {
+        match self {
+            Self::Own(mint) => mint.pubkey(),
+            Self::Public(mint) => *mint,
+        }
+    }
+
+    /// Whether the stand-ins (the venue, its markets and reserves, the
+    /// stand-in driver, and minted money) go on the cluster.
+    pub fn stand_ins(&self) -> bool {
+        matches!(self, Self::Own(_))
+    }
+}
+
 /// What sets a cluster up: everything a development cluster and a public one
 /// do differently. The rest of the set-up is the same on both.
 pub struct Settings {
-    /// The dollar's mint account.
-    pub mint: Keypair,
+    /// The dollar.
+    pub mint: Dollar,
     /// The registry's timelock and its floor.
     pub timelock: u64,
     pub min_timelock: u64,
@@ -161,7 +192,10 @@ impl Settings {
     /// faucet.
     pub fn local() -> Result<Self> {
         Ok(Self {
-            mint: keys::keypair_from_mnemonic(keys::DEVELOPMENT_MNEMONIC, MINT_KEY)?,
+            mint: Dollar::Own(keys::keypair_from_mnemonic(
+                keys::DEVELOPMENT_MNEMONIC,
+                MINT_KEY,
+            )?),
             timelock: TIMELOCK,
             min_timelock: 0,
             blessing_ttl: BLESSING_TTL,
@@ -182,24 +216,22 @@ impl Settings {
         })
     }
 
-    /// Devnet's, as the EVM testnets are set up: the dollar's mint at its
-    /// fixed index of the team's mnemonic `phrase` (never the published
-    /// development one, whose keys anyone holds), no timelock, the testnet
-    /// terms, no image until a real digest is proposed, the operator's real
-    /// Google Cloud `project`, and every role funded by transfer from the
-    /// deployer as the funding file gives `cluster`'s amounts.
+    /// Devnet's, as the EVM testnets are set up: Circle's devnet USDC as
+    /// the dollar and no stand-ins, the team's mnemonic `phrase` (never the
+    /// published development one, whose keys anyone holds), no timelock,
+    /// the testnet terms, no image until a real digest is proposed, the
+    /// operator's real Google Cloud `project`, and every role funded by
+    /// transfer from the deployer as the funding file gives `cluster`'s
+    /// amounts.
     pub fn testnet(
         phrase: &str,
         project: &str,
         funding: &crate::fund::Funding,
         cluster: &ChainKey,
     ) -> Result<Self> {
-        let mint = keys::keypair_from_mnemonic(phrase, crate::devnet_keys::DOLLAR_MINT)?;
-        let development = keys::keypair_from_mnemonic(
-            keys::DEVELOPMENT_MNEMONIC,
-            crate::devnet_keys::DOLLAR_MINT,
-        )?;
-        if mint.pubkey() == development.pubkey() {
+        if keys::keypair_from_mnemonic(phrase, DEPLOYER)?.pubkey()
+            == keys::keypair_from_mnemonic(keys::DEVELOPMENT_MNEMONIC, DEPLOYER)?.pubkey()
+        {
             bail!(
                 "{} is the published development phrase, whose keys are anyone's: a public cluster is set up from the team's own",
                 keys::TESTNET_SOLANA_MNEMONIC
@@ -212,7 +244,7 @@ impl Settings {
                 )
             })?;
         Ok(Self {
-            mint,
+            mint: Dollar::Public(CIRCLE_DEVNET_USDC),
             timelock: 0,
             min_timelock: 0,
             blessing_ttl: BLESSING_TTL,
@@ -222,6 +254,28 @@ impl Settings {
             project: crate::admin::project_id(checked_project(project)?).0,
             funding: Funding::Transfer { reserve, roles },
         })
+    }
+}
+
+/// Whether the cluster's admin mints the platform's dollar: the stand-in
+/// dollar's mint authority is the admin; Circle's USDC's is not.
+pub async fn admin_mints(client: &SolanaClient, platform: &Platform) -> Result<bool> {
+    let data = client
+        .account(&platform.mint)
+        .await?
+        .map(|account| account.data)
+        .unwrap_or_default();
+    Ok(mint_authority(&data) == Some(platform.admin))
+}
+
+/// A token mint's authority, from its account's data: an optional key
+/// first, as the token program lays it out.
+fn mint_authority(data: &[u8]) -> Option<Pubkey> {
+    match data.get(..4)? {
+        [1, 0, 0, 0] => <[u8; 32]>::try_from(data.get(4..36)?)
+            .ok()
+            .map(Pubkey::new_from_array),
+        _ => None,
     }
 }
 
@@ -400,7 +454,6 @@ pub async fn set_up_public(
     public_rpc: &str,
     file: &Path,
     settings: &Settings,
-    orca_seed: u64,
 ) -> Result<SolanaDeployments> {
     let keys = client.keys()?;
     let ids = programs_in_place(client).await?;
@@ -431,16 +484,18 @@ pub async fn set_up_public(
         );
     }
     let (platform, checker) = set_up(client, keys, settings).await?;
-    crate::solana_orca::set_up_devnet(
-        client,
-        &platform,
-        &keys.deployer,
-        keys.get(Role::Admin),
-        keys.get(Role::Operator),
-        orca_seed,
-    )
-    .await
-    .context("setting Orca's pool up")?;
+    // Orca's pool is the testnet market's to seed and keep at Pyth's price
+    // (`task chains:testnet-market-setup STEPS=pools`), with its own key.
+    if client
+        .account(&chain::solana::orca::POOLS[0].address)
+        .await?
+        .is_none()
+    {
+        tracing::warn!(
+            pool = %chain::solana::orca::POOLS[0].address,
+            "Orca's pool this build lists is not on the cluster yet: testnet-market-setup creates and seeds it"
+        );
+    }
 
     let deployments = SolanaDeployments {
         chain_key: key.to_string(),
@@ -723,7 +778,8 @@ async fn set_up(
     let deployer = &keys.deployer;
     let admin = keys.get(Role::Admin);
     let operator = keys.get(Role::Operator);
-    let mint = &settings.mint;
+    let dollar = &settings.mint;
+    let stand_ins = dollar.stand_ins();
     let cluster = client.cluster.clone();
     let (create_checker, checker) = Platform::ix_create_checker(
         &deployer.pubkey(),
@@ -734,15 +790,19 @@ async fn set_up(
     let platform = Platform {
         cluster_name: cluster.clone(),
         cluster: client.cluster_value(),
-        mint: mint.pubkey(),
+        mint: dollar.pubkey(),
         admin: admin.pubkey(),
         platform: keys.address(Role::Platform),
         operator: operator.pubkey(),
         checker: Some(checker),
     };
 
-    // The dollar, minted by the admin, as anyone may mint the EVM's local one.
-    if client.account(&mint.pubkey()).await?.is_none() {
+    // The dollar: minted by the admin on a development cluster, as anyone
+    // may mint the EVM's local one; a public cluster's must already be
+    // there.
+    if let Dollar::Own(mint) = dollar
+        && client.account(&mint.pubkey()).await?.is_none()
+    {
         let rent = client
             .rpc
             .rent_exempt_minimum(Platform::rent_for_mint())
@@ -753,6 +813,11 @@ async fn set_up(
             .send(ixs, &[deployer, mint])
             .await
             .context("creating the dollar")?;
+    }
+    if let Dollar::Public(mint) = dollar
+        && client.account(mint).await?.is_none()
+    {
+        bail!("the dollar's mint {mint} is not on {}", client.key);
     }
 
     // The checker must be final before the registry trusts it, which the
@@ -817,10 +882,11 @@ async fn set_up(
             .await
             .context("setting the stations up")?;
     }
-    if client
-        .account(&local_venue::venue_address())
-        .await?
-        .is_none()
+    if stand_ins
+        && client
+            .account(&local_venue::venue_address())
+            .await?
+            .is_none()
     {
         let ix = platform.ix_initialize_venue(&deployer.pubkey(), MARGIN_BPS);
         client
@@ -841,7 +907,12 @@ async fn set_up(
     }
 
     // The venue's markets, and its reserves.
-    for (market, is_perp) in [(SPOT, false), (PERP, true)] {
+    let markets: &[(&str, bool)] = if stand_ins {
+        &[(SPOT, false), (PERP, true)]
+    } else {
+        &[]
+    };
+    for &(market, is_perp) in markets {
         if client
             .account(&local_venue::market_address(&name(market)))
             .await?
@@ -852,8 +923,11 @@ async fn set_up(
         }
     }
     // Topped up to them, not added to on every run.
-    let reserves =
-        VENUE_RESERVES.saturating_sub(client.token_balance(&local_venue::vault_address()).await?);
+    let reserves = if stand_ins {
+        VENUE_RESERVES.saturating_sub(client.token_balance(&local_venue::vault_address()).await?)
+    } else {
+        0
+    };
     if reserves > 0 {
         client
             .send(
@@ -867,7 +941,9 @@ async fn set_up(
             .await
             .context("the venue's reserves")?;
     }
-    tracing::info!("the stand-in venue has listed its markets");
+    if stand_ins {
+        tracing::info!("the stand-in venue has listed its markets");
+    }
 
     // The images, the project and the stand-in driver, behind the timelock.
     let mut proposals = Vec::new();
@@ -897,7 +973,7 @@ async fn set_up(
         registry::state::ApprovalKind::Driver,
         &local_driver::NAME,
     );
-    if client.account(&driver_slot).await?.is_none() {
+    if stand_ins && client.account(&driver_slot).await?.is_none() {
         let ix = platform
             .ix_propose(
                 client,
@@ -911,10 +987,17 @@ async fn set_up(
             .await
             .context("proposing the stand-in driver")?;
     }
-    // Orca's driver, deployed final as the registry requires.
+    // Orca's driver, deployed final as the registry requires: proposed if
+    // the registry approves another program under its name (an earlier
+    // build's, listing another dollar's pool) or none.
     let orca_slot =
         registry::read::approval_address(registry::state::ApprovalKind::Driver, &orca_driver::NAME);
-    if client.account(&orca_slot).await?.is_none() {
+    let now = client.now().await?;
+    let approved = client
+        .load::<registry::state::ApprovalSlot>(&orca_slot)
+        .await?
+        .is_some_and(|slot| slot.effective(now) == orca_driver::ID || slot.next == orca_driver::ID);
+    if !approved {
         let ix = platform
             .ix_propose(
                 client,
@@ -938,9 +1021,15 @@ async fn set_up(
     }
     client.send(open, &[deployer]).await?;
     // Each topped up to its starting dollars, as on the EVM: one that holds
-    // them is given nothing.
+    // them is given nothing. A public cluster's dollar comes from its
+    // faucet alone.
     let mut minting = Vec::new();
-    for role in [Role::Author, Role::Viewer, Role::Keeper, Role::Admin] {
+    let spenders: &[Role] = if stand_ins {
+        &[Role::Author, Role::Viewer, Role::Keeper, Role::Admin]
+    } else {
+        &[]
+    };
+    for &role in spenders {
         let holds = client
             .token_balance(&platform.dollars(&keys.address(role)))
             .await?;
@@ -1146,27 +1235,32 @@ activation_usd = 2.0
     }
 
     #[test]
-    fn the_devnet_dollar_s_mint_is_at_its_fixed_index_of_the_team_s_mnemonic() {
-        let mint = testnet().mint.pubkey();
-        assert_eq!(
-            mint,
-            keys::keypair_from_mnemonic(TEAM, crate::devnet_keys::DOLLAR_MINT)
-                .unwrap()
-                .pubkey()
-        );
-        // Never the local dollar's, nor any program's or role's key.
-        assert_ne!(mint, Settings::local().unwrap().mint.pubkey());
-        for index in crate::devnet_keys::PROGRAM_KEYS
-            .iter()
-            .map(|(_, index)| *index)
-            .chain([keys::DEPLOYER])
-            .chain((0..chain::client::ROLE_COUNT as u32).map(|role| keys::ROLE_BASE + role))
-        {
-            assert_ne!(
-                mint,
-                keys::keypair_from_mnemonic(TEAM, index).unwrap().pubkey()
-            );
-        }
+    fn the_devnet_dollar_is_circle_s_usdc_with_no_stand_ins_and_the_local_one_is_minted_here() {
+        let devnet = testnet();
+        assert!(matches!(devnet.mint, Dollar::Public(mint) if mint == CIRCLE_DEVNET_USDC));
+        assert!(!devnet.mint.stand_ins());
+        let local = Settings::local().unwrap();
+        assert!(local.mint.stand_ins());
+        assert_ne!(local.mint.pubkey(), CIRCLE_DEVNET_USDC);
+    }
+
+    #[test]
+    #[cfg(feature = "devnet")]
+    fn the_devnet_build_s_orca_driver_lists_circle_s_usdc() {
+        assert_eq!(chain::solana::orca::DOLLAR_MINT, CIRCLE_DEVNET_USDC);
+    }
+
+    #[test]
+    fn a_mint_s_authority_is_read_from_its_optional_key() {
+        let admin = Pubkey::new_unique();
+        let mut data = vec![0u8; 82];
+        data[..4].copy_from_slice(&[1, 0, 0, 0]);
+        data[4..36].copy_from_slice(admin.as_ref());
+        assert_eq!(mint_authority(&data), Some(admin));
+        // No authority: nobody mints it.
+        data[..4].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(mint_authority(&data), None);
+        assert_eq!(mint_authority(&[]), None);
     }
 
     #[test]

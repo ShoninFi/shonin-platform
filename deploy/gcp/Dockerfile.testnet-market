@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1
 # testnet-market: keeps the test networks' Uniswap pools at the real market
 # price, from Chainlink's mainnet feeds (read with no key), and posts those
-# feeds' rounds to their testnet mirrors. Test networks only: the binary
+# feeds' rounds to their testnet mirrors; and Solana devnet's Orca pool at
+# Pyth's price. Test networks only: the binary
 # refuses any other network, and this image is built for the testnet alone.
 # Runs on its own small VM (deploy/gcp/testnet-market).
 # Built from the repository root by `task cloud:build NAME=testnet-market NETWORK=testnet`,
 # which passes the network's settings and its deployments directory (the
 # mirror feeds' record among them):
-#   docker build --build-arg NETWORK_FEATURE=none --build-arg NETWORK=testnet \
+#   docker build --build-arg NETWORK_FEATURE=devnet --build-arg NETWORK=testnet \
 #     --build-context deployments=.shonin/testnet/deployments \
 #     -f deploy/gcp/Dockerfile.testnet-market .
 #
-# Everything it runs with is in the image but its key: its own test network
-# account's key alone, SHONIN_TESTNET_MARKET_KEY, handed to the container
-# where it is started (an env file only root can read, on its VM). The
+# Everything it runs with is in the image but its keys: its own test network
+# accounts' keys alone, SHONIN_TESTNET_MARKET_KEY (EVM) and
+# SHONIN_TESTNET_MARKET_SOLANA_KEY, handed to the container where it is
+# started (an env file only root can read, on its VM). What it buys back to
+# is kept in /var/lib/testnet-market, a directory of the VM's. The
 # chains' endpoints are the public ones committed in config/chains.toml,
 # unless the paid endpoints' secret overrides them.
 
@@ -38,22 +41,26 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS deps
 ENV CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-# Accepted like every image's; this one compiles no Solana program id.
+# The Solana program ids it compiles in: the devnet ids on the testnet (Orca's
+# pool and dollar are the ones the devnet build of the driver lists).
 ARG NETWORK_FEATURE
 COPY --from=recipe /src/recipe.json recipe.json
 # The Solana programs' crates the chain crate names by path: outside the
-# workspace, so the recipe carries no skeleton of them, and cargo resolves
-# them even where no feature uses them.
+# workspace, so the recipe carries no skeleton of them.
 COPY contracts/solana contracts/solana
-RUN cargo chef cook --release --locked -p shonin-testnet-market --bin testnet-market --recipe-path recipe.json
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE}" && \
+    features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
+    cargo chef cook --release --locked -p shonin-testnet-market --bin testnet-market $features --recipe-path recipe.json
 
 # Then the service itself.
 FROM ${DEPS} AS build
 ARG NETWORK
+ARG NETWORK_FEATURE
 RUN : "${NETWORK:?pass --build-arg NETWORK=testnet}" && \
     { [ "$NETWORK" = testnet ] || { echo "testnet-market is built for the testnet alone, not $NETWORK"; exit 1; }; }
 COPY . .
-RUN cargo build --release --locked -p shonin-testnet-market --bin testnet-market
+RUN features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
+    cargo build --release --locked -p shonin-testnet-market --bin testnet-market $features
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 ARG NETWORK
@@ -64,6 +71,7 @@ COPY config/chains.toml /etc/shonin/chains.toml
 COPY --from=deployments *.json /etc/shonin/deployments/${NETWORK}/
 ENV SHONIN_NETWORK=${NETWORK} \
     SHONIN_CHAINS=/etc/shonin/chains.toml \
-    SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK}
+    SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK} \
+    SHONIN_TESTNET_MARKET_HOMES=/var/lib/testnet-market/homes.json
 ENTRYPOINT ["/usr/local/bin/testnet-market"]
 CMD ["--port", "19088", "--listen", "0.0.0.0"]

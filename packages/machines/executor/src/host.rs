@@ -560,8 +560,10 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                             Place::Evm(Evm {
                                 stocks: Some(half), ..
                             }),
-                            crate::robinhood::ROBINHOOD,
-                        ) => Some(half.submit(bytes).await),
+                            name,
+                        ) if crate::robinhood::trades_stocks(name) => {
+                            Some(half.submit(bytes).await)
+                        }
                         (
                             Place::Evm(Evm {
                                 lighter: Some(half),
@@ -684,8 +686,8 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 Place::Evm(Evm {
                     stocks: Some(half), ..
                 }),
-                crate::robinhood::ROBINHOOD,
-            ) => Some(half.state(&query).await),
+                name,
+            ) if crate::robinhood::trades_stocks(name) => Some(half.state(&query).await),
             (
                 Place::Evm(Evm {
                     lighter: Some(half),
@@ -2159,12 +2161,16 @@ pub async fn read_markets(chain: &Client, venue: Address) -> Result<Vec<MarketSt
 }
 
 /// The venue's markets `keep` keeps, by name, in the venue's order: only
-/// those are read.
+/// those are read. A chain without the stand-in venue (its address zero, as
+/// on every public network) lists none, and nothing is read.
 pub async fn read_some_markets(
     chain: &Client,
     venue: Address,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<MarketState>> {
+    if venue.is_zero() {
+        return Ok(Vec::new());
+    }
     let ids = chain.read(venue, ILocalVenue::marketsCall {}).await?;
     let mut markets = Vec::with_capacity(ids.len());
     for id in ids.into_iter().filter(|id| keep(&market_name(*id))) {
@@ -2202,6 +2208,46 @@ pub fn market_name(id: alloy::primitives::FixedBytes<32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_chain_without_the_stand_in_venue_lists_no_markets_and_reads_nothing() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::{Value, json};
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let method = request["method"].as_str().unwrap_or_default().to_string();
+                    seen.lock().unwrap().push(method.clone());
+                    let result = match method.as_str() {
+                        "eth_chainId" => json!("0x14a34"),
+                        _ => Value::Null,
+                    };
+                    Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chain = crate::stand_in::client(&url).await;
+        asked.lock().unwrap().clear();
+        let markets = read_markets(&chain, Address::ZERO).await.unwrap();
+        assert!(markets.is_empty());
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|method| method != "eth_call"),
+            "nothing is read from a venue that isn't there: {:?}",
+            asked.lock().unwrap()
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn a_stage_seen_after_a_venue_reply_blocks_the_remaining_new_actions() {

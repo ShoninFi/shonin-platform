@@ -22,6 +22,7 @@ use robinhood::listings::{Feed, MirrorFeeds, Token, Venue};
 
 use crate::bindings::{AggregatorV3Interface, IMirrorFeed, ISwapRouter02, IToken, IUniswapV3Pool};
 use crate::health::{FeedHealth, Health, PoolHealth};
+use crate::homes::Homes;
 use crate::math::{self, Pair, Plan, PoolState};
 
 /// How the pools are kept.
@@ -56,9 +57,13 @@ impl Default for Settings {
             band_bps: 30.0,
             restore_band_bps: 5.0,
             max_trade_usd: 250.0,
-            floors: [("WETH".to_string(), 0.002), ("USDC".to_string(), 5.0)]
-                .into_iter()
-                .collect(),
+            floors: [
+                ("WETH".to_string(), 0.002),
+                ("USDC".to_string(), 5.0),
+                ("SOL".to_string(), 0.05),
+            ]
+            .into_iter()
+            .collect(),
             default_stock_floor: 1.0,
             max_reference_age: Duration::from_secs(4 * 86_400),
             tick_words: 32,
@@ -147,9 +152,6 @@ pub struct ChainMarket {
     pub dollar_mintable: bool,
     pub mirrors: Vec<Mirror>,
     pub pools: Vec<Kept>,
-    /// What the account held of each finite asset when it first looked: what
-    /// it buys back to.
-    pub home: BTreeMap<Address, U256>,
     /// When each pool was last said at warn to be stuck one way.
     warned: BTreeMap<(Address, bool), Instant>,
     /// Each pool's token order, read once.
@@ -195,7 +197,6 @@ impl ChainMarket {
                     fee: resolved.fee,
                 })
                 .collect(),
-            home: BTreeMap::new(),
             warned: BTreeMap::new(),
             orders: BTreeMap::new(),
             spacings: BTreeMap::new(),
@@ -318,18 +319,18 @@ pub fn decide(settings: &Settings, situation: &Situation) -> Decision {
     }
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
 }
 
-fn units(amount: U256, decimals: u8) -> String {
+pub(crate) fn units(amount: U256, decimals: u8) -> String {
     format_units(amount, decimals).unwrap_or_else(|_| amount.to_string())
 }
 
-fn whole(amount: f64, decimals: u8) -> U256 {
+pub(crate) fn whole(amount: f64, decimals: u8) -> U256 {
     // Floors are small and written by hand: micro-units are exact enough.
     U256::from((amount.max(0.0) * 1e6) as u128) * U256::from(10u8).pow(U256::from(decimals))
         / U256::from(1_000_000u32)
@@ -347,8 +348,12 @@ pub struct Market {
     pub account: Address,
     pub source: DynProvider,
     pub chains: Vec<ChainMarket>,
+    /// Solana devnet's Orca pool, when it is kept.
+    pub solana: Option<crate::orca::SolanaMarket>,
     pub settings: Settings,
     pub health: Arc<Mutex<Health>>,
+    /// What each finite asset is bought back to.
+    pub homes: Homes,
 }
 
 impl Market {
@@ -366,6 +371,17 @@ impl Market {
                 if let Ok(mut health) = self.health.lock() {
                     health.chain(&chain.key).error = Some(format!("{error:#}"));
                 }
+            }
+        }
+        if let Some(solana) = self.solana.as_mut()
+            && let Err(error) = solana
+                .keep(&self.settings, &mut self.homes, &self.health)
+                .await
+        {
+            failures += 1;
+            tracing::warn!(chain = %solana.key, error = %format!("{error:#}"), "the round on this chain stopped; tried again next round");
+            if let Ok(mut health) = self.health.lock() {
+                health.chain(&solana.key).error = Some(format!("{error:#}"));
             }
         }
         if let Ok(mut health) = self.health.lock() {
@@ -556,13 +572,16 @@ impl Market {
         let token_balance = token.balanceOf(account).call().await?;
         let dollar_balance = dollar.balanceOf(account).call().await?;
         let mintable = self.chains[index].dollar_mintable;
-        let home = &mut self.chains[index].home;
-        let token_home = *home.entry(kept.token.address).or_insert(token_balance);
-        let dollar_home = if mintable {
-            None
-        } else {
-            Some(*home.entry(kept.dollar.address).or_insert(dollar_balance))
-        };
+        let token_home = self.homes.home(
+            &Homes::key(&key, &kept.token.address.to_string()),
+            token_balance,
+        );
+        let dollar_home = (!mintable).then(|| {
+            self.homes.home(
+                &Homes::key(&key, &kept.dollar.address.to_string()),
+                dollar_balance,
+            )
+        });
 
         let (crossed, read_to) = if target == state.sqrt_price {
             (Vec::new(), None)
@@ -748,17 +767,8 @@ impl Market {
         }
     }
 
-    fn record_pool(&self, key: &str, mut health: PoolHealth) {
-        if let Ok(mut shared) = self.health.lock() {
-            let pools = &mut shared.chain(key).pools;
-            let last_trade = pools
-                .iter()
-                .find(|pool| pool.symbol == health.symbol)
-                .and_then(|pool| pool.last_trade);
-            health.last_trade = health.last_trade.or(last_trade);
-            pools.retain(|pool| pool.symbol != health.symbol);
-            pools.push(health);
-        }
+    fn record_pool(&self, key: &str, health: PoolHealth) {
+        record_pool(&self.health, key, health);
     }
 
     /// The initialised ticks between the pool's price and the target, in
@@ -829,8 +839,22 @@ impl Market {
     }
 }
 
+/// A pool's line in the health report, keeping when it was last traded.
+pub(crate) fn record_pool(shared: &Mutex<Health>, key: &str, mut health: PoolHealth) {
+    if let Ok(mut shared) = shared.lock() {
+        let pools = &mut shared.chain(key).pools;
+        let last_trade = pools
+            .iter()
+            .find(|pool| pool.symbol == health.symbol)
+            .and_then(|pool| pool.last_trade);
+        health.last_trade = health.last_trade.or(last_trade);
+        pools.retain(|pool| pool.symbol != health.symbol);
+        pools.push(health);
+    }
+}
+
 /// The token's price in dollars, as the pool has it.
-fn price_of(pair: &Pair, sqrt_price: U256) -> f64 {
+pub(crate) fn price_of(pair: &Pair, sqrt_price: U256) -> f64 {
     let raw = (math::to_f64(sqrt_price) / 2f64.powi(96)).powi(2);
     let per_unit = if pair.token_is_token0 { raw } else { 1.0 / raw };
     per_unit * 10f64.powi(i32::from(pair.token_decimals) - i32::from(pair.dollar_decimals))

@@ -332,8 +332,10 @@ async fn a_round_brings_every_pool_on_forked_testnets_within_the_band() {
         account: me,
         source: mainnet.clone(),
         chains,
+        solana: None,
         settings,
         health: health.clone(),
+        homes: testnet_market::homes::Homes::load(None).unwrap(),
     };
     market.round().await;
     {

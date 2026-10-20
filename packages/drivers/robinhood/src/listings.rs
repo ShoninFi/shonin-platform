@@ -159,6 +159,9 @@ pub struct Uniswap {
 pub struct Venue {
     pub chain: u64,
     pub label: &'static str,
+    /// The name the driver is approved under on this chain's registry, as
+    /// `config/drivers.toml` lists it (one chain to a name).
+    pub driver: &'static str,
     pub dollar: Token,
     pub uniswap: Uniswap,
     pub listed: &'static [Listing],
@@ -189,6 +192,7 @@ const fn mirror(symbol: &'static str, token: Address, source: Address) -> Listin
 pub const ROBINHOOD_TESTNET: Venue = Venue {
     chain: TESTNET,
     label: "Robinhood Chain testnet",
+    driver: crate::payload::DRIVER,
     dollar: Token {
         symbol: "USDG",
         address: address!("293b337712D4312776a3a2D292F44410E7873bAd"),
@@ -230,6 +234,7 @@ pub const ROBINHOOD_TESTNET: Venue = Venue {
 pub const BASE_SEPOLIA_VENUE: Venue = Venue {
     chain: BASE_SEPOLIA,
     label: "Base Sepolia",
+    driver: crate::payload::BASE_DRIVER,
     dollar: Token {
         symbol: "USDC",
         address: address!("036CbD53842c5426634e7929541eC2318f3dCF7e"),

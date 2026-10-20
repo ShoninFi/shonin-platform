@@ -185,6 +185,24 @@ mod tests {
     }
 
     #[test]
+    fn the_uniswap_driver_on_base_is_its_own_entry_with_the_robinhood_driver_s_terms() {
+        let catalogue = Catalogue::published();
+        let base = &catalogue.drivers["uniswap-base"];
+        let robinhood = &catalogue.drivers["robinhood"];
+        assert_eq!(base.chain, DriverChain::On(Chain::Base));
+        assert_eq!(robinhood.chain, DriverChain::On(Chain::Robinhood));
+        for driver in [base, robinhood] {
+            assert_eq!(driver.networks, vec!["testnet".to_string()]);
+            assert_eq!(driver.custody, Custody::Station);
+            assert_eq!(driver.exit, Exit::Contract);
+        }
+        // One contract: what its `restricted()` answers, on both chains.
+        assert_eq!(base.restricted, robinhood.restricted);
+        // A name the registry can hold: 32 bytes at most.
+        assert!("uniswap-base".len() <= 32);
+    }
+
+    #[test]
     fn every_restricted_list_is_sorted_codes() {
         for (name, driver) in Catalogue::published().drivers {
             let mut sorted = driver.restricted.clone();

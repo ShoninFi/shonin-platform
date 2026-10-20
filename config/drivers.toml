@@ -50,8 +50,21 @@ valuation = "on-chain"
 [drivers.robinhood]
 label = "Robinhood Chain stock tokens"
 chain = "robinhood"
-# Its listings are mainnet tokens: a testnet one would have nothing to trade.
-networks = []
+# On the testnet, the testnet's stock tokens against USDG in Uniswap pools
+# kept at the mainnet feeds' prices.
+networks = ["testnet"]
+restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
+custody = "station"
+exit = "contract"
+valuation = "on-chain"
+
+# The same driver contract as `robinhood`, deployed on Base and approved
+# there under this name: WETH against USDC on Uniswap v3, at Chainlink's
+# ETH/USD price. Its `restricted()` is the contract's, so the same list.
+[drivers.uniswap-base]
+label = "Uniswap v3 on Base"
+chain = "base"
+networks = ["testnet"]
 restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
 custody = "station"
 exit = "contract"

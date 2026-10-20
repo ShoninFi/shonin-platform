@@ -110,23 +110,17 @@ enum Command {
     Deploy,
     /// On the testnets, set Solana devnet up from the programs already
     /// deployed there, as a development cluster is set up: every role funded
-    /// by transfer from the deployer (the funding file's amounts), the
-    /// dollar's mint at its fixed index of the team's mnemonic, the
-    /// registry with no timelock and the development checker, the operator's
-    /// project, the stand-in driver and the venue's markets, every role's
-    /// dollar account; then the deployment file, with the roles. No image
-    /// is proposed: a real digest is, with `propose-image`. Safe to run
-    /// again.
+    /// by transfer from the deployer (the funding file's amounts), Circle's
+    /// devnet USDC as the dollar (no stand-in venue or driver, nothing
+    /// minted), the registry with no timelock and the development checker,
+    /// the operator's project, Orca's driver, every role's dollar account;
+    /// then the deployment file, with the roles. No image is proposed: a
+    /// real digest is, with `propose-image`. Orca's pool is seeded by
+    /// `testnet-market-setup`. Safe to run again.
     SolanaSetup {
         /// The operator's Google Cloud project id.
         #[arg(long)]
         project: String,
-        /// The SOL the market operator's own seed in Orca's pool holds, with
-        /// as many dollars, centred on Pyth's price: moved to it from the
-        /// deployer as it needs. The default gives the depth a $100 demo
-        /// vault's closes need. Zero sets no seed up.
-        #[arg(long, default_value_t = 40.0)]
-        orca_seed_sol: f64,
     },
     /// After the station program is upgraded in place, rewrite every
     /// station the first station program wrote (each driver ending at its
@@ -239,9 +233,17 @@ enum Command {
         /// Of each listed token, how much the funder adds to its pool.
         #[arg(long, default_value_t = 0.0)]
         pool_tokens: f64,
-        /// Propose the driver to each chain's registry as `robinhood`.
+        /// Propose the driver to each chain's registry under the name
+        /// `config/drivers.toml` lists for it.
         #[arg(long)]
         propose: bool,
+        /// The market's Solana account's SOL, instead of the funding file's
+        /// `market` amount.
+        #[arg(long)]
+        sol: Option<f64>,
+        /// The devnet USDC the market's seed in Orca's pool opens with.
+        #[arg(long, default_value_t = 75.0)]
+        orca_usdc: f64,
         /// Refuse unless every endpoint is a local fork (anvil).
         #[arg(long)]
         on_fork: bool,
@@ -278,9 +280,10 @@ enum Command {
     /// Write a Solana keypair derived from the testnet Solana mnemonic, and
     /// print its address.
     SolanaKeypair {
-        /// Which: the deployer, the registry's own address, or the keeper
-        /// (for the cloud's keeper, which holds that key alone).
-        #[arg(long, value_parser = ["deployer", "program", "keeper"])]
+        /// Which: the deployer, the registry's own address, the keeper (for
+        /// the cloud's keeper, which holds that key alone), or the testnet
+        /// market's account (for its VM, likewise).
+        #[arg(long, value_parser = ["deployer", "program", "keeper", "market"])]
         role: String,
         #[arg(long)]
         out: PathBuf,
@@ -468,10 +471,7 @@ async fn main() -> Result<()> {
                 target.network
             )
         }
-        Some(Command::SolanaSetup {
-            project,
-            orca_seed_sol,
-        }) => {
+        Some(Command::SolanaSetup { project }) => {
             if target.network != NetworkName::Testnet {
                 bail!(
                     "solana-setup sets up Solana devnet (NETWORK=testnet): the local cluster is set up with the chains"
@@ -487,17 +487,10 @@ async fn main() -> Result<()> {
                 let settings = solana::Settings::testnet(&phrase, &project, &funding, &key)?;
                 let client = chain::connect_solana(target.network, &key, &config).await?;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
-                let seed = (orca_seed_sol.max(0.0) * 1e9) as u64;
-                let deployments = solana::set_up_public(
-                    &client,
-                    &key,
-                    &config.public_rpc,
-                    &file,
-                    &settings,
-                    seed,
-                )
-                .await
-                .map_err(|error| for_this_build(target.network, error))?;
+                let deployments =
+                    solana::set_up_public(&client, &key, &config.public_rpc, &file, &settings)
+                        .await
+                        .map_err(|error| for_this_build(target.network, error))?;
                 println!(
                     "{} ({key}): set up; the dollar is {}, written to {}",
                     config.label,
@@ -727,11 +720,15 @@ async fn main() -> Result<()> {
             usdc,
             pool_tokens,
             propose,
+            sol,
+            orca_usdc,
             on_fork,
         }) => {
+            let mut chains = only(&target, one, evm_chains(&target));
+            chains.extend(only(&target, one, solana_clusters(&target)));
             testnet_market::run(
                 target.network,
-                only(&target, one, evm_chains(&target)),
+                chains,
                 &target.configs,
                 &target.deployments_dir,
                 &args.artifacts,
@@ -744,6 +741,8 @@ async fn main() -> Result<()> {
                     usdc,
                     pool_tokens,
                     propose,
+                    sol,
+                    orca_usdc,
                     on_fork,
                 },
             )
@@ -815,6 +814,7 @@ async fn main() -> Result<()> {
         Some(Command::SolanaKeypair { role, out }) => {
             let index = match role.as_str() {
                 "program" => solana::PROGRAM,
+                "market" => devnet_keys::MARKET,
                 "keeper" => {
                     chain::solana::keys::ROLE_BASE + chain::Role::Keeper.account_index() as u32
                 }
@@ -1052,7 +1052,8 @@ async fn main() -> Result<()> {
                             solana_testnet::operate(&served, every).await
                         }
                         .await;
-                        let Err(error) = ran else { continue };
+                        // It ends only where there is nothing to operate.
+                        let Err(error) = ran else { return Ok(()) };
                         let error =
                             for_this_build(network, error).context(format!("the market on {key}"));
                         if !market::worth_restarting(&error) {
@@ -1625,8 +1626,9 @@ async fn accounts(target: &Target, funding_file: &std::path::Path) -> Result<()>
                     }
                 );
             }
-            let mint = solana::keypair_from_mnemonic(&phrase, devnet_keys::DOLLAR_MINT)?;
-            println!("  {:<20} {}", "dollar (mint)", mint.pubkey());
+            println!("  {:<20} {}", "dollar (USDC)", solana::CIRCLE_DEVNET_USDC);
+            let market = solana::keypair_from_mnemonic(&phrase, devnet_keys::MARKET)?;
+            println!("  {:<20} {}", "testnet-market", market.pubkey());
             for (name, index) in devnet_keys::PROGRAM_KEYS {
                 let program = solana::keypair_from_mnemonic(&phrase, index)?;
                 println!("  {name:<20} {}", program.pubkey());
@@ -1874,23 +1876,20 @@ mod tests {
 
     #[test]
     fn the_solana_set_up_needs_the_operator_s_project() {
-        let Some(Command::SolanaSetup {
-            project,
-            orca_seed_sol,
-        }) = parse(&["solana-setup", "--project", "shonin-testnet"])
-            .unwrap()
-            .command
+        let Some(Command::SolanaSetup { project }) =
+            parse(&["solana-setup", "--project", "shonin-testnet"])
+                .unwrap()
+                .command
         else {
             panic!("not the set-up");
         };
         assert_eq!(project, "shonin-testnet");
-        assert_eq!(orca_seed_sol, 40.0);
         assert!(parse(&["solana-setup"]).is_err());
     }
 
     #[test]
     fn a_solana_keypair_is_written_for_the_deployer_the_registry_or_the_keeper_alone() {
-        for role in ["deployer", "program", "keeper"] {
+        for role in ["deployer", "program", "keeper", "market"] {
             assert!(matches!(
                 parse(&["solana-keypair", "--role", role, "--out", "k.json"])
                     .unwrap()

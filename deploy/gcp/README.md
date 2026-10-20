@@ -21,7 +21,7 @@ Everything runs in one zone (`europe-west4-a`), on the default network, with not
 | `shonin-reviewer-<network>` | the reviewer, attested the same way; on demand, off when idle | `GCP_REVIEWER_MACHINE_TYPE` | `shonin-workload` |
 | `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read three secrets, start, stop and read the prover's, the builder's and the reviewer's instances |
 | `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
-| `shonin-testnet-market-testnet` | testnet-market, the testnet alone; Container-Optimized OS | `e2-micro`, 10 GB standard disk | `shonin-testnet-market`: pull images, write logs, read its own key and the paid endpoints |
+| `shonin-testnet-market-testnet` | testnet-market, the testnet alone; Container-Optimized OS | `e2-micro`, 10 GB standard disk | `shonin-testnet-market`: pull images, write logs, read its own two keys and the paid endpoints |
 
 They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.europe-west4-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.europe-west4-a.c.shonin-testnet.internal:19081`.
 
@@ -92,7 +92,7 @@ An on-demand VM, on only while proving, created by `task cloud:deploy:prover` (i
 
 ## testnet-market's VM
 
-The testnet alone (deleted with it). `testnet-market/startup.sh` reads the market's own key (`shonin-testnet-market-key`: account 101 of the EVM mnemonic, never the mnemonic) and the paid endpoints, and runs one container, `shonin-testnet-market`, health on `0.0.0.0:19088` (open to the VPC alone). Every minute it posts each Robinhood stock's new Chainlink round from Robinhood Chain mainnet (read with no key) to its mirror feed on the testnet, then swaps each testnet pool (the stocks against USDG, WETH against USDC on Base Sepolia) back within its band of the feed. The image carries the mirror feeds' record (`mirror-feeds-evm-46630.json`) beside the deployment files. `task cloud:redeploy:testnet-market` points it at a new image.
+The testnet alone (deleted with it). `testnet-market/startup.sh` reads the market's own keys (`shonin-testnet-market-key`: account 101 of the EVM mnemonic; `shonin-testnet-market-solana-key`: key 111 of the Solana mnemonic, optional; never the mnemonics) and the paid endpoints, and runs one container, `shonin-testnet-market`, health on `0.0.0.0:19088` (open to the VPC alone). Every minute it posts each Robinhood stock's new Chainlink round from Robinhood Chain mainnet (read with no key) to its mirror feed on the testnet, then swaps each testnet pool (the stocks against USDG, WETH against USDC on Base Sepolia) back within its band of the feed, and Orca's pool on Solana devnet (wrapped SOL against Circle's devnet USDC) back within its band of Pyth's price. What it buys back to is kept in `/var/lib/shonin/testnet-market` on the VM, so a restart keeps it. The image carries the mirror feeds' record (`mirror-feeds-evm-46630.json`) beside the deployment files, and the Solana program ids of the devnet build. `task cloud:redeploy:testnet-market` points it at a new image.
 
 ## Standing it up (testnet)
 
@@ -110,7 +110,7 @@ task cloud:deploy:machine NAME=builder NETWORK=testnet       # its first boot ge
 task cloud:reviewer NETWORK=testnet                          # seal the model key, build, propose, launch
 task store:sync NETWORK=testnet                  # the published strategies' files to R2 (DRY_RUN=1 to list)
 # the market (after task chains:testnet-market-setup NETWORK=testnet):
-task cloud:secrets:testnet-market NETWORK=testnet            # its key, checked against the mirrors, through stdin
+task cloud:secrets:testnet-market NETWORK=testnet            # its keys (the EVM one checked against the mirrors), through stdin
 task cloud:images NETWORK=testnet NAMES=testnet-market
 task cloud:deploy:testnet-market NETWORK=testnet
 task cloud:status NETWORK=testnet
@@ -119,4 +119,4 @@ task cloud:logs NAME=api NETWORK=testnet         # executor | builder | reviewer
 
 Stopping and deleting: `task cloud:stop NAME=executor|services|prover NETWORK=testnet` (the disk stays and bills), `task cloud:start ...`, `task cloud:delete NAME=... NETWORK=testnet CONFIRM=yes`. Images: `gcloud artifacts docker images delete europe-west4-docker.pkg.dev/shonin-testnet/shonin/<name>@<digest> --project=shonin-testnet`.
 
-The machines are never handed a mnemonic, nor any key: each makes its own inside the enclave and is blessed through attestation. The only keys in the cloud are the keeper's testnet key and the tunnel's token, readable by the services VM's account alone, and on the testnet testnet-market's own key, readable by its VM's account alone.
+The machines are never handed a mnemonic, nor any key: each makes its own inside the enclave and is blessed through attestation. The only keys in the cloud are the keeper's testnet key and the tunnel's token, readable by the services VM's account alone, and on the testnet testnet-market's own two keys, readable by its VM's account alone.
