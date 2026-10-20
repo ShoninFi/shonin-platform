@@ -6,5 +6,5 @@
 # mainnet: run the tests against the new binary before taking its hash.
 #
 # file                 program id                                      sha256
-orca_whirlpool.so      whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc     610b1e394973bd1b86de8afc983524bd21dea177e87bfae75ec289d4c350f9ae
+orca_whirlpool.so      whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc     c422b22f3eefe86dd55878a4f505b9c68c26e241dc96af1573ca032b24b8ee3f
 pyth_receiver.so       rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ     0d6bf9142c2eb1fdb8ead48054491369bed3a8d6846c5887e362844155599ab2
