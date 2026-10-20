@@ -4,7 +4,7 @@
 //! when it was read, rather than vanishing from the snapshot, the totals and
 //! every holder's portfolio until a refresh reads it whole again.
 //!
-//! Here: the vault is read whole once; then its `fees()` read fails once.
+//! Here: the vault is read whole once; then its `fees()` read reverts once.
 
 mod stand_in;
 
@@ -23,7 +23,7 @@ async fn a_vault_one_read_fails_for_stays_in_the_record() {
             (flag.load(Ordering::SeqCst)
                 && request["method"] == "eth_call"
                 && input(request) == selector::<IVault::feesCall>())
-            .then(|| Err("a node hiccup".to_string()))
+            .then(|| Err(format!("{REVERTED}: a read the vault does not answer")))
         }),
         "one-read-fails",
     )

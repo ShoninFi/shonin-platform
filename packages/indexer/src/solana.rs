@@ -10,16 +10,19 @@
 //! named it. The same pass keeps the vault's events for the page and what
 //! each holder has paid in and taken out.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chain::SolanaServed;
+use chain::solana::platform::{profile_address, publishing_config, review_address};
 use chain::solana::programs::anchor_lang::{AccountDeserialize, AnchorDeserialize, Discriminator};
+use chain::solana::programs::station::state as station_state;
 use chain::solana::programs::{profiles, publishing, vault as sv};
+use chain::solana::rpc::Account;
 use chain::solana::{Pubkey, SolanaClient, TransactionRecord};
-use shared::ChainAddress;
 use shared::model::activity::{EventKind, Kill, VaultEvent};
 use shared::model::common::Chain;
 use shared::model::health::Health;
@@ -30,6 +33,7 @@ use shared::model::vault::{
     Claim, ClaimState, Fees, Halt, PendingFloor, Request, RequestKind, Tank, Vault, VaultState,
 };
 use shared::model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};
+use shared::{ChainAddress, Terms};
 use sv::events as ev;
 use sv::state::{
     ClaimState as ChainClaimState, HaltReason, RequestKind as ChainRequestKind,
@@ -45,6 +49,23 @@ pub struct History {
     vaults: HashMap<Pubkey, VaultLog>,
     /// Each vault as last read whole, and the chain time it was.
     last_whole: HashMap<Pubkey, (Strategy, u64)>,
+    /// The vaults as last listed, by strategy id, and when that was, with
+    /// the factory's count of vaults then.
+    listed: Vec<Pubkey>,
+    listed_at: Option<Instant>,
+    listed_count: Option<u64>,
+    /// Every account read last time: the next refresh reads them all in
+    /// one go.
+    planned: BTreeSet<Pubkey>,
+    /// What each vault's accounts (the vault, its claims and its list of
+    /// restricted places) came to when its requests and history were last
+    /// read: they are read again only once that changes.
+    digests: HashMap<Pubkey, u64>,
+    /// Each vault's requests still waiting, as last listed.
+    requests: HashMap<Pubkey, Vec<Request>>,
+    /// The slot the last refresh read at: no later read is taken from a
+    /// node behind it.
+    slot: u64,
 }
 
 /// What a vault's history has come to so far, and where reading it stands.
@@ -67,18 +88,19 @@ struct VaultLog {
     /// Who booked each claim, by its id: a claim the closed vault pays says
     /// only its id.
     claim_owners: HashMap<u64, Pubkey>,
+    /// Whether the whole history listed has been read.
+    read_through: bool,
 }
 
 /// How many of a vault's transactions are listed per request.
 const SIGNATURE_PAGE: usize = 1_000;
 
-/// The most of one vault's transactions read in one refresh: a vault whose
-/// history is being rebuilt catches up a page at a time, and the rest of
-/// the record isn't held up meanwhile.
-const TRANSACTIONS_PER_REFRESH: usize = 64;
-
 /// How many of a vault's events the page shows.
 const SHOWN: usize = 60;
+
+/// The most rounds of reads one refresh makes for accounts the ones read
+/// name (a vault's claims and station, a key's image).
+const ROUNDS: usize = 4;
 
 const HOUR: u64 = 3_600;
 
@@ -88,25 +110,130 @@ const DOLLAR: f64 = 1e6;
 
 /// One Solana chain's part of the record.
 pub struct ChainRead {
+    /// The slot the accounts were read at.
+    pub slot: u64,
+    /// The cluster's clock then.
+    pub now: u64,
     pub strategies: Vec<Strategy>,
     pub authors: Vec<(ChainAddress, Author)>,
+    /// The platform's terms on the cluster, if they could be read.
+    pub terms: Option<Terms>,
+    /// How many payments the publishing program has taken.
+    pub payments: Option<u64>,
+    /// What each holder paid, by vault, for every vault whose history has
+    /// been read through.
+    pub costs: HashMap<Pubkey, HashMap<Pubkey, f64>>,
+    /// Whether some vault's history is still being read.
+    pub catching_up: bool,
+    /// Whether each key asked about (by vault and key) is blessed as the
+    /// vault's executor, as the accounts read say.
+    pub blessed: HashMap<(Pubkey, Pubkey), bool>,
 }
 
-/// Every vault on the chain, as the site shows it, and their authors.
+/// Accounts read, by address: `None` where there is none.
+type Accounts = HashMap<Pubkey, Option<Account>>;
+
+fn data<'a>(accounts: &'a Accounts, address: &Pubkey) -> Option<&'a [u8]> {
+    accounts
+        .get(address)?
+        .as_ref()
+        .map(|account| account.data.as_slice())
+        .filter(|data| !data.is_empty())
+}
+
+fn decode<T: AccountDeserialize>(accounts: &Accounts, address: &Pubkey) -> Option<T> {
+    T::try_deserialize(&mut data(accounts, address)?).ok()
+}
+
+/// Every vault on the chain, as the site shows it, and their authors, read
+/// in one go of every account the record shows (a vault, its claims, its
+/// station, its registration, review and author's profile, the platform's
+/// settings, the cluster's clock) and the accounts those name, as of one
+/// slot or later than the last read. The vaults are listed again only when
+/// the factory's count of them changes, a listed one is gone, or
+/// `rescan_every` has passed; a vault's requests and history are read again
+/// only when its accounts have changed, or while its history is still being
+/// read. `asked` are the keys health reports were signed with, by vault.
+#[allow(clippy::too_many_arguments)]
 pub async fn read(
     served: &SolanaServed,
     store: &Store,
     history: &mut History,
     health: &HashMap<Pubkey, Health>,
-    now: u64,
+    asked: &BTreeSet<(Pubkey, Pubkey)>,
+    rescan_every: Duration,
+    transactions_per_refresh: usize,
 ) -> Result<ChainRead> {
     let client = &served.client;
-    let vaults = vaults(client).await?;
+    let mut accounts: Accounts = HashMap::new();
+    let mut slot = history.slot;
+    let mut listing_checked = false;
+    for _ in 0..ROUNDS {
+        let mut wanted = wanted(served, history, &accounts, asked);
+        if accounts.is_empty() {
+            wanted.extend(history.planned.iter().copied());
+        }
+        let missing: Vec<Pubkey> = wanted
+            .into_iter()
+            .filter(|address| !accounts.contains_key(address))
+            .collect();
+        if missing.is_empty() {
+            if listing_checked {
+                break;
+            }
+        } else {
+            let (at, read) = client
+                .rpc
+                .accounts_since(&missing, slot)
+                .await
+                .context("reading the accounts")?;
+            slot = slot.max(at);
+            accounts.extend(missing.into_iter().zip(read));
+        }
+        if !listing_checked {
+            listing_checked = true;
+            if listing_due(history, &accounts, rescan_every) {
+                history.listed = vaults(client)
+                    .await?
+                    .into_iter()
+                    .map(|(address, _)| address)
+                    .collect();
+                history.listed_at = Some(Instant::now());
+                history.listed_count =
+                    decode::<sv::state::Factory>(&accounts, &sv::state::factory_address())
+                        .map(|factory| factory.vault_count);
+            }
+        }
+    }
+    history.slot = slot;
+    // What the accounts read name: the next refresh reads them all at once
+    // (none it no longer needs).
+    history.planned = wanted(served, history, &accounts, asked);
+    let now = clock_seconds(&accounts)?;
 
     let mut strategies = Vec::new();
     let mut authors: Vec<(ChainAddress, Author)> = Vec::new();
-    for (address, vault) in &vaults {
-        match one(served, store, history, health, *address, vault, now).await {
+    let mut costs = HashMap::new();
+    let mut catching_up = false;
+    let listed = history.listed.clone();
+    for address in &listed {
+        let Some(vault) = decode::<sv::state::Vault>(&accounts, address) else {
+            // Gone since it was listed: listed again at the next refresh.
+            continue;
+        };
+        match one(
+            served,
+            store,
+            history,
+            health,
+            &accounts,
+            *address,
+            &vault,
+            now,
+            transactions_per_refresh,
+        )
+        .await
+        {
             Ok(strategy) => {
                 history.last_whole.insert(*address, (strategy.clone(), now));
                 strategies.push(strategy);
@@ -131,23 +258,199 @@ pub async fn read(
                 }
             },
         }
+        // A vault whose history is read through has its holders' costs
+        // known; one with transactions still listed to read is catching up.
+        match history.vaults.get(address) {
+            Some(log) if log.read_through => {
+                costs.insert(*address, log.paid.clone());
+            }
+            Some(log) if !log.queue.is_empty() => catching_up = true,
+            _ => {}
+        }
         let author = ChainAddress::Solana(vault.author.to_bytes());
         if !authors.iter().any(|(known, _)| *known == author) {
-            // A profile that can't be read leaves the author shown by their
-            // key, and holds up nothing else.
-            let profile = served
-                .platform
-                .profile(client, &vault.author)
-                .await
-                .ok()
-                .flatten();
+            let profile = decode::<profiles::Profile>(&accounts, &profile_address(&vault.author));
             authors.push((author, author_of(&vault.author, profile)));
         }
     }
+    let blessed = asked
+        .iter()
+        .map(|(vault, signer)| {
+            (
+                (*vault, *signer),
+                blessed_executor(served, &accounts, vault, signer, now),
+            )
+        })
+        .collect();
     Ok(ChainRead {
+        slot,
+        now,
+        terms: terms(&accounts, now),
+        payments: decode::<publishing::state::Config>(&accounts, &publishing_config())
+            .map(|config| config.count),
         strategies,
         authors,
+        costs,
+        catching_up,
+        blessed,
     })
+}
+
+/// Whether the vaults are to be listed again: never listed, the factory's
+/// count changed, a listed vault is gone, or `rescan_every` has passed.
+fn listing_due(history: &History, accounts: &Accounts, rescan_every: Duration) -> bool {
+    let Some(listed_at) = history.listed_at else {
+        return true;
+    };
+    let count = decode::<sv::state::Factory>(accounts, &sv::state::factory_address())
+        .map(|factory| factory.vault_count);
+    listed_at.elapsed() >= rescan_every
+        || count != history.listed_count
+        || history
+            .listed
+            .iter()
+            .any(|vault| accounts.get(vault).is_some_and(Option::is_none))
+}
+
+/// Every account the record reads, as far as the accounts read so far name
+/// them.
+fn wanted(
+    served: &SolanaServed,
+    history: &History,
+    accounts: &Accounts,
+    asked: &BTreeSet<(Pubkey, Pubkey)>,
+) -> BTreeSet<Pubkey> {
+    use chain::solana::programs::registry::read as registry;
+
+    let mut wanted = BTreeSet::from([
+        chain::solana::programs::anchor_lang::solana_program::sysvar::clock::ID,
+        sv::state::factory_address(),
+        publishing_config(),
+        registry::config_address(),
+    ]);
+    for address in &history.listed {
+        wanted.insert(*address);
+        let Some(vault) = decode::<sv::state::Vault>(accounts, address) else {
+            continue;
+        };
+        for id in 1..=vault.claim_count {
+            wanted.insert(sv::state::claim_address(address, id).0);
+        }
+        wanted.insert(sv::state::restricted_address(address).0);
+        wanted.insert(vault.station);
+        wanted.insert(publishing::state::strategy_address(vault.strategy_id));
+        wanted.insert(review_address(vault.strategy_id));
+        wanted.insert(profile_address(&vault.author));
+    }
+    for (vault, signer) in asked {
+        wanted.insert(*vault);
+        wanted.insert(registry::key_address(signer));
+        if let Some(account) = decode::<sv::state::Vault>(accounts, vault) {
+            wanted.insert(registry::blessing_address(
+                signer,
+                &served.platform.cluster,
+                &vault.to_bytes(),
+                &account.bundle_hash,
+            ));
+        }
+        if let Some(key) = decode::<chain::solana::programs::registry::state::KeyInfo>(
+            accounts,
+            &registry::key_address(signer),
+        ) {
+            wanted.insert(registry::image_address(&key.image_digest));
+            wanted.insert(registry::project_address(&key.project_id));
+        }
+    }
+    wanted
+}
+
+/// The cluster's clock, from its account.
+fn clock_seconds(accounts: &Accounts) -> Result<u64> {
+    let clock = data(
+        accounts,
+        &chain::solana::programs::anchor_lang::solana_program::sysvar::clock::ID,
+    )
+    .ok_or_else(|| anyhow!("the cluster's clock was not read"))?;
+    let bytes: [u8; 8] = clock
+        .get(32..40)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| anyhow!("the clock is not a clock"))?;
+    Ok(i64::from_le_bytes(bytes).max(0) as u64)
+}
+
+/// The terms the cluster's programs enforce, from their accounts.
+fn terms(accounts: &Accounts, now: u64) -> Option<Terms> {
+    const DAY: f64 = 86_400.0;
+    let factory = decode::<sv::state::Factory>(accounts, &sv::state::factory_address())?;
+    let publishing = decode::<publishing::state::Config>(accounts, &publishing_config())?;
+    let registry = decode::<chain::solana::programs::registry::state::Config>(
+        accounts,
+        &chain::solana::programs::registry::read::config_address(),
+    )?;
+    let terms = &factory.terms;
+    let dollars = |units: u64| units as f64 / DOLLAR;
+    Some(Terms {
+        minimum_tank: dollars(terms.minimum_tank),
+        publish_fee: dollars(publishing.fee),
+        fees: shared::Fees {
+            holding_bps: terms.fees.holding_bps as u32,
+            author_bps: terms.fees.author_bps as u32,
+            platform_bps: terms.fees.platform_bps as u32,
+            transaction_bps: terms.fees.transaction_bps as u32,
+        },
+        exit_band_bps: terms.exit_band_bps as u32,
+        freeze_after_days: terms.timers.freeze_after as f64 / DAY,
+        image_timelock_days: registry.timelock(now) as f64 / DAY,
+        minimum_deposit: dollars(terms.minimum_deposit),
+        terms_hash: format!("0x{}", alloy::hex::encode(sv::factory::terms_hash(terms))),
+    })
+}
+
+/// Whether `signer` is blessed for `vault` and the bundle it runs, and as an
+/// executor, at `now`: the registry's blessing for the vault, the key's
+/// record, and its image's and project's, as the accounts read have them,
+/// judged as the programs judge them.
+fn blessed_executor(
+    served: &SolanaServed,
+    accounts: &Accounts,
+    vault: &Pubkey,
+    signer: &Pubkey,
+    now: u64,
+) -> bool {
+    use chain::solana::programs::registry::{read as at, state};
+
+    let Some(account) = decode::<sv::state::Vault>(accounts, vault) else {
+        return false;
+    };
+    let Some(config) = decode::<state::Config>(accounts, &at::config_address()) else {
+        return false;
+    };
+    let Some(blessing) = decode::<state::Blessing>(
+        accounts,
+        &at::blessing_address(
+            signer,
+            &served.platform.cluster,
+            &vault.to_bytes(),
+            &account.bundle_hash,
+        ),
+    ) else {
+        return false;
+    };
+    let Some(key) = decode::<state::KeyInfo>(accounts, &at::key_address(signer)) else {
+        return false;
+    };
+    let image = decode::<state::ImageRecord>(accounts, &at::image_address(&key.image_digest));
+    let project = decode::<state::ProjectRecord>(accounts, &at::project_address(&key.project_id));
+    blessing.signer == *signer
+        && state::is_blessed_for(&config, &blessing, image.as_ref(), project.as_ref(), now)
+        && state::is_blessed_as(
+            &config,
+            &key,
+            image.as_ref(),
+            project.as_ref(),
+            state::ImageKind::Executor,
+            now,
+        )
 }
 
 /// Every vault the vault program holds, by strategy id.
@@ -223,40 +526,64 @@ pub(crate) async fn job(served: &SolanaServed, store: &Store, mut job: Job) -> R
     Ok(job)
 }
 
+/// What a vault's accounts come to, to tell whether they changed.
+fn digest(accounts: &Accounts, address: &Pubkey, vault: &sv::state::Vault) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data(accounts, address).hash(&mut hasher);
+    for id in 1..=vault.claim_count {
+        data(accounts, &sv::state::claim_address(address, id).0).hash(&mut hasher);
+    }
+    data(accounts, &sv::state::restricted_address(address).0).hash(&mut hasher);
+    hasher.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn one(
     served: &SolanaServed,
     store: &Store,
     history: &mut History,
     health: &HashMap<Pubkey, Health>,
+    accounts: &Accounts,
     address: Pubkey,
     vault: &sv::state::Vault,
     now: u64,
+    transactions_per_refresh: usize,
 ) -> Result<Strategy> {
     let client = &served.client;
-    let platform = &served.platform;
     let id = vault.strategy_id;
-    let registered = platform.strategy(client, id).await?;
-    let review = platform.review(client, id).await?;
-    let author = match platform.profile(client, &vault.author).await? {
+    let registered =
+        decode::<publishing::state::Strategy>(accounts, &publishing::state::strategy_address(id));
+    let review = decode::<publishing::state::Review>(accounts, &review_address(id));
+    let author = match decode::<profiles::Profile>(accounts, &profile_address(&vault.author)) {
         Some(profile) if !profile.handle.is_empty() => profile.handle,
         _ => vault.author.to_string(),
     };
 
+    // Its requests and history, read again only once its accounts changed,
+    // or while its history is still being read.
+    let digest = digest(accounts, &address, vault);
     let log = history.vaults.entry(address).or_default();
-    read_history(client, &address, log).await?;
+    let changed = history.digests.get(&address) != Some(&digest);
+    if changed || !log.queue.is_empty() || !history.requests.contains_key(&address) {
+        read_history(client, &address, log, transactions_per_refresh).await?;
+        let waiting = requests(client, &address).await?;
+        history.requests.insert(address, waiting);
+        history.digests.insert(address, digest);
+    }
+    let log = history.vaults.entry(address).or_default();
+    let requests = history.requests.get(&address).cloned().unwrap_or_default();
 
-    let claims = claims(client, &address, vault).await?;
-    let requests = requests(client, &address).await?;
-    let restricted: Vec<String> = client
-        .load::<sv::state::Restricted>(&sv::state::restricted_address(&address).0)
-        .await?
-        .map(|list| {
-            list.codes
-                .iter()
-                .map(|code| name_of(B256::from(*code)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let claims = claims(accounts, &address, vault)?;
+    let restricted: Vec<String> =
+        decode::<sv::state::Restricted>(accounts, &sv::state::restricted_address(&address).0)
+            .map(|list| {
+                list.codes
+                    .iter()
+                    .map(|code| name_of(B256::from(*code)))
+                    .collect()
+            })
+            .unwrap_or_default();
 
     let figures = Figures::of(vault);
     let days_live = now.saturating_sub(vault.created_at) / 86_400;
@@ -297,7 +624,10 @@ async fn one(
         B256::from(registered.as_ref().map_or([0; 32], |r| r.source_hash)),
         B256::from(vault.bundle_hash),
     );
-    let legs = vec![leg(&shown, vault, &figures)];
+    let station = data(accounts, &vault.station)
+        .and_then(chain::solana::programs::station::state::Station::read_any)
+        .map(|(station, _)| station);
+    let legs = vec![leg(&shown, vault, station.as_ref(), &figures)];
     let events: Vec<VaultEvent> = log.events.iter().rev().cloned().collect();
 
     Ok(Strategy {
@@ -453,6 +783,7 @@ fn shown_vault(
         created: day(vault.created_at),
         station: vault.station.to_string(),
         value: figures.value,
+        valued_at: vault.priced.then(|| moment(vault.latest.time)),
         idle: vault.cash as f64 / DOLLAR,
         escrow: vault.escrow as f64 / DOLLAR,
         shares: vault.total_supply as f64 / SHARE,
@@ -516,11 +847,56 @@ fn standing(state: ChainVaultState, days_live: u64) -> Standing {
     }
 }
 
-/// The vault's one leg: its station, at the stand-in venue through the
-/// drivers it pinned.
-fn leg(shown: &Vault, vault: &sv::state::Vault, figures: &Figures) -> Leg {
+/// What a depositor is shown a driver as: its venue, as the published list
+/// of drivers labels it, or its name where the list has none.
+pub fn venue_of(driver: &str) -> String {
+    shared::catalogue::Catalogue::published()
+        .drivers
+        .get(driver)
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| driver.to_string())
+}
+
+/// The venues a station trades at: each driver it pinned, by the label the
+/// published list gives it, in the order pinned; the vault's own drivers'
+/// where the station could not be read.
+fn venues(vault: &sv::state::Vault, station: Option<&station_state::Station>) -> String {
+    let names: Vec<String> = match station {
+        Some(station) if !station.drivers.is_empty() => station
+            .drivers
+            .iter()
+            .map(|pinned| name_of(B256::from(pinned.name)))
+            .collect(),
+        _ => vault
+            .drivers
+            .iter()
+            .map(|driver| name_of(B256::from(*driver)))
+            .collect(),
+    };
+    let mut labels: Vec<String> = Vec::new();
+    for name in names.iter().filter(|name| !name.is_empty()) {
+        let label = venue_of(name);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    match labels.as_slice() {
+        [] => "its station's venue".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The vault's one leg: its station, at the venues of the drivers it
+/// pinned.
+fn leg(
+    shown: &Vault,
+    vault: &sv::state::Vault,
+    station: Option<&station_state::Station>,
+    figures: &Figures,
+) -> Leg {
     Leg {
-        venue: "Local venue".to_string(),
+        venue: venues(vault, station),
         chain: shown.chain,
         custody: Custody::VenueEnforced,
         exit_path: ExitPath::Contract,
@@ -574,56 +950,49 @@ fn review_of(store: &Store, review: &publishing::state::Review) -> Review {
     }
 }
 
-/// Every claim the vault has booked, each at the address its id derives.
-async fn claims(
-    client: &SolanaClient,
-    address: &Pubkey,
-    vault: &sv::state::Vault,
-) -> Result<Vec<Claim>> {
-    let ids: Vec<u64> = (1..=vault.claim_count).collect();
+/// Every claim the vault has booked, each at the address its id derives,
+/// as the accounts read have them.
+fn claims(accounts: &Accounts, address: &Pubkey, vault: &sv::state::Vault) -> Result<Vec<Claim>> {
     let mut out = Vec::new();
-    for ids in ids.chunks(100) {
-        let addresses: Vec<Pubkey> = ids
-            .iter()
-            .map(|id| sv::state::claim_address(address, *id).0)
-            .collect();
-        let accounts = client.rpc.accounts(&addresses).await?;
-        for (id, account) in ids.iter().zip(accounts) {
-            // A claim closed once it was paid and its rent taken back is
-            // gone from the cluster: what it was is in the vault's history.
-            let Some(account) = account.filter(|account| !account.data.is_empty()) else {
-                continue;
-            };
-            let claim = sv::state::Claim::try_deserialize(&mut &account.data[..])
-                .map_err(|error| anyhow!("claim {id} does not read as one: {error}"))?;
-            let paid = claim.state == ChainClaimState::Paid;
-            // A paid claim's shares are burnt, so the supply no longer counts
-            // them: its share is measured with them put back.
-            let supply = if paid {
-                vault.total_supply.saturating_add(claim.shares)
-            } else {
-                vault.total_supply
-            };
-            out.push(Claim {
-                id: claim.id as u32,
-                owner: claim.owner.to_string(),
-                shares: claim.shares as f64 / SHARE,
-                fraction_closed: if supply == 0 {
-                    0.0
-                } else {
-                    claim.shares as f64 / supply as f64
-                },
-                booked: day(claim.booked_at),
-                state: match claim.state {
-                    ChainClaimState::Paid => ClaimState::Paid,
-                    ChainClaimState::Waiting => ClaimState::Waiting,
-                    ChainClaimState::Queued => ClaimState::Queued,
-                    ChainClaimState::Fallback => ClaimState::Fallback,
-                    ChainClaimState::Pending | ChainClaimState::None => ClaimState::Pending,
-                },
-                settled_for: (claim.paid > 0).then(|| claim.paid as f64 / DOLLAR),
-            });
+    for id in 1..=vault.claim_count {
+        let at = sv::state::claim_address(address, id).0;
+        if !accounts.contains_key(&at) {
+            anyhow::bail!("claim {id} was not read");
         }
+        // A claim closed once it was paid and its rent taken back is gone
+        // from the cluster: what it was is in the vault's history.
+        let Some(bytes) = data(accounts, &at) else {
+            continue;
+        };
+        let claim = sv::state::Claim::try_deserialize(&mut &bytes[..])
+            .map_err(|error| anyhow!("claim {id} does not read as one: {error}"))?;
+        let paid = claim.state == ChainClaimState::Paid;
+        // A paid claim's shares are burnt, so the supply no longer counts
+        // them: its share is measured with them put back.
+        let supply = if paid {
+            vault.total_supply.saturating_add(claim.shares)
+        } else {
+            vault.total_supply
+        };
+        out.push(Claim {
+            id: claim.id as u32,
+            owner: claim.owner.to_string(),
+            shares: claim.shares as f64 / SHARE,
+            fraction_closed: if supply == 0 {
+                0.0
+            } else {
+                claim.shares as f64 / supply as f64
+            },
+            booked: day(claim.booked_at),
+            state: match claim.state {
+                ChainClaimState::Paid => ClaimState::Paid,
+                ChainClaimState::Waiting => ClaimState::Waiting,
+                ChainClaimState::Queued => ClaimState::Queued,
+                ChainClaimState::Fallback => ClaimState::Fallback,
+                ChainClaimState::Pending | ChainClaimState::None => ClaimState::Pending,
+            },
+            settled_for: (claim.paid > 0).then(|| claim.paid as f64 / DOLLAR),
+        });
     }
     Ok(out)
 }
@@ -672,10 +1041,15 @@ async fn requests(client: &SolanaClient, address: &Pubkey) -> Result<Vec<Request
 
 /// Read whatever is new in the vault's history: list the transactions that
 /// touched it since the last listing, then read them oldest first, at most
-/// [`TRANSACTIONS_PER_REFRESH`] a refresh. A transaction that can't be read
+/// `transactions_per_refresh` a refresh. A transaction that can't be read
 /// is read again next time, so nothing is passed over; one the node no
 /// longer holds is passed over, as there is nothing else to read it from.
-async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog) -> Result<()> {
+async fn read_history(
+    client: &SolanaClient,
+    vault: &Pubkey,
+    log: &mut VaultLog,
+    transactions_per_refresh: usize,
+) -> Result<()> {
     let mut newest_first = Vec::new();
     let mut before: Option<String> = None;
     loop {
@@ -706,7 +1080,7 @@ async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog)
     }
 
     let mut read = 0;
-    while read < TRANSACTIONS_PER_REFRESH {
+    while read < transactions_per_refresh.max(1) {
         let Some(signature) = log.queue.front().cloned() else {
             break;
         };
@@ -722,7 +1096,8 @@ async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog)
         }
         log.queue.pop_front();
     }
-    if !log.queue.is_empty() {
+    log.read_through = log.queue.is_empty();
+    if !log.read_through {
         tracing::debug!(%vault, left = log.queue.len(), "read part of a vault's history; the rest next time");
     }
     Ok(())

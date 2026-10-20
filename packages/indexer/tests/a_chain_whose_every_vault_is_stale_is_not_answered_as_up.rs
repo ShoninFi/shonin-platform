@@ -1,6 +1,6 @@
 //! A chain whose every vault is shown as last read whole, none of them read
-//! whole now (a node that answers the chain's head and none of its vaults'
-//! reads), is not a chain being read: once that has lasted past
+//! whole now (a node that answers the chain's head and reverts a read every
+//! vault makes), is not a chain being read: once that has lasted past
 //! `STALE_AFTER`, its health says so and answers 503, as it does for a chain
 //! not read at all.
 
@@ -22,8 +22,8 @@ async fn a_chain_whose_every_vault_is_stale_is_not_answered_as_up() {
         Arc::new(move |request| {
             (flag.load(Ordering::SeqCst)
                 && request["method"] == "eth_call"
-                && input(request) == selector::<IVault::totalValueCall>())
-            .then(|| Err("a node hiccup".to_string()))
+                && input(request) == selector::<IVault::feesCall>())
+            .then(|| Err(format!("{REVERTED}: a read the vault does not answer")))
         }),
         "every-vault-stale",
     )

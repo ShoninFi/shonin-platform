@@ -8,88 +8,34 @@
 //! vault's `balanceOf` only, and someone asks for a portfolio on base. 3 s
 //! later `/api/snapshot` is asked for, and is answered at once.
 
+#[path = "../../indexer/tests/stand_in/mod.rs"]
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::routing::post;
-
-const VAULT: &str = "00000000000000000000000000000000000000be";
-
+/// A node with one vault, slow (10 s) for the vault's `balanceOf` once
+/// `slow` is set.
 async fn a_node(slow: Arc<AtomicBool>) -> SocketAddr {
-    let app = Router::new().route(
-        "/",
-        post(move |body: String| {
-            let slow = slow.clone();
-            async move {
-                let id = body
-                    .split("\"id\":")
-                    .nth(1)
-                    .map(|rest| {
-                        rest.chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect::<String>()
-                    })
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| "0".to_string());
-                let lower = body.to_ascii_lowercase();
-                if slow.load(Ordering::SeqCst)
-                    && lower.contains("\"eth_call\"")
-                    && lower.contains(VAULT)
-                    && lower.contains("70a08231")
-                {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                }
-                let result = if body.contains("\"eth_chainId\"") {
-                    "\"0x7a69\"".to_string()
-                } else if body.contains("\"eth_blockNumber\"") {
-                    "\"0x10\"".to_string()
-                } else if body.contains("\"eth_getBlockByNumber\"") {
-                    let mut block =
-                        alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = 16;
-                    block.header.inner.timestamp = 1_700_000_000;
-                    serde_json::to_string(&block).unwrap()
-                } else if body.contains("\"eth_call\"") {
-                    // `vaults()` (any call whose input is the bare selector of
-                    // `vaults()`) names the one vault; anything else is zeros.
-                    let vaults = format!(
-                        "{:x}",
-                        alloy::primitives::FixedBytes::<4>::from(
-                            <chain::bindings::factory::IVaultFactory::vaultsCall
-                                as alloy::sol_types::SolCall>::SELECTOR
-                        )
-                    );
-                    if lower.contains(&format!("\"0x{vaults}\"")) {
-                        format!(
-                            "\"0x{}{}{}\"",
-                            "0".repeat(62) + "20",
-                            "0".repeat(63) + "1",
-                            "0".repeat(24) + VAULT
-                        )
-                    } else {
-                        format!("\"0x{}\"", "0".repeat(64 * 128))
-                    }
-                } else if body.contains("\"eth_getBalance\"") {
-                    "\"0x0\"".to_string()
-                } else if body.contains("\"eth_getCode\"") {
-                    "\"0x01\"".to_string()
-                } else {
-                    "[]".to_string()
-                };
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    address
+    let chain = stand_in::Chain::at(stand_in::HEAD);
+    *chain.delay_of.lock().unwrap() = Some(Arc::new(move |request: &serde_json::Value| {
+        let to_the_vault = request["params"][0]["to"]
+            .as_str()
+            .is_some_and(|to| to.to_ascii_lowercase().ends_with(stand_in::VAULT));
+        if slow.load(Ordering::SeqCst)
+            && request["method"] == "eth_call"
+            && to_the_vault
+            && stand_in::input(request).starts_with("0x70a08231")
+        {
+            Duration::from_secs(10)
+        } else {
+            Duration::ZERO
+        }
+    }));
+    let url = stand_in::a_node_on(chain, Arc::new(|_| None)).await;
+    url.trim_start_matches("http://").parse().unwrap()
 }
 
 fn deployments() -> String {

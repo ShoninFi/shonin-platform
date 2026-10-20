@@ -6,130 +6,81 @@
 //! first. A read cut off at the refresh's limit does not count as one, so the
 //! jobs it was cut off from keep their place at the front.
 //!
-//! Here base's node answers every read in 900 ms, so a job with a strategy id
-//! takes about 2.7 s and a refresh (5 s) completes eight of the twelve
-//! `Ready` jobs: the first wave of eight, never the second.
+//! Here base's node reads every view on its own (it runs no batched read),
+//! each in 120 ms, so eight jobs take about two seconds and a refresh (5 s)
+//! completes about sixteen of the twenty-four `Ready` jobs.
 //! 1. two refreshes complete every job once.
 //! 2. every job's review is posted on chain.
 //! 3. after four more refreshes, every job shows its review.
 
+mod stand_in;
+
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alloy::sol_types::SolCall;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::get;
+use chain::Served;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::profiles::{IAuthorProfiles, Profile};
 use chain::bindings::reviews::IReviewRegistry;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
 use indexer::Indexer;
 use serde_json::{Value, json};
 use shared::model::registry::JobState;
+use stand_in::*;
 
 const AUTHOR: &str = "0x00000000000000000000000000000000000000a1";
 
-async fn a_slow_node(delay: Duration, reviewed: Arc<AtomicBool>) -> SocketAddr {
-    let app = Router::new().route(
-        "/",
-        post(move |axum::Json(request): axum::Json<Value>| {
-            let reviewed = reviewed.clone();
-            async move {
-                let id = request["id"].clone();
-                let method = request["method"].as_str().unwrap_or_default().to_string();
-                if method != "eth_chainId" {
-                    tokio::time::sleep(delay).await;
-                }
-                let result = match method.as_str() {
-                    "eth_chainId" => json!("0x7a69"),
-                    "eth_blockNumber" => json!("0x10"),
-                    "eth_getBlockByNumber" => {
-                        let mut block =
-                            alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                        block.header.inner.number = 16;
-                        block.header.inner.timestamp = 1_700_000_000;
-                        serde_json::to_value(block).unwrap()
-                    }
-                    "eth_call" => {
-                        let tx = &request["params"][0];
-                        let data = tx["input"]
-                            .as_str()
-                            .or_else(|| tx["data"].as_str())
-                            .unwrap_or("0x");
-                        let input = alloy::hex::decode(data).unwrap_or_default();
-                        if input.starts_with(&IAuthorProfiles::profileOfCall::SELECTOR) {
-                            json!(alloy::hex::encode_prefixed(
-                                IAuthorProfiles::profileOfCall::abi_encode_returns(&Profile {
-                                    handle: "alice".to_string(),
-                                    blurb: String::new(),
-                                    linkLabels: Vec::new(),
-                                    linkUrls: Vec::new(),
-                                    joinedAt: 0,
-                                })
-                            ))
-                        } else if input.starts_with(&IReviewRegistry::reviewOfCall::SELECTOR) {
-                            // A static tuple: 14 words of review (6 hashes, 6 ratings, findingCount, reviewedAt), then `refused`.
-                            let mut words = vec![0u8; 15 * 32];
-                            if reviewed.load(Ordering::SeqCst) {
-                                // reviewedAt, the review's last word.
-                                words[13 * 32 + 31] = 1;
-                            }
-                            json!(alloy::hex::encode_prefixed(words))
-                        } else if input.starts_with(&IVaultFactory::vaultOfCall::SELECTOR) {
-                            json!(format!("0x{}", "0".repeat(64)))
-                        } else {
-                            json!(format!("0x{}{}", "0".repeat(62) + "20", "0".repeat(64)))
-                        }
-                    }
-                    _ => json!([]),
-                };
-                axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    address
-}
+/// How many jobs the build service lists.
+const JOBS: u64 = 24;
 
-fn deployments() -> Deployments {
-    let one = "0x0000000000000000000000000000000000000001";
-    let mut fields = vec![
-        r#""chain_key":"evm:31337""#.to_string(),
-        r#""chain_id":31337"#.to_string(),
-        r#""rpc_url":"""#.to_string(),
-        r#""deployed_block":0"#.to_string(),
-    ];
-    for name in [
-        "usd",
-        "venue",
-        "attestation_verifier",
-        "attestation",
-        "publishing",
-        "prices",
-        "strategies",
-        "reviews",
-        "profiles",
-        "factory",
-        "station_factory",
-        "driver",
-        "bridge",
-    ] {
-        fields.push(format!(r#""{name}":"{one}""#));
+/// Base, on a node with no vaults answering every read after `delay`,
+/// giving every author the handle `alice`, and every job's review once
+/// `reviewed` is set.
+async fn a_slow_chain(delay: Duration, reviewed: Arc<AtomicBool>) -> Served {
+    let answer: Answer = Arc::new(move |request: &Value| {
+        if request["method"] != "eth_call" {
+            return None;
+        }
+        let input = alloy::hex::decode(input(request)).unwrap_or_default();
+        Some(Ok(
+            if input.starts_with(&IAuthorProfiles::profileOfCall::SELECTOR) {
+                json!(alloy::hex::encode_prefixed(
+                    IAuthorProfiles::profileOfCall::abi_encode_returns(&Profile {
+                        handle: "alice".to_string(),
+                        blurb: String::new(),
+                        linkLabels: Vec::new(),
+                        linkUrls: Vec::new(),
+                        joinedAt: 0,
+                    })
+                ))
+            } else if input.starts_with(&IReviewRegistry::reviewOfCall::SELECTOR) {
+                // A static tuple: 14 words of review (6 hashes, 6 ratings, findingCount, reviewedAt), then `refused`.
+                let mut words = vec![0u8; 15 * 32];
+                if reviewed.load(Ordering::SeqCst) {
+                    // reviewedAt, the review's last word.
+                    words[13 * 32 + 31] = 1;
+                }
+                json!(alloy::hex::encode_prefixed(words))
+            } else if input.starts_with(&IVaultFactory::vaultOfCall::SELECTOR) {
+                json!(format!("0x{}", "0".repeat(64)))
+            } else {
+                no_vaults()
+            },
+        ))
+    });
+    let node = a_slow_node_on(Chain::at(HEAD), delay, answer).await;
+    Served {
+        vault_chain: shared::Chain::Base,
+        key: "evm:31337".parse().unwrap(),
+        client: client(&node).await,
+        deployments: deployments_from(0),
+        native_usd: None,
+        public_rpc: String::new(),
     }
-    let roles: Vec<String> = [
-        "admin", "platform", "attestor", "builder", "reviewer", "executor", "keeper", "operator",
-        "author", "viewer",
-    ]
-    .iter()
-    .map(|role| format!(r#""{role}":"{one}""#))
-    .collect();
-    fields.push(format!(r#""roles":{{{}}}"#, roles.join(",")));
-    Deployments::from_json(&format!("{{{}}}", fields.join(","))).unwrap()
 }
 
 fn a_ready_job(id: u64) -> shared::model::registry::Job {
@@ -176,40 +127,19 @@ async fn a_builder_listing(jobs: Vec<shared::model::registry::Job>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_unsettled_job_is_read_again_on_a_slow_chain() {
     let reviewed = Arc::new(AtomicBool::new(false));
-    let node = format!(
-        "http://{}",
-        a_slow_node(Duration::from_millis(900), reviewed.clone()).await
-    );
-    let config = ChainConfig {
-        label: "stand-in".to_string(),
-        rpc: node.clone(),
-        ws: None,
-        dollar: "USDC".to_string(),
-        native_usd: None,
-        public_rpc: node,
-        logs_rpc: None,
-        log_range: None,
-        confirmations: None,
-    };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let served = a_slow_chain(Duration::from_millis(120), reviewed.clone()).await;
     let store =
         std::env::temp_dir().join(format!("shonin-unsettled-in-turn-{}", std::process::id()));
-    let jobs: Vec<_> = (0..12).map(a_ready_job).collect();
-    let indexer = Arc::new(Indexer::new(
-        vec![shared::Chain::Base],
-        store,
-        Some(a_builder_listing(jobs).await),
-    ));
-    indexer
-        .add(Served {
-            vault_chain: shared::Chain::Base,
-            key: "evm:31337".parse::<ChainKey>().unwrap(),
-            client,
-            deployments: deployments(),
-            native_usd: None,
-            public_rpc: String::new(),
-        })
-        .await;
+    let jobs: Vec<_> = (0..JOBS).map(a_ready_job).collect();
+    let indexer = Arc::new(
+        Indexer::new(
+            vec![shared::Chain::Base],
+            store,
+            Some(a_builder_listing(jobs).await),
+        )
+        .with_rpc_policy(policy()),
+    );
+    indexer.add(served).await;
 
     for _ in 0..2 {
         indexer.refresh().await.unwrap();
@@ -222,7 +152,7 @@ async fn every_unsettled_job_is_read_again_on_a_slow_chain() {
             .filter(|job| job.author == "alice")
             .count();
         assert_eq!(
-            completed, 12,
+            completed, JOBS as usize,
             "every job is completed once after two refreshes"
         );
     }
@@ -245,7 +175,7 @@ async fn every_unsettled_job_is_read_again_on_a_slow_chain() {
         .collect();
     assert!(
         missing.is_empty(),
-        "after four refreshes, {} of 12 unsettled jobs still show no review: {missing:?}",
+        "after four refreshes, {} of {JOBS} unsettled jobs still show no review: {missing:?}",
         missing.len()
     );
 }

@@ -6,7 +6,7 @@
 //! stale vault does, so a chain whose only vault has never been read whole
 //! is answered 503 by its health once `STALE_AFTER` has passed.
 //!
-//! Here a node fails one of the vault's reads (`fees()`) from the start.
+//! Here one of the vault's reads (`fees()`) reverts from the start.
 
 mod stand_in;
 
@@ -28,7 +28,7 @@ async fn a_chain_whose_only_vault_was_never_read_whole_is_not_answered_as_up() {
             (flag.load(Ordering::SeqCst)
                 && request["method"] == "eth_call"
                 && input(request) == selector::<IVault::feesCall>())
-            .then(|| Err("a node that does not answer this read".to_string()))
+            .then(|| Err(format!("{REVERTED}: a read the vault does not answer")))
         }),
         "never-read-whole",
     )

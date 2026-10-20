@@ -25,20 +25,15 @@ fn refused(status: StatusCode, message: String) -> Refused {
 /// one of them.
 const PUBLIC_CLUSTERS: [&str; 3] = ["mainnet-beta", "devnet", "testnet"];
 
+/// The cluster's config for the app, with the terms as the record last read
+/// them and when.
 pub async fn config(
     service: &Service,
     chain: Chain,
     served: &SolanaServed,
-) -> Result<Config, Refused> {
-    let terms = terms(served).await.map_err(|error| {
-        tracing::warn!(%chain, error = format!("{error:#}"), "could not read the platform's terms");
-        // An app told the wrong terms would state them as facts, so it is
-        // told nothing until the cluster answers.
-        refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("{} did not answer for the platform's terms", chain.label()),
-        )
-    })?;
+    terms: Terms,
+    terms_as_of: time::PrimitiveDateTime,
+) -> Config {
     let info = service
         .indexer
         .snapshot
@@ -52,13 +47,14 @@ pub async fn config(
             chain_id: None,
             block: 0,
             as_of: None,
+            catching_up: false,
         });
     let deployments = &served.deployments;
     let client = &served.client;
     let viewer = (!PUBLIC_CLUSTERS.contains(&client.cluster.as_str()))
         .then(|| client.role(Role::Viewer).ok().map(|key| key.pubkey()))
         .flatten();
-    Ok(Config {
+    Config {
         chain: info,
         // The file's own URL, never an override: a paid one carries its key.
         rpc_url: served.public_rpc.clone(),
@@ -76,38 +72,12 @@ pub async fn config(
         asset_symbol: chain.dollar().to_string(),
         asset_decimals: sv::state::DECIMALS,
         terms,
+        terms_as_of: Some(terms_as_of),
         dev: viewer.map(|key| DevMode {
             address: key.to_string(),
             label: "Development wallet".to_string(),
         }),
-    })
-}
-
-/// The terms the cluster's programs enforce, read from their accounts.
-async fn terms(served: &SolanaServed) -> anyhow::Result<Terms> {
-    const DAY: f64 = 86_400.0;
-    let client = &served.client;
-    let platform = &served.platform;
-    let factory = platform.factory(client).await?;
-    let publishing = platform.publishing_config(client).await?;
-    let registry = platform.registry_config(client).await?;
-    let now = client.now().await?;
-    let terms = &factory.terms;
-    Ok(Terms {
-        minimum_tank: dollars(terms.minimum_tank),
-        publish_fee: dollars(publishing.fee),
-        fees: shared::Fees {
-            holding_bps: terms.fees.holding_bps as u32,
-            author_bps: terms.fees.author_bps as u32,
-            platform_bps: terms.fees.platform_bps as u32,
-            transaction_bps: terms.fees.transaction_bps as u32,
-        },
-        exit_band_bps: terms.exit_band_bps as u32,
-        freeze_after_days: terms.timers.freeze_after as f64 / DAY,
-        image_timelock_days: registry.timelock(now) as f64 / DAY,
-        minimum_deposit: dollars(terms.minimum_deposit),
-        terms_hash: format!("0x{}", alloy::hex::encode(sv::factory::terms_hash(terms))),
-    })
+    }
 }
 
 fn dollars(units: u64) -> f64 {
@@ -191,11 +161,16 @@ pub async fn portfolio(
         };
         let held = shares as f64 / 1e18;
         if held > 0.0 {
+            // What it paid, from the record's reading of the vault's
+            // history; unknown, never nothing, while that isn't read.
             let cost = service
                 .indexer
-                .solana_cost(chain, &vault, &who)
-                .await
-                .unwrap_or(0.0);
+                .cost(
+                    chain,
+                    &shared::ChainAddress::Solana(vault.to_bytes()),
+                    &shared::ChainAddress::Solana(who.to_bytes()),
+                )
+                .await;
             positions.push(Holding {
                 slug: strategy.slug.clone(),
                 shares: held,

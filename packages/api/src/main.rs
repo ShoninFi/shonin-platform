@@ -20,25 +20,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
-use chain::bindings::factory::IVaultFactory;
-use chain::bindings::publishing::IPublishing;
-use chain::{Client, Role, Served, SolanaServed};
+use chain::{Role, Served, SolanaServed};
 use clap::Parser;
-use futures::{StreamExt, TryStreamExt};
 use indexer::{Indexer, Lookup};
 use shared::model::registry::Job;
 use shared::{
     Addresses, Chain, ChainInfo, Config, DevMode, EvmAddresses, HealthPost, HeldClaim, Holding,
-    Portfolio, Snapshot, Terms, Upload, UploadAccepted,
+    Portfolio, Snapshot, Upload, UploadAccepted,
 };
 
 #[derive(Parser)]
@@ -132,7 +128,8 @@ async fn main() -> Result<()> {
         args.store.clone(),
         args.builder_url.clone(),
     )
-    .with_service_rpc_policy(connections.service_rpc_policy.clone())?;
+    .with_service_rpc_policy(connections.service_rpc_policy.clone())?
+    .with_chains(connections.chains.clone());
     if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
         indexer = indexer.with_store_url(url);
     }
@@ -265,27 +262,36 @@ fn served(service: &Service, chain: Chain) -> Result<On, (StatusCode, Json<share
     }
 }
 
+/// The chain's config for the app: where to reach it, the platform's
+/// addresses on it, and the terms the platform runs under there, as the
+/// record last read them (in the background, so the route never waits on
+/// the chain), with when they were read.
 async fn config(
     State(service): State<Arc<Service>>,
     UrlPath(chain): UrlPath<Chain>,
 ) -> Result<Json<Config>, (StatusCode, Json<shared::ApiError>)> {
-    let served = match served(&service, chain)? {
+    let on = served(&service, chain)?;
+    // An app told the wrong terms would state them as facts, so it is told
+    // nothing until the chain has answered for them once.
+    let (terms, terms_as_of) = service.indexer.terms(chain).await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(shared::ApiError {
+                message: format!(
+                    "{} has not answered for the platform's terms yet",
+                    chain.label()
+                ),
+            }),
+        )
+    })?;
+    let served = match on {
         On::Evm(served) => served,
-        On::Solana(served) => return solana::config(&service, chain, &served).await.map(Json),
+        On::Solana(served) => {
+            return Ok(Json(
+                solana::config(&service, chain, &served, terms, terms_as_of).await,
+            ));
+        }
     };
-    let terms = terms(chain, &served.client, &served.deployments)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%chain, %error, "could not read the platform's terms");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(shared::ApiError {
-                    // An app told the wrong terms would state them as facts,
-                    // so it is told nothing until the chain answers.
-                    message: format!("{} did not answer for the platform's terms", chain.label()),
-                }),
-            )
-        })?;
     let info = service
         .indexer
         .snapshot
@@ -299,6 +305,7 @@ async fn config(
             chain_id: Some(served.client.chain_id),
             block: 0,
             as_of: None,
+            catching_up: false,
         });
     let deployments = &served.deployments;
     // Only a development chain holds its accounts' keys, so only there can the
@@ -327,6 +334,7 @@ async fn config(
         asset_symbol: chain.dollar().to_string(),
         asset_decimals: 6,
         terms,
+        terms_as_of: Some(terms_as_of),
         dev: viewer.map(|address| DevMode {
             address: format!("{address:?}"),
             label: "Development wallet".to_string(),
@@ -338,9 +346,6 @@ async fn config(
 /// or two per vault, and a node slow enough to take longer is answered for
 /// as not answering rather than holding the request open.
 const PORTFOLIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How many of a portfolio's vaults are read from the chain at once.
-const PORTFOLIO_READS_AT_ONCE: usize = 16;
 
 async fn portfolio(
     State(service): State<Arc<Service>>,
@@ -376,11 +381,10 @@ async fn read_portfolio(
             }),
         )
     })?;
-    let client = &served.client;
     // A balance that could not be read is not a balance of nothing: the
     // portfolio is not answered rather than shown empty.
     let unread = |error: anyhow::Error| {
-        tracing::warn!(%chain, %error, "a portfolio balance could not be read");
+        tracing::warn!(%chain, error = format!("{error:#}"), "a portfolio balance could not be read");
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(shared::ApiError {
@@ -388,15 +392,6 @@ async fn read_portfolio(
             }),
         )
     };
-
-    let balance = client
-        .read(
-            served.deployments.usd,
-            IERC20::balanceOfCall { account: who },
-        )
-        .await
-        .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
-        .map_err(unread)?;
 
     // The chain's strategies are copied out and the record let go before
     // any chain is read: a slow node holds up this request alone, never the
@@ -414,17 +409,81 @@ async fn read_portfolio(
         .filter(|strategy| !indexer::read::never_read(strategy))
         .cloned()
         .collect();
-    // The vaults are read several at a time ([`PORTFOLIO_READS_AT_ONCE`]),
-    // so a portfolio across many vaults isn't every read end to end.
-    let reads: Vec<_> = strategies
+    let vaults: Vec<Option<Address>> = strategies
         .iter()
-        .map(|strategy| holding_of(client, strategy, who, served.deployments.deployed_block))
+        .map(|strategy| strategy.vault.address.parse::<Address>().ok())
         .collect();
-    let held: Vec<Option<(f64, f64)>> = futures::stream::iter(reads)
-        .buffered(PORTFOLIO_READS_AT_ONCE)
-        .try_collect()
-        .await
-        .map_err(unread)?;
+    // Every balance in one observation, at the block the record was read at:
+    // the shares are then counted at the share price and against the cost
+    // the record has as of that block. Before the record has been read, at
+    // the head.
+    let mut plan = chain::follow::Plan::default();
+    plan.read(
+        served.deployments.usd,
+        &IERC20::balanceOfCall { account: who },
+    );
+    for vault in vaults.iter().flatten() {
+        plan.read(*vault, &IERC20::balanceOfCall { account: who });
+    }
+    let head = service.indexer.record_head(chain).await;
+    let pinned = match head {
+        Some(head) => service
+            .indexer
+            .observe(chain, &plan, chain::follow::At::Pinned(head))
+            .await
+            .inspect_err(|error| tracing::debug!(%chain, error = format!("{error:#}"), "the balances could not be read at the record's block; read at the head"))
+            .ok(),
+        None => None,
+    };
+    // Read at the head instead, the costs are unknown: they are as of the
+    // record's block, the balances are not.
+    let costs_apply = pinned.is_some();
+    let observed = match pinned {
+        Some(observed) => observed,
+        None => service
+            .indexer
+            .observe(chain, &plan, chain::follow::At::Latest)
+            .await
+            .map_err(unread)?,
+    };
+    let mut balances = Vec::with_capacity(plan.reads.len());
+    for index in 0..plan.reads.len() {
+        balances.push(
+            observed
+                .decode::<IERC20::balanceOfCall>(index)
+                .map_err(unread)?,
+        );
+    }
+    let mut balances = balances.into_iter();
+    let balance = balances
+        .next()
+        .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
+        .unwrap_or(0.0);
+    let owner = shared::ChainAddress::Evm(who.0.0);
+    let mut held: Vec<Option<(f64, Option<f64>)>> = Vec::with_capacity(vaults.len());
+    for vault in &vaults {
+        let Some(vault) = vault else {
+            held.push(None);
+            continue;
+        };
+        let shares = balances
+            .next()
+            .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)
+            .unwrap_or(0.0);
+        // What it paid, from the record's own reading of the vault's
+        // history; unknown, never nothing, while that isn't read through.
+        let cost = if !costs_apply {
+            None
+        } else if shares > 0.0 {
+            service
+                .indexer
+                .cost(chain, &shared::ChainAddress::Evm(vault.0.0), &owner)
+                .await
+        } else {
+            Some(0.0)
+        };
+        held.push(Some((shares, cost)));
+    }
 
     let mut positions = Vec::new();
     let mut claims = Vec::new();
@@ -467,226 +526,6 @@ async fn read_portfolio(
         positions,
         claims,
     }))
-}
-
-/// What `who` holds of a strategy's vault, in shares, and what it paid for
-/// that, if the vault's address reads as one.
-async fn holding_of(
-    client: &Client,
-    strategy: &shared::Strategy,
-    who: Address,
-    deployed_block: u64,
-) -> anyhow::Result<Option<(f64, f64)>> {
-    let Ok(vault) = strategy.vault.address.parse::<Address>() else {
-        return Ok(None);
-    };
-    let held = client
-        .read(vault, IERC20::balanceOfCall { account: who })
-        .await
-        .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)?;
-    let cost = if held > 0.0 {
-        cost_basis(client, vault, who, deployed_block)
-            .await
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    Ok(Some((held, cost)))
-}
-
-/// What an address paid for what it still holds: everything it put in, less
-/// everything it took out. The vault's own log is the whole of it.
-///
-/// What it took out is found three ways, since the vault says so three ways:
-///
-/// - a withdrawal, or a claim paid while the vault ran: `Withdrawn` under the
-///   owner (and, for a claim, a `ClaimPaid` right after it);
-/// - a claim paid once the vault closed (`claimClosed`): a `ClaimPaid` alone,
-///   which names only the claim, so the owner is the one its `ClaimBooked`
-///   names;
-/// - shares redeemed once the vault closed (`redeemClosed`): a `Withdrawn`
-///   under the receiver, whoever that is, so it is counted for the holder
-///   whose shares were burnt for it in the same transaction, and not for the
-///   receiver.
-///
-/// Shares never move from one holder to another (the vault refuses
-/// `transfer`), so no cost moves with them.
-///
-/// The log is read from `since`, the block the platform's contracts were
-/// deployed in, since no vault is older than its factory; it is read in one
-/// request per event, filtered to the vault and, where the event names one,
-/// the owner. A node that caps the block range of a log request refuses it
-/// once the chain has run past that cap since the deployment, and the cost
-/// then reads as nothing rather than as a wrong figure.
-async fn cost_basis(chain: &Client, vault: Address, who: Address, since: u64) -> Option<f64> {
-    use std::collections::HashSet;
-
-    use alloy::primitives::{B256, U256};
-    use alloy::rpc::types::{Filter, Log};
-    use alloy::sol_types::SolEvent;
-    use chain::bindings::vault::IVault;
-
-    let base = |signature: B256| {
-        Filter::new()
-            .address(vault)
-            .event_signature(signature)
-            .from_block(since)
-    };
-    let logs = |filter: Filter| async move { chain.logs(&filter).await.ok() };
-    // Where a log sits: its transaction, and its place in it.
-    let at = |log: &Log| (log.transaction_hash, log.log_index);
-    let before = |log: &Log| {
-        (
-            log.transaction_hash,
-            log.log_index.and_then(|i| i.checked_sub(1)),
-        )
-    };
-
-    let mut paid = 0.0;
-    for log in logs(base(IVault::Deposited::SIGNATURE_HASH).topic2(who.into_word())).await? {
-        if let Ok(event) = log.log_decode::<IVault::Deposited>() {
-            paid += dollars(event.inner.data.assets);
-        }
-    }
-
-    // Every claim paid, and where the log just before each sits: a claim paid
-    // while the vault ran follows its own `Withdrawn`.
-    let claims_paid = logs(base(IVault::ClaimPaid::SIGNATURE_HASH)).await?;
-    let before_a_claim_paid: HashSet<_> = claims_paid.iter().map(before).collect();
-
-    let withdrawn = logs(base(IVault::Withdrawn::SIGNATURE_HASH).topic2(who.into_word())).await?;
-    for log in &withdrawn {
-        let Ok(event) = log.log_decode::<IVault::Withdrawn>() else {
-            continue;
-        };
-        // A closed vault's redemption names its receiver: it is counted
-        // below, for whoever held the shares.
-        if event.inner.data.requestId.is_zero() && !before_a_claim_paid.contains(&at(log)) {
-            continue;
-        }
-        paid -= dollars(event.inner.data.assets);
-    }
-
-    // A claim paid once the vault closed, with no `Withdrawn` before it: the
-    // owner's if the owner booked it.
-    let booked: HashSet<U256> =
-        logs(base(IVault::ClaimBooked::SIGNATURE_HASH).topic2(who.into_word()))
-            .await?
-            .iter()
-            .filter_map(|log| log.log_decode::<IVault::ClaimBooked>().ok())
-            .map(|event| event.inner.data.claimId)
-            .collect();
-    let withdrawals: HashSet<_> = withdrawn.iter().map(at).collect();
-    for log in &claims_paid {
-        let Ok(event) = log.log_decode::<IVault::ClaimPaid>() else {
-            continue;
-        };
-        if booked.contains(&event.inner.data.claimId) && !withdrawals.contains(&before(log)) {
-            paid -= dollars(event.inner.data.assets);
-        }
-    }
-
-    // Every redemption a closed vault paid, to whomever: a `Withdrawn` for no
-    // request with no claim paid after it.
-    let mut redeemed_closed = Vec::new();
-    for log in logs(base(IVault::Withdrawn::SIGNATURE_HASH).topic1(B256::ZERO)).await? {
-        if before_a_claim_paid.contains(&at(&log)) {
-            continue;
-        }
-        if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
-            redeemed_closed.push((event.inner.data, at(&log)));
-        }
-    }
-    // This holder's part: the redemption each of its burns paid for, the
-    // first after the burn in the same transaction for the same shares.
-    if !redeemed_closed.is_empty() {
-        let burnt = logs(
-            base(IVault::Transfer::SIGNATURE_HASH)
-                .topic1(who.into_word())
-                .topic2(B256::ZERO),
-        )
-        .await?;
-        let mut counted = HashSet::new();
-        for log in &burnt {
-            let Ok(event) = log.log_decode::<IVault::Transfer>() else {
-                continue;
-            };
-            let (hash, index) = at(log);
-            let paid_for = redeemed_closed
-                .iter()
-                .filter(|(redeemed, (in_tx, after))| {
-                    *in_tx == hash
-                        && redeemed.shares == event.inner.data.value
-                        && after.zip(index).is_some_and(|(after, index)| after > index)
-                        && !counted.contains(&(*in_tx, *after))
-                })
-                .min_by_key(|(_, (_, after))| *after);
-            if let Some((redeemed, place)) = paid_for {
-                counted.insert(*place);
-                paid -= dollars(redeemed.assets);
-            }
-        }
-    }
-
-    for log in logs(base(IVault::ProRataTaken::SIGNATURE_HASH).topic1(who.into_word())).await? {
-        if let Ok(event) = log.log_decode::<IVault::ProRataTaken>() {
-            paid -= dollars(event.inner.data.assets);
-        }
-    }
-    for log in logs(base(IVault::UnitsPaid::SIGNATURE_HASH).topic1(who.into_word())).await? {
-        if let Ok(event) = log.log_decode::<IVault::UnitsPaid>() {
-            paid -= dollars(event.inner.data.assets);
-        }
-    }
-    Some(paid.max(0.0))
-}
-
-/// The terms the platform is running under, asked of the contracts that
-/// enforce them. They are governed rather than fixed, so the app is told them
-/// instead of being built with them.
-/// The terms one vault chain's contracts enforce.
-async fn terms(on: Chain, chain: &Client, deployments: &chain::Deployments) -> Result<Terms> {
-    const DAY: f64 = 86_400.0;
-
-    let vaults = chain
-        .read(deployments.factory, IVaultFactory::configCall {})
-        .await
-        .with_context(|| format!("reading the terms on {on}"))?;
-    let timelock = chain
-        .read(
-            deployments.attestation,
-            IAttestationRegistry::timelockCall {},
-        )
-        .await
-        .with_context(|| format!("reading the terms on {on}"))?;
-    let publish_fee = chain
-        .read(deployments.publishing, IPublishing::feeCall {})
-        .await
-        .with_context(|| format!("reading the terms on {on}"))?;
-    let terms_hash = chain
-        .read(deployments.factory, IVaultFactory::termsCall {})
-        .await
-        .with_context(|| format!("reading the terms on {on}"))?;
-
-    Ok(Terms {
-        minimum_tank: dollars(vaults.minimumTank),
-        publish_fee: dollars(publish_fee),
-        fees: shared::Fees {
-            holding_bps: vaults.holdingBps as u32,
-            author_bps: vaults.authorBps as u32,
-            platform_bps: vaults.platformBps as u32,
-            transaction_bps: vaults.transactionBps as u32,
-        },
-        exit_band_bps: vaults.exitBandBps as u32,
-        freeze_after_days: vaults.timers.freezeAfter as f64 / DAY,
-        image_timelock_days: timelock as f64 / DAY,
-        minimum_deposit: dollars(vaults.minimumDeposit),
-        terms_hash: format!("{terms_hash:?}"),
-    })
-}
-
-fn dollars(value: alloy::primitives::U256) -> f64 {
-    value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6
 }
 
 async fn jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
@@ -1021,6 +860,10 @@ async fn store_file(
 }
 
 #[cfg(test)]
+#[path = "../../indexer/tests/stand_in/mod.rs"]
+mod stand_in;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1144,67 +987,6 @@ mod tests {
         assert_eq!(paths, ["/jobs/8800"]);
     }
 
-    /// An answer to the JSON-RPC request in `body`, as a node with no logs
-    /// on chain 31337 would give it.
-    fn a_node_with_no_logs(body: &str) -> (StatusCode, String) {
-        let id = body
-            .split("\"id\":")
-            .nth(1)
-            .map(|rest| {
-                rest.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| "0".to_string());
-        let result = if body.contains("eth_chainId") {
-            "\"0x7a69\""
-        } else {
-            "[]"
-        };
-        (
-            StatusCode::OK,
-            format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_holding_s_cost_is_read_from_the_deployment_not_from_the_first_block() {
-        let (node, seen) = a_recording_server(a_node_with_no_logs).await;
-        let config = chain::ChainConfig {
-            label: "A node".to_string(),
-            rpc: node.clone(),
-            ws: None,
-            dollar: "USDC".to_string(),
-            native_usd: None,
-            confirmations: None,
-            public_rpc: node,
-            logs_rpc: None,
-            log_range: None,
-        };
-        let client = Client::connect(&config, chain::Signing::ReadOnly)
-            .await
-            .unwrap();
-        let cost = cost_basis(
-            &client,
-            Address::repeat_byte(0x11),
-            Address::repeat_byte(0x22),
-            1234,
-        )
-        .await;
-        assert_eq!(cost, Some(0.0));
-        let asked: Vec<String> = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, body)| body.contains("eth_getLogs"))
-            .map(|(_, body)| body.clone())
-            .collect();
-        assert_eq!(asked.len(), 7, "{asked:?}");
-        for body in asked {
-            assert!(body.contains(r#""fromBlock":"0x4d2""#), "{body}");
-        }
-    }
     // A vault's log, as a node holding it answers for it ------------------
 
     /// A node on chain 31337 holding `logs`, answering a log request with
@@ -1269,222 +1051,6 @@ mod tests {
 
     const VAULT: Address = Address::repeat_byte(0x11);
     const HOLDER: Address = Address::repeat_byte(0x22);
-    const SOMEONE_ELSE: Address = Address::repeat_byte(0x33);
-
-    /// One of the vault's events, in transaction `tx` at `index`.
-    fn logged(
-        event: impl alloy::sol_types::SolEvent,
-        tx: u8,
-        index: u64,
-    ) -> alloy::rpc::types::Log {
-        alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: VAULT,
-                data: event.encode_log_data(),
-            },
-            block_hash: Some(alloy::primitives::B256::repeat_byte(tx)),
-            block_number: Some(tx as u64),
-            block_timestamp: None,
-            transaction_hash: Some(alloy::primitives::B256::repeat_byte(tx)),
-            transaction_index: Some(0),
-            log_index: Some(index),
-            removed: false,
-        }
-    }
-
-    fn usd(dollars: u64) -> alloy::primitives::U256 {
-        alloy::primitives::U256::from(dollars * 1_000_000)
-    }
-
-    fn shares(count: u64) -> alloy::primitives::U256 {
-        alloy::primitives::U256::from(count) * alloy::primitives::U256::from(10u64.pow(18))
-    }
-
-    fn deposited(owner: Address, dollars: u64, tx: u8) -> alloy::rpc::types::Log {
-        use chain::bindings::vault::IVault;
-        logged(
-            IVault::Deposited {
-                requestId: alloy::primitives::U256::from(tx),
-                owner,
-                assets: usd(dollars),
-                shares: shares(dollars),
-            },
-            tx,
-            0,
-        )
-    }
-
-    async fn cost_of(logs: Vec<alloy::rpc::types::Log>, who: Address) -> Option<f64> {
-        let node = a_node_holding(logs).await;
-        let config = chain::ChainConfig {
-            label: "A node".to_string(),
-            rpc: node.clone(),
-            ws: None,
-            dollar: "USDC".to_string(),
-            native_usd: None,
-            confirmations: None,
-            public_rpc: node,
-            logs_rpc: None,
-            log_range: None,
-        };
-        let client = Client::connect(&config, chain::Signing::ReadOnly)
-            .await
-            .unwrap();
-        cost_basis(&client, VAULT, who, 0).await
-    }
-
-    #[tokio::test]
-    async fn a_claim_paid_once_the_vault_closed_comes_off_its_owner_s_cost_once() {
-        use alloy::primitives::U256;
-        use chain::bindings::vault::IVault;
-
-        let logs = vec![
-            deposited(HOLDER, 100, 1),
-            deposited(SOMEONE_ELSE, 50, 2),
-            // A claim paid while the vault ran: its `Withdrawn` and its
-            // `ClaimPaid`, one after the other.
-            logged(
-                IVault::ClaimBooked {
-                    claimId: U256::from(8),
-                    owner: HOLDER,
-                    shares: shares(20),
-                },
-                3,
-                0,
-            ),
-            logged(
-                IVault::Withdrawn {
-                    requestId: U256::from(4),
-                    owner: HOLDER,
-                    shares: shares(20),
-                    assets: usd(20),
-                    feeShares: U256::ZERO,
-                },
-                4,
-                3,
-            ),
-            logged(
-                IVault::ClaimPaid {
-                    claimId: U256::from(8),
-                    assets: usd(20),
-                },
-                4,
-                4,
-            ),
-            // Two claims paid once the vault closed (`claimClosed`): a burn,
-            // then the `ClaimPaid` alone.
-            logged(
-                IVault::ClaimBooked {
-                    claimId: U256::from(9),
-                    owner: HOLDER,
-                    shares: shares(30),
-                },
-                5,
-                0,
-            ),
-            logged(
-                IVault::ClaimBooked {
-                    claimId: U256::from(10),
-                    owner: SOMEONE_ELSE,
-                    shares: shares(10),
-                },
-                5,
-                1,
-            ),
-            logged(
-                IVault::Transfer {
-                    from: VAULT,
-                    to: Address::ZERO,
-                    value: shares(30),
-                },
-                6,
-                0,
-            ),
-            logged(
-                IVault::ClaimPaid {
-                    claimId: U256::from(9),
-                    assets: usd(30),
-                },
-                6,
-                2,
-            ),
-            logged(
-                IVault::Transfer {
-                    from: VAULT,
-                    to: Address::ZERO,
-                    value: shares(10),
-                },
-                7,
-                0,
-            ),
-            logged(
-                IVault::ClaimPaid {
-                    claimId: U256::from(10),
-                    assets: usd(10),
-                },
-                7,
-                2,
-            ),
-        ];
-        assert_eq!(cost_of(logs.clone(), HOLDER).await, Some(50.0));
-        assert_eq!(cost_of(logs, SOMEONE_ELSE).await, Some(40.0));
-    }
-
-    #[tokio::test]
-    async fn a_closed_vault_s_redemption_comes_off_the_holder_s_cost_not_the_receiver_s() {
-        use alloy::primitives::U256;
-        use chain::bindings::vault::IVault;
-
-        let logs = vec![
-            deposited(HOLDER, 100, 1),
-            deposited(SOMEONE_ELSE, 50, 2),
-            // `redeemClosed(5 shares, someone else)`, sent by the holder: the
-            // holder's shares burnt, the dollars to the receiver.
-            logged(
-                IVault::Transfer {
-                    from: HOLDER,
-                    to: Address::ZERO,
-                    value: shares(5),
-                },
-                3,
-                0,
-            ),
-            logged(
-                IVault::Withdrawn {
-                    requestId: U256::ZERO,
-                    owner: SOMEONE_ELSE,
-                    shares: shares(5),
-                    assets: usd(40),
-                    feeShares: U256::ZERO,
-                },
-                3,
-                2,
-            ),
-            // And one the receiver redeems for themselves.
-            logged(
-                IVault::Transfer {
-                    from: SOMEONE_ELSE,
-                    to: Address::ZERO,
-                    value: shares(1),
-                },
-                4,
-                0,
-            ),
-            logged(
-                IVault::Withdrawn {
-                    requestId: U256::ZERO,
-                    owner: SOMEONE_ELSE,
-                    shares: shares(1),
-                    assets: usd(8),
-                    feeShares: U256::ZERO,
-                },
-                4,
-                2,
-            ),
-        ];
-        assert_eq!(cost_of(logs.clone(), HOLDER).await, Some(60.0));
-        assert_eq!(cost_of(logs, SOMEONE_ELSE).await, Some(42.0));
-    }
 
     // The build service, for an upload ------------------------------------
 
@@ -1554,7 +1120,7 @@ mod tests {
             logs_rpc: None,
             log_range: None,
         };
-        let client = Client::connect(&config, chain::Signing::ReadOnly)
+        let client = chain::Client::connect(&config, chain::Signing::ReadOnly)
             .await
             .unwrap();
         let service = a_service(builder);
@@ -1739,5 +1305,164 @@ mod tests {
         let said = answer.expect_err("the upload is refused");
         assert_eq!(said.status, StatusCode::BAD_REQUEST);
         assert_eq!(said.message, "shonin.toml puts the vault on robinhood");
+    }
+
+    // What a holder paid, from the record -----------------------------------
+
+    /// What a holder paid for a holding is read from the record's own
+    /// reading of the vault's history, paged as narrowly as the endpoint
+    /// asks (Base's caps a log query at 200 blocks), with no log read of its
+    /// own: until that history has been read up to the head, it is unknown,
+    /// never shown as nothing paid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_holding_s_cost_is_unknown_until_its_vault_s_history_is_read_through() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use chain::bindings::vault::IVault;
+        use serde_json::{Value, json};
+
+        const HEAD: u64 = 60_010;
+        const DEPOSITED_IN: u64 = 55_000;
+        let holder = Address::repeat_byte(0xd0);
+        let the_deposit = stand_in::logged(
+            IVault::Deposited {
+                requestId: alloy::primitives::U256::from(1),
+                owner: holder,
+                assets: alloy::primitives::U256::from(100_000_000u64),
+                shares: alloy::primitives::U256::from(10u64)
+                    * alloy::primitives::U256::from(10u64.pow(18)),
+            },
+            DEPOSITED_IN,
+            0,
+        );
+        let log_reads = Arc::new(AtomicU64::new(0));
+        let counted = log_reads.clone();
+        let answer: stand_in::Answer = Arc::new(move |request: &Value| {
+            match request["method"].as_str() {
+                Some("eth_getLogs") => {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let (from, to) = stand_in::log_range(request);
+                    Some(if to - from >= 200 {
+                        Err("block range too large, max is 200".to_string())
+                    } else {
+                        Ok(json!(stand_in::matching(
+                            request,
+                            std::slice::from_ref(&the_deposit)
+                        )))
+                    })
+                }
+                Some("eth_call")
+                    if stand_in::input(request)
+                        .starts_with(&stand_in::selector::<IERC20::balanceOfCall>()) =>
+                {
+                    let to = request["params"][0]["to"].as_str().unwrap_or_default();
+                    // Ten shares of the vault, and five dollars.
+                    let held: u128 = if to.to_ascii_lowercase().ends_with(stand_in::VAULT) {
+                        10 * 10u128.pow(18)
+                    } else {
+                        5_000_000
+                    };
+                    Some(Ok(json!(format!("0x{held:064x}"))))
+                }
+                _ => None,
+            }
+        });
+        let indexer = stand_in::an_indexer_on(
+            stand_in::Chain::at(HEAD),
+            stand_in::deployments(),
+            answer,
+            "holding-cost",
+        )
+        .await;
+        let service = Arc::new(Service {
+            indexer: indexer.clone(),
+            builder: None,
+            executor: "http://127.0.0.1:1".to_string(),
+            http: indexer::http(),
+            upload_timeout: std::time::Duration::from_secs(3),
+            rootkey: rootkey::Relays::default(),
+            wake: Arc::new(internal::Wake::new(None)),
+        });
+        let who = format!("{holder:?}");
+        let cost = |portfolio: &Portfolio| portfolio.positions.first().map(|held| held.cost);
+
+        // The first refresh reads the history part of the way.
+        indexer.refresh().await.unwrap();
+        assert!(indexer.snapshot.read().await.chains[0].catching_up);
+        let Json(portfolio) = read_portfolio(&service, Chain::Base, who.clone())
+            .await
+            .unwrap();
+        assert_eq!(portfolio.positions.len(), 1);
+        assert_eq!(
+            cost(&portfolio),
+            Some(None),
+            "unknown while the history is read"
+        );
+
+        // The next reads it to the head, past the deposit.
+        indexer.refresh().await.unwrap();
+        assert!(!indexer.snapshot.read().await.chains[0].catching_up);
+        let before = log_reads.load(Ordering::SeqCst);
+        let Json(portfolio) = read_portfolio(&service, Chain::Base, who).await.unwrap();
+        assert_eq!(cost(&portfolio), Some(Some(100.0)));
+        assert_eq!(
+            log_reads.load(Ordering::SeqCst),
+            before,
+            "a portfolio read logs of its own"
+        );
+        let json = serde_json::to_value(&portfolio).unwrap();
+        assert_eq!(json["positions"][0]["cost"], json!(100.0));
+        assert_eq!(json["balance"], json!(5.0));
+    }
+
+    /// The platform's terms are served from the record, read with it in the
+    /// background and dated by the block they were read at: the config route
+    /// reads nothing of the chain, so a slow chain never holds it up, and
+    /// before the record has read them it says so rather than guess.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_config_s_terms_are_served_from_the_record_with_their_read_time() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let asked = Arc::new(AtomicU64::new(0));
+        let counted = asked.clone();
+        let indexer = stand_in::an_indexer_on(
+            stand_in::Chain::at(stand_in::HEAD),
+            stand_in::deployments(),
+            Arc::new(move |_: &serde_json::Value| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            "config-terms",
+        )
+        .await;
+        let service = Arc::new(Service {
+            indexer: indexer.clone(),
+            builder: None,
+            executor: "http://127.0.0.1:1".to_string(),
+            http: indexer::http(),
+            upload_timeout: std::time::Duration::from_secs(3),
+            rootkey: rootkey::Relays::default(),
+            wake: Arc::new(internal::Wake::new(None)),
+        });
+        let refused = config(State(service.clone()), UrlPath(Chain::Base)).await;
+        assert_eq!(
+            refused.err().map(|(status, _)| status),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "terms never read are not answered"
+        );
+
+        indexer.refresh().await.unwrap();
+        let before = asked.load(Ordering::SeqCst);
+        let Json(config) = config(State(service), UrlPath(Chain::Base)).await.unwrap();
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            before,
+            "the route read the chain"
+        );
+        assert_eq!(
+            config.terms_as_of,
+            Some(indexer::read::moment(stand_in::TIME)),
+            "dated by the block the record read them at"
+        );
     }
 }

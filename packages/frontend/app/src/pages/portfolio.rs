@@ -677,8 +677,9 @@ async fn read_row(
         .unwrap_or_default();
     let paid_cents = portfolio
         .and_then(|p| p.positions.iter().find(|h| h.slug == vault.slug))
-        .filter(|holding| holding.cost.is_finite() && holding.cost >= 0.0)
-        .map(|holding| (holding.cost * 100.0).round() as u128);
+        .and_then(|holding| holding.cost)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .map(|cost| (cost * 100.0).round() as u128);
     Some(Row {
         vault: vault.clone(),
         network: network.clone(),

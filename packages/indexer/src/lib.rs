@@ -8,10 +8,11 @@
 //! The binary in this crate only reads. The web app's API runs the same
 //! indexer in-process and serves what it holds.
 
-mod logs;
+pub mod evm;
 pub mod read;
 pub mod solana;
 pub mod store;
+pub mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use shared::{Chain, ChainAddress};
 use shared::{ChainInfo, HealthPost, Snapshot, Totals};
 use tokio::sync::RwLock;
 
-use crate::read::History;
+use crate::evm::{EvmRecord, Refresh};
 use crate::store::Store;
 
 /// What became of a health report.
@@ -175,6 +176,8 @@ pub struct Reader {
     pub vault_chain: Chain,
     pub key: ChainKey,
     source: Source,
+    /// The chain's RPC settings.
+    policy: chain::rpc_policy::RpcPolicy,
     /// When it connected, and when it was last read whole: what its health
     /// is judged by.
     connected: Instant,
@@ -183,18 +186,31 @@ pub struct Reader {
     /// last read whole, none read whole now. Such a read is not a read of
     /// the chain, and moves `read_at` on no further.
     every_vault_stale: std::sync::atomic::AtomicBool,
+    /// Whether the record is still reading its history up to the head.
+    catching_up: std::sync::atomic::AtomicBool,
 }
 
-/// What a chain is read through: an EVM client and what has been made of its
-/// logs, or a Solana client and what has been made of each vault's history.
+/// What a chain is read through: an EVM chain's record and a follower for
+/// the routes' reads, or a Solana client and what has been made of each
+/// vault's history.
 enum Source {
     Evm {
         served: Box<Served>,
-        history: Box<RwLock<History>>,
+        record: Box<tokio::sync::Mutex<EvmRecord>>,
+        /// For the reads a route makes (a portfolio's balances, the jobs),
+        /// apart from the record's, so neither waits on the other.
+        routes: Box<tokio::sync::Mutex<chain::follow::Follower>>,
     },
     Solana {
         served: Box<SolanaServed>,
         history: Box<RwLock<solana::History>>,
+        /// The keys health reports were signed with, by vault: each
+        /// refresh reads whether they are blessed.
+        asked: Box<
+            std::sync::Mutex<
+                std::collections::BTreeSet<(chain::solana::Pubkey, chain::solana::Pubkey)>,
+            >,
+        >,
     },
 }
 
@@ -223,7 +239,21 @@ impl Reader {
             chain_id: self.evm().map(|served| served.client.chain_id),
             block: 0,
             as_of: None,
+            catching_up: false,
         }
+    }
+
+    /// How long between refreshes.
+    fn refresh_every(&self) -> Duration {
+        Duration::from_millis(match self.source {
+            Source::Evm { .. } => self.policy.record_refresh_ms,
+            Source::Solana { .. } => self.policy.solana_record_refresh_ms,
+        })
+    }
+
+    /// How long without a whole refresh before its health says so.
+    fn stale_after(&self) -> Duration {
+        Duration::from_millis(self.policy.record_stale_ms)
     }
 }
 
@@ -238,6 +268,54 @@ struct Read {
     /// Everyone who has published on it, by address.
     authors: Vec<(ChainAddress, Author)>,
     feed: Vec<FeedEvent>,
+    /// The block an EVM chain's record was read at.
+    head: Option<chain::follow::Header>,
+    /// The platform's terms on the chain, and the chain time they were read
+    /// at.
+    terms: Option<(shared::Terms, u64)>,
+    /// How many payments the publishing contract had taken, and when that
+    /// was read.
+    payments: Option<(u64, Instant)>,
+    /// What each holder paid for what they hold, for the vaults whose
+    /// history has been read through.
+    costs: Arc<Costs>,
+    /// On a Solana cluster: whether each key health reports were signed
+    /// with is blessed as its vault's executor, by vault and key, as the
+    /// accounts were read.
+    blessed: Arc<HashMap<(chain::solana::Pubkey, chain::solana::Pubkey), bool>>,
+    /// When it was read, on this server's clock.
+    read_at: Instant,
+}
+
+/// What each holder paid for what they hold, by vault: known only for the
+/// vaults whose history has been read through.
+#[derive(Clone, Debug, Default)]
+pub struct Costs {
+    known: HashSet<ChainAddress>,
+    paid: HashMap<(ChainAddress, ChainAddress), f64>,
+}
+
+impl Costs {
+    /// What `owner` paid for what it holds of `vault`, if that is known.
+    pub fn of(&self, vault: &ChainAddress, owner: &ChainAddress) -> Option<f64> {
+        self.known
+            .contains(vault)
+            .then(|| self.paid.get(&(*vault, *owner)).copied().unwrap_or(0.0))
+    }
+
+    /// Every vault's costs, each vault's by holder.
+    pub fn from_vaults(
+        vaults: impl IntoIterator<Item = (ChainAddress, HashMap<ChainAddress, f64>)>,
+    ) -> Self {
+        let mut costs = Costs::default();
+        for (vault, holders) in vaults {
+            costs.known.insert(vault);
+            for (owner, paid) in holders {
+                costs.paid.insert((vault, owner), paid);
+            }
+        }
+        costs
+    }
 }
 
 /// The build queue as last read: the jobs the build service last gave, when
@@ -252,11 +330,34 @@ struct Queue {
     stale: bool,
 }
 
-/// One job as its chain last completed it, and when.
+/// One job as its chain last completed it, when, and how many times in a
+/// row it has been completed without settling.
 struct Completion {
     job: Job,
     at: Instant,
+    tries: u32,
 }
+
+impl Completion {
+    /// Whether it is to be read again at `now`: an activation read without
+    /// its review (a node behind the one the build service reads) is read
+    /// again less and less often, from every poll to once in
+    /// [`UNREVIEWED_EVERY_MOST`]; any other job not settled, every poll.
+    fn due(&self, now: Instant) -> bool {
+        if self.job.state != JobState::Activated || self.job.review.is_some() {
+            return true;
+        }
+        let wait = UNREVIEWED_EVERY_FIRST
+            .saturating_mul(1 << self.tries.min(16))
+            .min(UNREVIEWED_EVERY_MOST);
+        now.saturating_duration_since(self.at) >= wait
+    }
+}
+
+/// How soon an activation read without its review is read again at first,
+/// and at most.
+const UNREVIEWED_EVERY_FIRST: Duration = Duration::from_secs(2);
+const UNREVIEWED_EVERY_MOST: Duration = Duration::from_secs(300);
 
 /// Where a vault chain stands with this indexer.
 #[derive(Clone)]
@@ -276,6 +377,8 @@ pub enum Lookup {
 pub struct Connections {
     pub expected: Vec<Chain>,
     pub service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy,
+    /// The chain config, for each chain's RPC settings.
+    pub chains: chain::ChainConfigs,
     pub evm: tokio::sync::mpsc::UnboundedReceiver<Served>,
     pub solana: tokio::sync::mpsc::UnboundedReceiver<SolanaServed>,
 }
@@ -298,10 +401,10 @@ pub fn connections(args: &chain::ChainArgs) -> Result<Connections> {
     };
     let mut expected = evm_chains;
     expected.extend(solana.iter().map(|target| target.vault_chain));
+    let chains = chain::config::ChainConfigs::load(&args.chains)?;
     Ok(Connections {
-        service_rpc_policy: chain::config::ChainConfigs::load(&args.chains)?
-            .service_rpc_policy()
-            .clone(),
+        service_rpc_policy: chains.service_rpc_policy().clone(),
+        chains,
         expected,
         evm,
         solana: args.connect_each_solana()?,
@@ -312,6 +415,11 @@ pub fn connections(args: &chain::ChainArgs) -> Result<Connections> {
 /// reading.
 pub struct Indexer {
     service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy,
+    /// The chain config, for each chain's RPC settings: the checked-in
+    /// settings when there is none.
+    chains: Option<chain::ChainConfigs>,
+    /// Settings every chain is read with instead, where set.
+    policy: Option<chain::rpc_policy::RpcPolicy>,
     /// The vault chains to be read, connected or not yet: a chain is read
     /// from the moment it connects, and one that hasn't holds up no other.
     expected: Vec<Chain>,
@@ -361,6 +469,8 @@ impl Indexer {
     pub fn new(expected: Vec<Chain>, store: PathBuf, builder: Option<String>) -> Self {
         Self {
             service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy::default(),
+            chains: None,
+            policy: None,
             snapshot: RwLock::new(empty_snapshot()),
             expected,
             readers: std::sync::RwLock::new(Vec::new()),
@@ -387,6 +497,29 @@ impl Indexer {
         policy.validate()?;
         self.service_rpc_policy = policy;
         Ok(self)
+    }
+
+    /// Read each chain with its settings in `chains`.
+    pub fn with_chains(mut self, chains: chain::ChainConfigs) -> Self {
+        self.chains = Some(chains);
+        self
+    }
+
+    /// Read every chain with `policy`, whatever the chain config says.
+    pub fn with_rpc_policy(mut self, policy: chain::rpc_policy::RpcPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// The RPC settings chain `key` is read with.
+    fn policy_for(&self, key: &ChainKey) -> chain::rpc_policy::RpcPolicy {
+        if let Some(policy) = &self.policy {
+            return policy.clone();
+        }
+        match &self.chains {
+            Some(chains) => chains.rpc_policy(key),
+            None => chain::rpc_policy::RpcPolicies::established().for_chain(key),
+        }
     }
 
     /// The same indexer, its store reading through to the public copy at
@@ -449,12 +582,16 @@ impl Indexer {
     /// Start reading a chain that has connected.
     pub async fn add(&self, served: Served) {
         let (vault_chain, key) = (served.vault_chain, served.key.clone());
+        let policy = self.policy_for(&key);
+        let record = EvmRecord::new(&served, policy.clone());
+        let routes = chain::follow::Follower::new(served.client.clone(), policy);
         self.add_reader(
             vault_chain,
             key,
             Source::Evm {
                 served: Box::new(served),
-                history: Box::new(RwLock::new(History::default())),
+                record: Box::new(tokio::sync::Mutex::new(record)),
+                routes: Box::new(tokio::sync::Mutex::new(routes)),
             },
         )
         .await;
@@ -469,6 +606,7 @@ impl Indexer {
             Source::Solana {
                 served: Box::new(served),
                 history: Box::new(RwLock::new(solana::History::default())),
+                asked: Box::default(),
             },
         )
         .await;
@@ -476,13 +614,16 @@ impl Indexer {
 
     async fn add_reader(&self, vault_chain: Chain, key: ChainKey, source: Source) {
         tracing::info!(chain = %key, "the indexer is reading");
+        let policy = self.policy_for(&key);
         let reader = Reader {
             vault_chain,
             key,
             source,
+            policy,
             connected: Instant::now(),
             read_at: std::sync::Mutex::new(None),
             every_vault_stale: std::sync::atomic::AtomicBool::new(false),
+            catching_up: std::sync::atomic::AtomicBool::new(false),
         };
         let info = reader.unread_info();
         {
@@ -560,19 +701,59 @@ impl Indexer {
         }
     }
 
-    /// What `owner` paid for what they hold in a Solana vault, as the vault's
-    /// history has been read so far. None until it has been read.
-    pub async fn solana_cost(
+    /// What `owner` paid for what they hold in `vault`, as the record has
+    /// read the vault's history: `None` while that is not known (the chain
+    /// not read yet, or the vault's history not read through).
+    pub async fn cost(
         &self,
         chain: Chain,
-        vault: &chain::solana::Pubkey,
-        owner: &chain::solana::Pubkey,
+        vault: &ChainAddress,
+        owner: &ChainAddress,
     ) -> Option<f64> {
-        let reader = self.reader(chain)?;
-        let Source::Solana { history, .. } = &reader.source else {
-            return None;
+        self.parts.read().await.get(&chain)?.costs.of(vault, owner)
+    }
+
+    /// The platform's terms on `chain` as the record last read them, with
+    /// when that was on the chain's own clock.
+    pub async fn terms(&self, chain: Chain) -> Option<(shared::Terms, time::PrimitiveDateTime)> {
+        let parts = self.parts.read().await;
+        let (terms, at) = parts.get(&chain)?.terms.clone()?;
+        Some((terms, read::moment(at)))
+    }
+
+    /// How many payments `chain`'s publishing contract had taken, as the
+    /// record read it no longer than `within` ago.
+    pub async fn payments(&self, chain: Chain, within: Duration) -> Option<u64> {
+        let parts = self.parts.read().await;
+        let (count, at) = parts.get(&chain)?.payments?;
+        (at.elapsed() <= within).then_some(count)
+    }
+
+    /// The block an EVM chain's record was last read at.
+    pub async fn record_head(&self, chain: Chain) -> Option<chain::follow::Header> {
+        self.parts.read().await.get(&chain)?.head
+    }
+
+    /// How long between refreshes of `chain`'s record.
+    pub fn refresh_every(&self, chain: Chain) -> Option<Duration> {
+        Some(self.reader(chain)?.refresh_every())
+    }
+
+    /// Observe `plan` on an EVM chain at `at`, apart from the record's own
+    /// reads (a route's: a portfolio's balances, say).
+    pub async fn observe(
+        &self,
+        chain: Chain,
+        plan: &chain::follow::Plan,
+        at: chain::follow::At,
+    ) -> Result<chain::follow::Observed> {
+        let reader = self
+            .reader(chain)
+            .ok_or_else(|| anyhow::anyhow!("{chain} is not connected"))?;
+        let Source::Evm { routes, .. } = &reader.source else {
+            anyhow::bail!("{chain} is not an EVM chain");
         };
-        solana::cost(&*history.read().await, vault, owner)
+        routes.lock().await.observe(plan, at).await
     }
 
     /// Take a health report if the key that signed it is blessed for the
@@ -691,7 +872,29 @@ impl Indexer {
             tracing::warn!(%vault, "a health report whose signature is not its key's");
             return HealthVerdict::NotBlessed;
         };
-        match solana_blessed_executor(&served, &vault, &signer).await {
+        // Judged by the blessing as the record last read it, when the record
+        // has read it within a refresh or two; otherwise read of the cluster
+        // once, and read with the record from then on.
+        let known = self.reader(chain).and_then(|reader| {
+            let fresh_within = reader.refresh_every().saturating_mul(2)
+                + Duration::from_millis(reader.policy.read_budget_ms);
+            if let Source::Solana { asked, .. } = &reader.source {
+                asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((vault, signer));
+            }
+            let parts = self.parts.try_read().ok()?;
+            let part = parts.get(&chain)?;
+            (part.read_at.elapsed() <= fresh_within)
+                .then(|| part.blessed.get(&(vault, signer)).copied())
+                .flatten()
+        });
+        let blessed = match known {
+            Some(blessed) => Ok(blessed),
+            None => solana_blessed_executor(&served, &vault, &signer).await,
+        };
+        match blessed {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(%vault, %signer, "a health report from a key this vault has not blessed as its executor");
@@ -736,9 +939,11 @@ impl Indexer {
         self.signed.read().await.get(&(chain, vault)).cloned()
     }
 
-    /// Keep reading, every couple of seconds, for as long as the process
-    /// runs: each chain, and the queue, on a loop of its own, so a slow one
-    /// holds back no other. A chain is taken up as soon as it connects.
+    /// Keep reading for as long as the process runs: each chain, and the
+    /// queue, on a loop of its own, so a slow one holds back no other. A
+    /// chain is read every `record_refresh_ms` (`solana_record_refresh_ms`
+    /// for a Solana cluster), and a moment apart ([`CATCHING_UP_PAUSE`])
+    /// while it catches up with its history. A chain is taken up as soon as it connects.
     pub async fn run(&self) {
         use futures::StreamExt;
 
@@ -759,8 +964,16 @@ impl Indexer {
                 if started.insert(reader.vault_chain) {
                     running.push(Box::pin(async move {
                         loop {
-                            self.refresh_chain(&reader).await;
-                            tokio::time::sleep(PAUSE).await;
+                            let started = Instant::now();
+                            let again = self.refresh_chain(&reader).await;
+                            if again {
+                                tokio::time::sleep(CATCHING_UP_PAUSE).await;
+                                continue;
+                            }
+                            tokio::time::sleep(
+                                reader.refresh_every().saturating_sub(started.elapsed()),
+                            )
+                            .await;
                         }
                     }));
                 }
@@ -773,9 +986,7 @@ impl Indexer {
     }
 
     /// Read everything again, once: every chain and the queue together, each
-    /// part written into the snapshot as soon as it is in. It is cheap enough
-    /// to do often and simple enough to be obviously correct, which matters
-    /// more here than being clever.
+    /// part written into the snapshot as soon as it is in.
     pub async fn refresh(&self) -> Result<()> {
         let readers = self.readers();
         let chains =
@@ -784,13 +995,15 @@ impl Indexer {
         Ok(())
     }
 
-    /// Read one chain again and put its part of the snapshot in place. A
-    /// chain that can't be read keeps its last part, dated as it was. A read
-    /// that found every vault on it stale (a vault never read whole among
-    /// them) is put in place too, each vault marked, but is not taken for a
-    /// read of the chain: its health says so once that has lasted (see
-    /// [`Indexer::health_at`]).
-    async fn refresh_chain(&self, reader: &Reader) {
+    /// Read one chain again and put its part of the snapshot in place, and
+    /// whether to read it again at once (its history is still being read).
+    /// A chain that can't be read keeps its last part, dated as it was. A
+    /// read that found every vault on it stale (a vault never read whole
+    /// among them) is put in place too, each vault marked, but is not taken
+    /// for a read of the chain: its health says so once that has lasted (see
+    /// [`Indexer::health_at`]). Nor is a read of a chain whose history is
+    /// still being read: it is put in place marked as catching up.
+    async fn refresh_chain(&self, reader: &Reader) -> bool {
         let health = self.health.read().await.clone();
         match self.read_one(reader, &health).await {
             Ok(read) => {
@@ -799,18 +1012,24 @@ impl Indexer {
                         .strategies
                         .iter()
                         .all(|strategy| strategy.stale_as_of.is_some());
+                let catching_up = read.info.catching_up;
                 reader
                     .every_vault_stale
                     .store(every_vault_stale, std::sync::atomic::Ordering::SeqCst);
+                reader
+                    .catching_up
+                    .store(catching_up, std::sync::atomic::Ordering::SeqCst);
                 self.parts.write().await.insert(reader.vault_chain, read);
-                if !every_vault_stale {
+                if !every_vault_stale && !catching_up {
                     *reader.read_at.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Instant::now());
                 }
                 self.compose().await;
+                catching_up
             }
             Err(error) => {
                 tracing::warn!(chain = %reader.key, error = format!("{error:#}"), "could not read this chain");
+                false
             }
         }
     }
@@ -989,8 +1208,10 @@ impl Indexer {
             let read_at = *reader.read_at.lock().unwrap_or_else(|e| e.into_inner());
             let since = read_at.unwrap_or(reader.connected);
             let quiet = now.saturating_duration_since(since);
-            if quiet > STALE_AFTER {
-                let what = if reader
+            if quiet > reader.stale_after() {
+                let what = if reader.catching_up.load(std::sync::atomic::Ordering::SeqCst) {
+                    format!("catching up, not current for {} min", quiet.as_secs() / 60)
+                } else if reader
                     .every_vault_stale
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
@@ -1037,76 +1258,70 @@ impl Indexer {
         reader: &Reader,
         health: &HashMap<(Chain, ChainAddress), Health>,
     ) -> Result<Read> {
-        let (served, history) = match &reader.source {
-            Source::Evm { served, history } => (served, history),
-            Source::Solana { served, history } => {
+        let (served, record) = match &reader.source {
+            Source::Evm { served, record, .. } => (served, record),
+            Source::Solana {
+                served, history, ..
+            } => {
                 return self.read_solana(reader, served, history, health).await;
             }
         };
-        let chain = &served.client;
-        let (head, now) = chain.head_and_time().await?;
         let health: HashMap<Address, Health> = health
             .iter()
             .filter(|((on, _), _)| *on == served.vault_chain)
             .filter_map(|((_, vault), report)| Some((Address::from(vault.evm()?), report.clone())))
             .collect();
-
-        let mut history = history.write().await;
-        let strategies = read::strategies(
-            chain,
-            served.vault_chain,
-            &served.deployments,
-            &self.store,
-            &mut history,
-            &health,
-            head,
-            now,
-        )
-        .await?;
+        let refreshed = match record.lock().await.refresh(&self.store, &health).await {
+            Refresh::Read(refreshed) => *refreshed,
+            Refresh::Skipped(why) => anyhow::bail!("{why}"),
+        };
+        let last = self.parts.read().await.get(&served.vault_chain).cloned();
         // Authors that can't be read leave the authors as last read, and hold
-        // up nothing else of the chain's.
-        let authors = match read::authors(chain, &served.deployments).await {
-            Ok(authors) => authors
+        // up nothing else of the chain's; so do the terms.
+        let authors = match refreshed.authors {
+            Some(authors) => authors
                 .into_iter()
                 .map(|(address, author)| (ChainAddress::Evm(address.0.0), author))
                 .collect(),
-            Err(error) => {
-                tracing::warn!(chain = %served.key, %error, "could not read the authors; kept them as last read");
-                self.parts
-                    .read()
-                    .await
-                    .get(&served.vault_chain)
-                    .map(|read| read.authors.clone())
-                    .unwrap_or_default()
-            }
+            None => last
+                .as_ref()
+                .map(|read| read.authors.clone())
+                .unwrap_or_default(),
         };
-        let feed = read::feed(
-            chain,
-            served.vault_chain,
-            &served.deployments,
-            &mut history,
-            head,
-            &strategies,
-        )
-        .await;
-        let trades = strategies
-            .iter()
-            .map(|strategy| read::trade_count(&history, strategy))
-            .sum();
-        drop(history);
+        let terms = match refreshed.terms {
+            Some(terms) => Some((terms, refreshed.head.timestamp)),
+            None => last.as_ref().and_then(|read| read.terms.clone()),
+        };
+        let costs = Costs::from_vaults(refreshed.costs.into_iter().map(|(vault, holders)| {
+            (
+                ChainAddress::Evm(vault.0.0),
+                holders
+                    .into_iter()
+                    .map(|(owner, paid)| (ChainAddress::Evm(owner.0.0), paid))
+                    .collect(),
+            )
+        }));
+        let now = refreshed.head.timestamp;
         Ok(Read {
             info: ChainInfo {
                 chain: served.vault_chain,
                 key: reader.key.to_string(),
-                chain_id: Some(chain.chain_id),
-                block: head,
-                as_of: Some(read::moment(now)),
+                chain_id: Some(served.client.chain_id),
+                block: refreshed.through,
+                as_of: refreshed.through_time.map(read::moment),
+                catching_up: refreshed.catching_up,
             },
             now,
-            strategies,
-            trades,
+            strategies: refreshed.strategies,
+            trades: refreshed.trades,
             authors,
-            feed,
+            feed: refreshed.feed,
+            head: Some(refreshed.head),
+            terms,
+            payments: refreshed.payments.map(|count| (count, Instant::now())),
+            costs: Arc::new(costs),
+            blessed: Arc::default(),
+            read_at: Instant::now(),
         })
     }
 
@@ -1119,9 +1334,6 @@ impl Indexer {
         history: &RwLock<solana::History>,
         health: &HashMap<(Chain, ChainAddress), Health>,
     ) -> Result<Read> {
-        let client = &served.client;
-        let slot = client.rpc.slot().await?;
-        let now = client.now().await?;
         let health: HashMap<chain::solana::Pubkey, Health> = health
             .iter()
             .filter(|((on, _), _)| *on == served.vault_chain)
@@ -1132,23 +1344,58 @@ impl Indexer {
                 ))
             })
             .collect();
+        let asked = match &reader.source {
+            Source::Solana { asked, .. } => asked.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            Source::Evm { .. } => Default::default(),
+        };
         let mut history = history.write().await;
-        let read = solana::read(served, &self.store, &mut history, &health, now).await?;
+        let read = solana::read(
+            served,
+            &self.store,
+            &mut history,
+            &health,
+            &asked,
+            Duration::from_millis(reader.policy.solana_rescan_ms),
+            usize::try_from(reader.policy.solana_history_transactions).unwrap_or(usize::MAX),
+        )
+        .await?;
         drop(history);
         let feed = solana::feed(served.vault_chain, &read.strategies);
+        let costs = Costs::from_vaults(read.costs.into_iter().map(|(vault, holders)| {
+            (
+                ChainAddress::Solana(vault.to_bytes()),
+                holders
+                    .into_iter()
+                    .map(|(owner, paid)| (ChainAddress::Solana(owner.to_bytes()), paid.max(0.0)))
+                    .collect(),
+            )
+        }));
+        let last_terms = self
+            .parts
+            .read()
+            .await
+            .get(&served.vault_chain)
+            .and_then(|read| read.terms.clone());
         Ok(Read {
             info: ChainInfo {
                 chain: served.vault_chain,
                 key: reader.key.to_string(),
                 chain_id: None,
-                block: slot,
-                as_of: Some(read::moment(now)),
+                block: read.slot,
+                as_of: Some(read::moment(read.now)),
+                catching_up: read.catching_up,
             },
-            now,
+            now: read.now,
             strategies: read.strategies,
             trades: 0,
             authors: read.authors,
             feed,
+            head: None,
+            terms: read.terms.map(|terms| (terms, read.now)).or(last_terms),
+            payments: read.payments.map(|count| (count, Instant::now())),
+            costs: Arc::new(costs),
+            blessed: Arc::new(read.blessed),
+            read_at: Instant::now(),
         })
     }
 
@@ -1259,12 +1506,13 @@ impl Indexer {
         else {
             return jobs;
         };
+        let now = Instant::now();
         let mut unsettled: Vec<(Option<Instant>, Job)> = {
             let completions = self.completions();
             jobs.iter()
                 .filter_map(|job| {
                     let completion = completions.get(&(job.chain, job.id.clone()));
-                    if completion.is_some_and(|was| settled(&was.job)) {
+                    if completion.is_some_and(|was| settled(&was.job) || !was.due(now)) {
                         return None;
                     }
                     Some((completion.map(|was| was.at), job.clone()))
@@ -1273,31 +1521,78 @@ impl Indexer {
         };
         // Never completed first, then the longest since it was completed.
         unsettled.sort_by_key(|(at, _)| *at);
-        let reads =
-            futures::stream::iter(unsettled).for_each_concurrent(JOBS_AT_ONCE, |(_, job)| async {
-                let key = (job.chain, job.id.clone());
-                let read = async {
-                    match &reader.source {
-                        Source::Evm { served, .. } => {
-                            read::job(&served.client, &served.deployments, &self.store, job).await
-                        }
-                        Source::Solana { served, .. } => {
-                            solana::job(served, &self.store, job).await
+        match &reader.source {
+            // The jobs' reads in observations of the chain, a few jobs to
+            // each (one batched call where the chain's endpoint runs the
+            // view helper), until the refresh's time for them runs out: a
+            // slow chain leaves the rest as last completed, to be read first
+            // next time, and holds up nothing else.
+            Source::Evm { served, routes, .. } => {
+                let deployments = &served.deployments;
+                let deadline = tokio::time::Instant::now() + JOB_READS;
+                for chunk in unsettled.chunks(JOBS_AT_ONCE) {
+                    let mut plan = chain::follow::Plan::default();
+                    for (_, job) in chunk {
+                        for (target, data) in read::job_reads(deployments, job) {
+                            if !plan
+                                .reads
+                                .iter()
+                                .any(|read| read.target == target && read.data == data)
+                            {
+                                plan.reads.push(chain::follow::Read { target, data });
+                            }
                         }
                     }
-                };
-                if let Ok(Ok(job)) = tokio::time::timeout(JOB_READ, read).await {
-                    self.completions().insert(
-                        key,
-                        Completion {
-                            job,
-                            at: Instant::now(),
-                        },
-                    );
+                    let observed = tokio::time::timeout_at(deadline, async {
+                        routes
+                            .lock()
+                            .await
+                            .observe(&plan, chain::follow::At::Latest)
+                            .await
+                    })
+                    .await;
+                    let observed = match observed {
+                        Ok(Ok(observed)) => observed,
+                        Ok(Err(error)) => {
+                            tracing::debug!(chain = %reader.key, error = format!("{error:#}"), "the jobs could not be read; the rest next time");
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::debug!(chain = %reader.key, "completed part of this chain's jobs, the rest next time");
+                            break;
+                        }
+                    };
+                    let answers: HashMap<views::Key, chain::follow::Item> = plan
+                        .reads
+                        .iter()
+                        .zip(observed.items)
+                        .map(|(read, item)| ((read.target, read.data.clone()), item))
+                        .collect();
+                    let facts = views::Facts::new();
+                    let views = views::Views::new(&answers, &facts);
+                    for (_, job) in chunk {
+                        let key = (job.chain, job.id.clone());
+                        if let Ok(job) = read::job(&views, deployments, &self.store, job.clone()) {
+                            self.completed_now(key, job);
+                        }
+                    }
                 }
-            });
-        if tokio::time::timeout(JOB_READS, reads).await.is_err() {
-            tracing::debug!(chain = %reader.key, "completed part of this chain's jobs, the rest next time");
+            }
+            Source::Solana { served, .. } => {
+                let reads = futures::stream::iter(unsettled).for_each_concurrent(
+                    JOBS_AT_ONCE,
+                    |(_, job)| async {
+                        let key = (job.chain, job.id.clone());
+                        let read = solana::job(served, &self.store, job);
+                        if let Ok(Ok(job)) = tokio::time::timeout(JOB_READ, read).await {
+                            self.completed_now(key, job);
+                        }
+                    },
+                );
+                if tokio::time::timeout(JOB_READS, reads).await.is_err() {
+                    tracing::debug!(chain = %reader.key, "completed part of this chain's jobs, the rest next time");
+                }
+            }
         }
         let completions = self.completions();
         jobs.into_iter()
@@ -1306,6 +1601,22 @@ impl Indexer {
                 None => job,
             })
             .collect()
+    }
+
+    /// Keep what a job's chain added to it, read just now.
+    fn completed_now(&self, key: (Chain, String), job: Job) {
+        let mut completions = self.completions();
+        let tries = completions
+            .get(&key)
+            .map_or(0, |was| was.tries.saturating_add(1));
+        completions.insert(
+            key,
+            Completion {
+                job,
+                at: Instant::now(),
+                tries,
+            },
+        );
     }
 
     fn completions(&self) -> std::sync::MutexGuard<'_, HashMap<(Chain, String), Completion>> {
@@ -1477,11 +1788,13 @@ const JOB_READS: Duration = Duration::from_secs(5);
 /// How many of one chain's jobs are completed at once.
 const JOBS_AT_ONCE: usize = 8;
 
-/// How long between reads of each chain.
-const PAUSE: Duration = Duration::from_secs(2);
+/// The pause between two refreshes of a chain whose history is still being
+/// read: the least any poll waits.
+const CATCHING_UP_PAUSE: Duration = Duration::from_millis(250);
 
-/// How long a chain may go unread before its health says so: well past a
-/// slow read, and far short of a record anyone would trust.
+/// How long a chain may go unread before its health says so with the
+/// checked-in settings (`record_stale_ms`): well past a slow read, and far
+/// short of a record anyone would trust.
 pub const STALE_AFTER: Duration = Duration::from_secs(3 * 60);
 
 /// The longest first line a health route gives: a dashboard shows it in a

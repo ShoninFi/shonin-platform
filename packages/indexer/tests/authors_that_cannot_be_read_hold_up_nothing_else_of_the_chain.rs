@@ -8,32 +8,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chain::bindings::profiles::IAuthorProfiles;
-use serde_json::json;
 use stand_in::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authors_that_cannot_be_read_hold_up_nothing_else_of_the_chain() {
     let later = Arc::new(AtomicBool::new(false));
     let flag = later.clone();
-    let indexer = an_indexer(
+    let chain = Chain::at(0x10);
+    let indexer = an_indexer_on(
+        chain.clone(),
+        deployments(),
         Arc::new(move |request| {
             let later = flag.load(Ordering::SeqCst);
-            let head: u64 = if later { 0x20 } else { 0x10 };
             match request["method"].as_str().unwrap_or_default() {
-                "eth_blockNumber" => Some(Ok(json!(format!("0x{head:x}")))),
-                "eth_getBlockByNumber" => {
-                    let mut block =
-                        alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = head;
-                    block.header.inner.timestamp = 1_790_000_000 + head;
-                    Some(Ok(serde_json::to_value(block).unwrap()))
-                }
                 "eth_call"
                     if later
                         && input(request)
                             .starts_with(&selector::<IAuthorProfiles::profileOfCall>()) =>
                 {
-                    Some(Err("a node hiccup".to_string()))
+                    Some(Err(format!(
+                        "{REVERTED}: a read the profiles do not answer"
+                    )))
                 }
                 _ => None,
             }
@@ -50,6 +45,7 @@ async fn authors_that_cannot_be_read_hold_up_nothing_else_of_the_chain() {
     }
 
     later.store(true, Ordering::SeqCst);
+    chain.head.store(0x20, Ordering::SeqCst);
     indexer.refresh().await.unwrap();
     let snapshot = indexer.snapshot.read().await;
     assert_eq!(
