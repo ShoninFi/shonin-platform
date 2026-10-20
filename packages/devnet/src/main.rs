@@ -5,9 +5,10 @@
 //! real time, and plays the market each venue quotes. Everything else on the
 //! platform reads the files it writes and talks to the chains it prepared.
 //!
-//! On the testnets it deploys and seeds the same stand-in stack, signed by the
-//! accounts the developer's mnemonic derives, and drives nothing: the chains
-//! keep their own time. It never deploys to mainnet ([`MAINNET_MISSING`]).
+//! On the testnets it deploys the same platform in each chain's own dollar,
+//! with no stand-ins, signed by the accounts the developer's mnemonic derives,
+//! and drives nothing: the chains keep their own time and their real venues'
+//! markets. It never deploys to mainnet ([`MAINNET_MISSING`]).
 //!
 //! On any network it serves the ops dashboard on its port: what is running,
 //! locally and in the cloud.
@@ -249,9 +250,9 @@ enum Command {
         on_fork: bool,
     },
     /// Top a person's own wallet up on the testnets, to try the app's money
-    /// flows with it: the stand-in dollar (minted by the funder on an EVM
-    /// chain, by the admin on Solana, into the wallet's dollar account), and
-    /// with `--gas` the chain's coin up to the funding file's `default`,
+    /// flows with it: the chain's dollar where anyone may mint it (minted
+    /// by the funder; a faucet's dollar is left to its faucet), and with
+    /// `--gas` the chain's coin up to the funding file's `default`,
     /// from the chain's funder and never past its reserve. An EVM address is
     /// funded on every EVM chain of the network, a Solana one on its
     /// cluster, or only `--vault-chain`'s. Safe to run again; testnet only.
@@ -347,26 +348,13 @@ enum Command {
         #[arg(long, default_value_t = seed::TAKE_ON_SECONDS)]
         take_on_seconds: u64,
     },
-    /// On a testnet, play the stand-in venue's market in real time, signed
-    /// by the operator from the mnemonic (never from the cloud): every
-    /// `--every-minutes` one post of both markets' prices and the funding
-    /// accrued since the last, from a tape like bitcoin's (spot about 0.6%
-    /// an hour, funding about 10% a year with rare lulls), minting the venue
-    /// whatever its accounts are owed beyond what it holds. It starts from
-    /// the venue's prices as they stand, so it can be stopped and started
-    /// again. Every EVM chain of the network and its Solana cluster once set
-    /// up (the admin keeping the venue's reserves there) at once, or
-    /// `--vault-chain`'s.
-    Market {
-        #[arg(long, default_value_t = 10)]
-        every_minutes: u64,
-    },
     /// A demonstration that pays its own way, on the vault chain: a fresh
     /// vault for the agent (published again, or a strategy published with
     /// `--publish-only` and never activated), activated at the modest
     /// allowances with its tank filled to and kept at `--tank-days` of the
     /// daily cap by auto-fill, a depositor's money in and at work, then left
-    /// running. Needs the market operator (`market`) posting.
+    /// running. On a local chain the stand-in venue's market runs with the
+    /// chain; on a public cluster the agent trades the real venue.
     Demo {
         /// Where the API is answering. Not needed with `--strategy`.
         #[arg(long, default_value = "")]
@@ -455,7 +443,6 @@ async fn main() -> Result<()> {
                 | Command::AllowDevChecker
                 | Command::ClearRootKey
                 | Command::HyperliquidVaults { .. }
-                | Command::Market { .. }
                 | Command::Demo { .. }
                 | Command::MigrateStations { dry_run: false }
         )
@@ -1016,118 +1003,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::Market { every_minutes }) => {
-            if target.network != NetworkName::Testnet {
-                bail!(
-                    "the market operator is for the testnets: the local chain's market runs with the chain"
-                );
-            }
-            let every = std::time::Duration::from_secs(every_minutes.max(1) * 60);
-            let mut running = tokio::task::JoinSet::new();
-            // Each Solana cluster set up, on its own as the EVM chains are.
-            for (key, config) in only(&target, one, solana_clusters(&target)) {
-                let file = Deployments::file_in(&target.deployments_dir, &key);
-                let set_up = std::fs::read_to_string(&file)
-                    .ok()
-                    .and_then(|text| chain::SolanaDeployments::from_json(&text).ok())
-                    .filter(|deployments| deployments.roles.is_some());
-                let Some(deployments) = set_up else {
-                    tracing::info!(chain = %key, "not set up yet: no market on it");
-                    continue;
-                };
-                let network = target.network;
-                running.spawn(async move {
-                    loop {
-                        let ran = async {
-                            let client = chain::connect_solana(network, &key, &config).await?;
-                            client.check_deployments(&deployments).await?;
-                            let served = chain::SolanaServed {
-                                vault_chain: shared::Chain::Solana,
-                                key: key.clone(),
-                                platform: chain::solana::Platform::from_deployments(&deployments)?,
-                                client,
-                                deployments: deployments.clone(),
-                                public_rpc: config.rpc.clone(),
-                            };
-                            solana_testnet::operate(&served, every).await
-                        }
-                        .await;
-                        // It ends only where there is nothing to operate.
-                        let Err(error) = ran else { return Ok(()) };
-                        let error =
-                            for_this_build(network, error).context(format!("the market on {key}"));
-                        if !market::worth_restarting(&error) {
-                            return Err::<(), _>(error);
-                        }
-                        tracing::warn!(
-                            error = format!("{error:#}"),
-                            "the market operator stopped on this cluster; it starts again shortly"
-                        );
-                        tokio::time::sleep(market::RESTART_AFTER).await;
-                    }
-                });
-            }
-            for (key, config) in only(&target, one, evm_chains(&target)) {
-                let network = target.network;
-                let file = Deployments::file_in(&target.deployments_dir, &key);
-                // A public test network's deployment has no stand-in venue:
-                // nothing to play there (testnet-market keeps its real pools).
-                let without_stand_ins = std::fs::read_to_string(&file)
-                    .ok()
-                    .and_then(|text| serde_json::from_str::<Deployments>(&text).ok())
-                    .is_some_and(|deployments| !deploy::has_stand_ins(&deployments));
-                if without_stand_ins {
-                    tracing::info!(chain = %key, "no stand-in venue on this chain: no market on it");
-                    continue;
-                }
-                // Each chain on its own: one whose endpoint is down, or that
-                // stops, is started again after a pause, and holds up none
-                // of the others.
-                running.spawn(async move {
-                    loop {
-                        let ran = async {
-                            let client = connect_to(network, &key, &config).await?;
-                            let deployments =
-                                client.deployments(&file).await.with_context(|| {
-                                    format!("no deployment on {key}: run chains:deploy first")
-                                })?;
-                            market::operate(
-                                &client,
-                                &deployments,
-                                every,
-                                market::TapeParams::TESTNET,
-                            )
-                            .await
-                        }
-                        .await;
-                        let Err(error) = ran else { continue };
-                        let error = error.context(format!("the market on {key}"));
-                        if !market::worth_restarting(&error) {
-                            return Err::<(), _>(error);
-                        }
-                        tracing::warn!(
-                            error = format!("{error:#}"),
-                            "the market operator stopped on this chain; it starts again shortly"
-                        );
-                        tokio::time::sleep(market::RESTART_AFTER).await;
-                    }
-                });
-            }
-            let mut failed = None;
-            while let Some(finished) = running.join_next().await {
-                let error = match finished {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(error)) => error,
-                    Err(error) => anyhow::Error::new(error),
-                };
-                tracing::error!(
-                    error = format!("{error:#}"),
-                    "a chain's market operator stopped for good"
-                );
-                failed.get_or_insert(error);
-            }
-            failed.map_or(Ok(()), Err)
-        }
         Some(Command::Demo {
             api,
             agents,
@@ -1211,11 +1086,7 @@ async fn main() -> Result<()> {
                     coin_usd,
                     billed_coin_usd: target.config.native_usd.unwrap_or(0.0),
                     carry_share,
-                    mean_funding: if local {
-                        market::TapeParams::LOCAL.funding_mean()
-                    } else {
-                        market::TESTNET_MEAN_FUNDING
-                    },
+                    mean_funding: market::TapeParams::LOCAL.funding_mean(),
                     json,
                 },
             )
@@ -1773,11 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn the_market_demo_and_economics_commands_parse() {
-        let Some(Command::Market { every_minutes }) = parse(&["market"]).unwrap().command else {
-            panic!("not the market");
-        };
-        assert_eq!(every_minutes, 10);
+    fn the_demo_and_economics_commands_parse() {
         let Some(Command::Demo {
             agent,
             deposit,

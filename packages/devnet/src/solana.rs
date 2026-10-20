@@ -478,12 +478,8 @@ pub async fn set_up_public(
     };
 
     let short = fund(client, keys, &settings.funding).await?;
-    // The admin and the operator sign the set-up: nothing goes on without
-    // them.
-    if let Some(role) = short
-        .iter()
-        .find(|role| matches!(role, Role::Admin | Role::Operator))
-    {
+    // The admin signs the set-up: nothing goes on without it.
+    if let Some(role) = short.iter().find(|role| matches!(role, Role::Admin)) {
         bail!(
             "the deployer can't give the {} its amount past its reserve: fund the deployer ({}) and run this again",
             role.label(),

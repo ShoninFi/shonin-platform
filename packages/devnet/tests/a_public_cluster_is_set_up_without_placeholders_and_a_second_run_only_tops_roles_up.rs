@@ -450,13 +450,15 @@ async fn a_public_cluster_is_set_up_without_placeholders_and_a_second_run_only_t
     client.check_deployments(&written).await.unwrap();
 
     // Every role funded by transfer to exactly its amount; the platform and
-    // the attestor, given none, hold none.
+    // the attestor, given none, hold none, and nor does the stand-in venue's
+    // operator, which the default never covers on a public cluster.
     for (role, amount) in [
         (Role::Keeper, 2 * LAMPORTS_PER_SOL),
         (Role::Viewer, LAMPORTS_PER_SOL / 5),
         (Role::Builder, LAMPORTS_PER_SOL / 5),
         (Role::Platform, 0),
         (Role::Attestor, 0),
+        (Role::Operator, 0),
     ] {
         assert_eq!(
             client.lamports(&team.address(role)).await.unwrap(),

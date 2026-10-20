@@ -194,7 +194,7 @@ tasks:
         {{if .TRADE_MINUTES}}--trade-minutes {{.TRADE_MINUTES}}{{end}}
 
   fund-wallet:
-    desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the stand-in dollar (minted on each EVM chain for a 0x address, on Solana devnet for a Solana one), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
+    desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the chain's dollar where anyone may mint it (the Robinhood Chain testnet's USDG, by the funder; Circle's USDC comes from its faucet alone), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
     requires:
       vars: [ADDRESS]
     cmds:
@@ -209,11 +209,6 @@ tasks:
     desc: "Clear the root key's record on the network's canonical chain, as the admin, and print the signer cleared: for a root that is lost (its executor replaced) or to rotate it. That signer is refused for good; the executor then makes a new root and the keeper records it, and everything sealed to the old one must be sealed again (NETWORK=testnet)"
     cmds:
       - "{{.DEVNET}} clear-root-key"
-
-  market:
-    desc: "On the testnets, play the stand-in venue's market in real time as its operator, signed from the mnemonic on this machine (never in the cloud): every EVERY_MINUTES (10 by default) one post per chain of both markets' prices and the funding accrued since the last, from a tape like bitcoin's (spot about 0.6% an hour; funding about 10% a year, near 0.000295 a day outside a lull, sinking towards nothing for 8 hours about once every 4 days), minting the venue whatever its accounts are owed beyond what it holds (on Solana, the admin keeping the venue's reserves at what the set-up gave them). Resumable: it starts from the venue's prices. Every EVM testnet and the Solana cluster once set up, or VAULT_CHAIN=<name>; logs each post's gas and the coin a day it comes to (NETWORK=testnet)"
-    cmds:
-      - "{{.DEVNET_SOLANA}} {{.VAULT_CHAIN_ARG}} market {{if .EVERY_MINUTES}}--every-minutes {{.EVERY_MINUTES}}{{end}}"
 
   smoke:
     desc: "The smoke check a deploy ends with, read-only: each EVM chain's deployment read back from the chain (or only VAULT_CHAIN=<name>'s), and with API=<url> the API's health, each of those chains served with a fresh reading, and a vault priced (ALLOW_NO_VAULT=1 before any is). Fails if any check does (local, or NETWORK=testnet)"

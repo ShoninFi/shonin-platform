@@ -80,22 +80,21 @@ task services:seed VAULT_CHAIN=solana AGENT=funding-basis   # one agent through 
 
 ### The testnets
 
-The same stand-in stack deploys to the public testnets (Base Sepolia, Hyperliquid testnet, Robinhood Chain testnet, Solana devnet). There the roles are accounts derived from mnemonics you hold in `.env`, `SHONIN_TESTNET_EVM_MNEMONIC` and `SHONIN_TESTNET_SOLANA_MNEMONIC`, in the same order as the local ones, and the image timelock is zero.
+The same platform deploys to the public testnets (Base Sepolia, Hyperliquid testnet, Robinhood Chain testnet, Solana devnet), in each chain's own dollar and with no stand-ins: agents there trade real venues, whose pools `testnet-market` keeps at the feeds' prices. There the roles are accounts derived from mnemonics you hold in `.env`, `SHONIN_TESTNET_EVM_MNEMONIC` and `SHONIN_TESTNET_SOLANA_MNEMONIC`, in the same order as the local ones, and the image timelock is zero.
 
 ```bash
 task chains:accounts NETWORK=testnet          # every role's address and gas: fund these from the faucets
 task chains:deploy NETWORK=testnet            # deploy to every EVM testnet
 task contracts:solana:deploy NETWORK=testnet  # deploy the programs to Solana devnet
-task chains:solana-setup NETWORK=testnet      # set them up: roles funded from the deployer, the dollar, markets, project
+task chains:solana-setup NETWORK=testnet      # set them up: roles funded from the deployer, configs in Circle's USDC, project
 task chains:solana-migrate-stations NETWORK=testnet  # after upgrading the station program: rewrite older stations (DRY_RUN=1 lists them)
 NETWORK=testnet task dev:services             # run everything here, against them
-task chains:market NETWORK=testnet            # post the stand-in venues' prices and funding, Solana's too
-task services:seed NETWORK=testnet VAULT_CHAIN=solana AGENT=funding-basis PUBLISH_ONLY=1 API_URL=<api>
+task services:seed NETWORK=testnet VAULT_CHAIN=solana AGENT=mm-quoter PUBLISH_ONLY=1 API_URL=<api>
 ```
 
-On Solana the seed publishes `funding-basis/solana` (an agent's own Solana copy, where it has one) through the API and the cloud build service and reviewer, paying from the author's dollar account; then `STRATEGY=<id>` activates the vault, deposits, waits for the agent's work at the stand-in venue, and books a claim the keeper pays, reading each back from the cluster. `task services:demo NETWORK=testnet VAULT_CHAIN=solana` leaves a fresh vault running with auto-fill, as on an EVM testnet.
+On Solana the seed publishes an agent (its own Solana copy, such as `mm-quoter/solana`, where it has one) through the API and the cloud build service and reviewer, paying from the author's dollar account, which holds Circle's devnet USDC from its faucet. `task services:demo NETWORK=testnet VAULT_CHAIN=solana STRATEGY=<id>` then leaves a fresh vault running with auto-fill. The seed's live part (`LIVE=1`, `STRATEGY=<id>` on `services:seed`), which books a claim at the stand-in venue, runs on the local chains only.
 
-The testnets keep their own time, so nothing drives their clocks, and only the market operator (`task chains:market`, on this machine) moves their stand-in venues' prices. **Mainnet refuses**: these tasks deploy the stand-in stack (a mintable dollar, a stand-in venue, the development attestation verifier), which is for local chains and testnets only.
+The testnets keep their own time and their venues' own markets, so nothing here drives either. **Mainnet refuses**: these tasks are for local chains and testnets only.
 
 ### Chains and networks
 

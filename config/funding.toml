@@ -1,7 +1,9 @@
 # What `task chains:fund NETWORK=testnet` tops each role account up to, in the
 # chain's own coin, from the funder (the EVM mnemonic's account
 # m/44'/60'/0'/0/100). A role already holding its amount is left alone, so the
-# task is safe to run again. `default` covers every role not named.
+# task is safe to run again. `default` covers every role not named, but for
+# the operator: it posts the stand-in venue's prices, no test network has the
+# stand-in venue, so it is never funded here (and the file may not name it).
 #
 # Each amount lasts a month or more at the role's burn, written beside it a
 # month: one run of the task a month keeps every role going, and the Testnet
@@ -37,7 +39,6 @@ default = 0.004
 admin = 0.03     # deploys and proposals only: none in the last week
 executor = 0
 keeper = 0.02    # 0.0045 a month: its sends 0.0005 (about 15 a day), the rest vault-key stakes and blessings
-operator = 0.005 # 0.0025 a month: 0.000082 a day, a post every ten minutes
 author = 0.008   # activations only: none in the last week
 market = 0.005   # about 0.0015 a month (estimated): a post and a swap each time a feed moves
 
@@ -49,7 +50,6 @@ default = 0.03
 admin = 0.4      # deploys on big blocks only: none in the last week
 executor = 0
 keeper = 0.5     # about 0.4 a month: its sends 0.008 (0.00028 a day), the rest vault-key stakes, sized by the fee estimate of the moment
-operator = 0.08  # 0.042 to 0.063 a month: 0.0014 to 0.0021 a day, a post every ten minutes
 author = 0.06    # activations only: a few a week
 
 # Robinhood Chain testnet. Its public
@@ -61,7 +61,6 @@ default = 0.0003
 admin = 0.004    # deploys and proposals only
 executor = 0
 keeper = 0.006   # about 0.003 a month (estimated): its sends 0.0015, vault-key stakes 0.0005 each
-operator = 0.005 # 0.0042 a month: 0.00014 a day, a post every ten minutes
 author = 0.001   # activations only
 market = 0.005   # about 0.003 a month (estimated): four mirror feeds' posts and the swaps after them
 
@@ -73,8 +72,7 @@ market = 0.005   # about 0.003 a month (estimated): four mirror feeds' posts and
 # into accounts: the keeper's lookup tables, the blessings it relays and the
 # vault keys it stocks (0.05 SOL each, once the registry vouches for them; a
 # handover makes one more); the author's activations (a vault, its station,
-# their dollar accounts); the operator's market listings and its posts every
-# ten minutes. The executor, the platform and the attestor sign no
+# their dollar accounts). The executor, the platform and the attestor sign no
 # transaction there: the executor's keys are made in the enclave and stocked
 # by the keeper.
 #
@@ -87,7 +85,6 @@ market = 0.005   # about 0.003 a month (estimated): four mirror feeds' posts and
 reserve = 1
 default = 0.2
 admin = 0.5      # deploys and set-ups only
-operator = 0.25  # about 0.03 a month: some 150 signatures a day, and its listings' rent
 keeper = 2       # about 0.3 a month: some 20 signatures a day, lookup tables, 0.05 for each vault key stocked
 executor = 0
 author = 1       # activations' rent only
@@ -98,10 +95,12 @@ market = 3       # about 1.2 held once (its seed's SOL side and tick arrays), an
 # On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on
 # HyperEVM, so the task buys HYPE on HyperCore's spot market and sends it to
 # HyperEVM itself, never paying more than `max_price` dollars a HYPE or buying
-# more than `max_per_run` HYPE in one run. The deploying account (the admin)
+# more than `max_per_run` HYPE in one run. The cap only guards testnet play
+# money against a broken book: it sits well above where testnet HYPE trades,
+# so a top-up isn't refused when the price moves. The deploying account (the admin)
 # is given `activation_usd` on HyperCore so it exists there, and switched to
 # big blocks, since some contracts are larger than a small block's 2M gas.
 [hyperliquid]
-max_price = 60.0
+max_price = 150.0
 max_per_run = 3.0
 activation_usd = 2.0

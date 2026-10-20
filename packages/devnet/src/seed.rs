@@ -296,8 +296,7 @@ pub async fn run(
     let author = client.account(Role::Author)?;
     say_who_the_author_is(client, deployments, author).await?;
 
-    let work = std::env::temp_dir().join("shonin-seed");
-    let _ = std::fs::remove_dir_all(&work);
+    let work = Scratch::new("full", vault_chain);
 
     for (index, plan) in PLAN.iter().enumerate() {
         let prepared = prepare(
@@ -346,7 +345,7 @@ pub async fn run(
         if plan.retired {
             wait_for_shares(client, vault, client.account(Role::Viewer)?).await?;
             client
-                .send(author, vault, IVault::retireCall {})
+                .send_estimated(author, vault, IVault::retireCall {})
                 .await
                 .context("the vault would not retire")?;
             tracing::info!(slug, "and then its author retired it");
@@ -496,7 +495,7 @@ pub async fn demo(
     if !more.is_zero() {
         have(client, deployments, author, more).await?;
         client
-            .send(
+            .send_estimated(
                 author,
                 deployments.usd,
                 ILocalUsd::approveCall {
@@ -506,12 +505,12 @@ pub async fn demo(
             )
             .await?;
         client
-            .send(author, vault, IVault::fundTankCall { assets: more })
+            .send_estimated(author, vault, IVault::fundTankCall { assets: more })
             .await
             .context("filling the tank")?;
     }
     client
-        .send(author, vault, IVault::setTankKeepCall { assets: keep })
+        .send_estimated(author, vault, IVault::setTankKeepCall { assets: keep })
         .await
         .context("turning auto-fill on")?;
     tracing::info!(
@@ -545,8 +544,7 @@ pub async fn demo(
         alloy::primitives::utils::format_units(keep, 6).unwrap_or_default()
     );
     println!(
-        "Keep the market operator posting (task chains:market NETWORK={}; on the local network the devnet plays it), and the services up. To watch it pay its way:",
-        demo.network
+        "Keep the devnet running (it plays the stand-in venue's market) and the services up. To watch it pay its way:"
     );
     println!(
         "  task services:economics NETWORK={} VAULT_CHAIN={} VAULT={vault}",
@@ -614,7 +612,7 @@ async fn have(
         .await?;
     if held < amount {
         client
-            .send(
+            .send_estimated(
                 who,
                 deployments.usd,
                 ILocalUsd::mintCall {
@@ -670,7 +668,7 @@ async fn at_work(
     let rate: f64 = perp.fundingRate.to_string().parse().unwrap_or(0.0);
     let mark: f64 = perp.mark.to_string().parse().unwrap_or(1.0);
     bail!(
-        "the agent of {slug} ({vault}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the market operator posting (task chains:market)? The vault is left as it is.",
+        "the agent of {slug} ({vault}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the devnet running (it plays the stand-in venue's market)? The vault is left as it is.",
         within.as_secs() / 60,
         rate / mark,
         perp.fundingUpdatedAt
@@ -688,7 +686,7 @@ async fn deposit(
 ) -> Result<()> {
     let amount = U256::from(amount);
     client
-        .send(
+        .send_estimated(
             who,
             deployments.usd,
             ILocalUsd::approveCall {
@@ -700,7 +698,7 @@ async fn deposit(
     let restricted = client.read(vault, IVault::restrictedTextCall {}).await?;
     let statement = client.sign_statement(who, vault, &restricted).await?;
     client
-        .send(
+        .send_estimated(
             who,
             vault,
             IVault::requestDepositCall {
@@ -866,7 +864,7 @@ async fn claim(
         .await?
         .to::<u64>();
     client
-        .send(
+        .send_estimated(
             leaver,
             vault,
             IVault::requestRedeemCall {
@@ -989,7 +987,7 @@ async fn nudge_the_market(client: &Client, deployments: &Deployments) -> Result<
         }
     }
     client
-        .send(
+        .send_estimated(
             operator,
             deployments.venue,
             ILocalVenue::postCall { quotes, funding },
@@ -1022,7 +1020,7 @@ async fn killed(
     }
     let admin = client.account(Role::Admin)?;
     client
-        .send(admin, vault, IVault::killCall {})
+        .send_estimated(admin, vault, IVault::killCall {})
         .await
         .context("the vault would not stop")?;
     tracing::info!(slug, "and then stopped with a depositor's money at work");
@@ -1048,7 +1046,7 @@ async fn killed(
         .read(deployments.usd, IERC20::balanceOfCall { account: viewer })
         .await?;
     client
-        .send(
+        .send_estimated(
             viewer,
             vault,
             IVault::redeemClosedCall {
@@ -1070,28 +1068,68 @@ async fn killed(
     Ok(())
 }
 
+/// A scratch folder of the seed's, its own to one run on one chain, so seeds
+/// running at once never write into each other's; it reads as the project
+/// inside it, and is removed when dropped.
+pub(crate) struct Scratch {
+    root: PathBuf,
+    project: PathBuf,
+}
+
+impl Scratch {
+    fn new(what: &str, vault_chain: shared::Chain) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "shonin-seed-{what}-{}-{}-{}",
+            vault_chain.name(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        Self {
+            project: root.clone(),
+            root,
+        }
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.project
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// A copy of the agents with `project`'s manifest naming `vault_chain` as its
-/// vault's chain, when it names another; none when it already names it.
+/// vault's chain, when it names another (read as the copied project); none
+/// when it already names it.
 pub(crate) fn on_vault_chain(
     agents: &Path,
     project: &Path,
     vault_chain: shared::Chain,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<Scratch>> {
     let manifest = std::fs::read_to_string(project.join("shonin.toml"))?;
     let Some(rewritten) = naming_vault_chain(&manifest, vault_chain) else {
         return Ok(None);
     };
-    let into = std::env::temp_dir().join(format!("shonin-seed-{}", vault_chain.name()));
-    let _ = std::fs::remove_dir_all(&into);
-    copy_tree(agents, &into)?;
+    let mut scratch = Scratch::new("moved", vault_chain);
+    copy_tree(agents, &scratch.root)?;
     let relative = project.strip_prefix(agents).unwrap_or(project);
-    let moved = into.join(relative);
-    std::fs::write(moved.join("shonin.toml"), rewritten)?;
+    scratch.project = scratch.root.join(relative);
+    std::fs::write(scratch.project.join("shonin.toml"), rewritten)?;
     tracing::info!(
         chain = vault_chain.name(),
         "the manifest names another vault chain: publishing a copy that names this one"
     );
-    Ok(Some(moved))
+    Ok(Some(scratch))
 }
 
 /// `manifest` with its vault's chain named `vault_chain`, or `None` when it
@@ -1196,7 +1234,7 @@ async fn say_who_the_author_is(
         return Ok(());
     }
     client
-        .send(
+        .send_estimated(
             author,
             deployments.profiles,
             IAuthorProfiles::setProfileCall {
@@ -1228,6 +1266,24 @@ pub(crate) fn guess_agents() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeds_run_at_once_never_share_a_work_folder_and_each_is_removed_after() {
+        let base = Scratch::new("full", shared::Chain::Base);
+        let again = Scratch::new("full", shared::Chain::Base);
+        let solana = Scratch::new("full", shared::Chain::Solana);
+        assert_ne!(base.root, again.root);
+        assert_ne!(base.root, solana.root);
+        std::fs::create_dir_all(base.join("0")).unwrap();
+        std::fs::create_dir_all(again.join("0")).unwrap();
+        let (root, other) = (base.root.clone(), again.root.clone());
+        drop(base);
+        assert!(!root.exists());
+        assert!(
+            other.join("0").exists(),
+            "the other seed's folder is left alone"
+        );
+    }
 
     #[test]
     fn the_full_seed_publishes_its_agent_naming_the_chain_it_is_seeded_on() {

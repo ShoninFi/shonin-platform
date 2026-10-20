@@ -4,13 +4,14 @@
 //! An agent is packed and uploaded to the API, paid for from the author's
 //! own dollar account, reviewed by the cloud reviewer and built and
 //! registered by the cloud build service with their own Solana keys. Its
-//! vault is then activated by its author, a depositor's money priced at a
-//! later valuation by the keeper, put to work by the agent at the stand-in
-//! venue, and all of it asked back, booking a claim the keeper serves. Each
-//! step is read back from the cluster. Nothing here signs as a service: the
-//! seed holds the author's, the depositor's and the market operator's keys,
-//! and the admin's only to mint the stand-in dollar, as anyone may on an EVM
-//! testnet.
+//! vault is then activated by its author, and a depositor's money priced at
+//! a later valuation by the keeper and put to work by the agent. On a
+//! development cluster, which has the stand-in venue, the seed's live part
+//! then asks all of it back, booking a claim the keeper serves. Each step is
+//! read back from the cluster. Nothing here signs as a service: the seed
+//! holds the author's and the depositor's keys, and, on a development
+//! cluster only, the admin's to mint the stand-in dollar and the stand-in
+//! venue's operator's to post its prices.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,7 +40,7 @@ struct Published {
 /// The agent to publish on Solana: its own Solana copy beside it
 /// (`<agent>/solana`) if it has one, or else a copy of it whose manifest names
 /// Solana as its vault chain.
-fn project_for(agents: &Path, name: &str) -> Result<(PathBuf, Option<PathBuf>)> {
+fn project_for(agents: &Path, name: &str) -> Result<(PathBuf, Option<crate::seed::Scratch>)> {
     let project = agents.join("packages/agents").join(name);
     let own = project.join(Chain::Solana.name());
     if own.join("shonin.toml").exists() {
@@ -79,6 +80,9 @@ pub async fn one(
     take_on: u64,
 ) -> Result<()> {
     let seed = Seed::new(served);
+    if live {
+        seed.require_stand_in_venue("the seed's live part").await?;
+    }
     let agents = agents_dir(agents)?;
     let (project, moved) = project_for(&agents, name)?;
     let project = moved.as_deref().unwrap_or(&project);
@@ -114,6 +118,7 @@ pub async fn one(
 /// paid, and a little of the author's left in.
 pub async fn on_strategy(served: &SolanaServed, strategy: u64, take_on: u64) -> Result<()> {
     let seed = Seed::new(served);
+    seed.require_stand_in_venue("the seed's live part").await?;
     if seed
         .platform
         .strategy(seed.client, strategy)
@@ -230,13 +235,20 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
     let shares = seed.wait_for_shares(&v, &viewer.pubkey()).await?;
     tracing::info!(slug, shares, "the deposit was priced at a later valuation");
     if !seed.at_work(&v, amount, demo.work_within, false).await? {
-        let perp = seed.perp().await?;
+        let quoted = if seed.has_stand_in_venue().await? {
+            let perp = seed.perp().await?;
+            format!(
+                " The stand-in venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002.",
+                perp.funding_rate as f64 / perp.mark.max(1) as f64,
+                perp.funding_updated_at
+            )
+        } else {
+            String::new()
+        };
         bail!(
-            "the agent of {slug} ({}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the market operator posting on Solana (task chains:market)? The vault is left as it is.",
+            "the agent of {slug} ({}) has not put the money to work within {} min.{quoted} Its log on the executor says why. The vault is left as it is.",
             v.vault,
             demo.work_within.as_secs() / 60,
-            perp.funding_rate as f64 / perp.mark.max(1) as f64,
-            perp.funding_updated_at
         );
     }
     println!("vault {}", v.vault);
@@ -246,10 +258,7 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
         demo.deposit_dollars,
         keep as f64 / 1e6
     );
-    println!(
-        "Keep the market operator posting (task chains:market NETWORK={}), and the services up.",
-        demo.network
-    );
+    println!("Keep the services up.");
     Ok(())
 }
 
@@ -505,6 +514,28 @@ impl<'a> Seed<'a> {
         )
     }
 
+    /// Whether the cluster has the stand-in venue: a development cluster
+    /// does, a public one doesn't.
+    async fn has_stand_in_venue(&self) -> Result<bool> {
+        Ok(self
+            .client
+            .account(&local_venue::venue_address())
+            .await?
+            .is_some())
+    }
+
+    /// Refuse, on a cluster without the stand-in venue, what only works
+    /// with it.
+    async fn require_stand_in_venue(&self, what: &str) -> Result<()> {
+        if self.has_stand_in_venue().await? {
+            return Ok(());
+        }
+        bail!(
+            "{what} needs the stand-in venue, which {} doesn't have: a public cluster's vaults trade real venues",
+            self.platform.cluster_name
+        )
+    }
+
     /// The venue's perpetual.
     async fn perp(&self) -> Result<local_venue::Market> {
         self.client
@@ -549,10 +580,11 @@ impl<'a> Seed<'a> {
         Ok(())
     }
 
-    /// Whether the agent has put the money to work within `within`: its
-    /// station holds a position at the venue and the vault's cash is under
-    /// nine tenths of `deposited`. With `nudge`, the seed posts the venue's
-    /// prices as its market operator every [`NUDGE_EVERY`] meanwhile.
+    /// Whether the agent has put the money to work within `within`: the
+    /// vault's cash is under nine tenths of `deposited` and, at the stand-in
+    /// venue, its station holds a position there. With `nudge`, the seed
+    /// posts the stand-in venue's prices as its operator every
+    /// [`NUDGE_EVERY`] meanwhile.
     async fn at_work(
         &self,
         v: &VaultAccounts,
@@ -560,12 +592,20 @@ impl<'a> Seed<'a> {
         within: Duration,
         nudge: bool,
     ) -> Result<bool> {
-        let station = self.platform.station(self.client, &v.station).await?;
-        let authority = station
-            .drivers
-            .first()
-            .map(|driver| driver.authority)
-            .context("the station has no driver")?;
+        // At the stand-in venue, the station's account there; a public
+        // cluster's venues are read through the vault's cash alone.
+        let authority = if self.has_stand_in_venue().await? {
+            let station = self.platform.station(self.client, &v.station).await?;
+            Some(
+                station
+                    .drivers
+                    .first()
+                    .map(|driver| driver.authority)
+                    .context("the station has no driver")?,
+            )
+        } else {
+            None
+        };
         let mut nudged: Option<tokio::time::Instant> = None;
         let until = tokio::time::Instant::now() + within;
         while tokio::time::Instant::now() < until {
@@ -579,14 +619,17 @@ impl<'a> Seed<'a> {
                 }
                 nudged = Some(tokio::time::Instant::now());
             }
-            let held = self
-                .platform
-                .margin_account(self.client, &authority)
-                .await?
-                .is_some_and(|account| {
-                    account.size_in(&name(crate::solana::SPOT)) != 0
-                        || account.size_in(&name(crate::solana::PERP)) != 0
-                });
+            let held = match &authority {
+                Some(authority) => self
+                    .platform
+                    .margin_account(self.client, authority)
+                    .await?
+                    .is_some_and(|account| {
+                        account.size_in(&name(crate::solana::SPOT)) != 0
+                            || account.size_in(&name(crate::solana::PERP)) != 0
+                    }),
+                None => true,
+            };
             let cash = self.platform.vault(self.client, &v.vault).await?.cash;
             if held && u128::from(cash) * 10 < u128::from(deposited) * 9 {
                 tracing::info!(vault = %v.vault, cash, "the agent has put the money to work");
@@ -703,169 +746,6 @@ impl<'a> Seed<'a> {
     }
 }
 
-// The market operator ---------------------------------------------------------
-
-/// Play the stand-in venue's market on the cluster in real time, as the
-/// operator, from the venue's prices as they stand (see
-/// [`crate::market::operate`]): every `every`, both markets' prices from a
-/// tape like bitcoin's, and the funding the rate quoted last accrued since,
-/// by the cluster's clock. The venue's reserves are kept at what the set-up
-/// gave them, the admin minting what they have paid out beyond; and Orca's
-/// pool is brought back to Pyth's price whenever it has strayed.
-pub async fn operate(served: &SolanaServed, every: Duration) -> Result<()> {
-    use crate::market::{Tape, TapeParams};
-    let client = &served.client;
-    let platform = &served.platform;
-    if client
-        .account(&local_venue::venue_address())
-        .await?
-        .is_none()
-    {
-        tracing::info!(cluster = %served.key, "no stand-in venue on this cluster: nothing to operate");
-        return Ok(());
-    }
-    let operator = client.role(Role::Operator)?;
-    if operator.pubkey() != platform.operator {
-        return Err(anyhow::Error::new(WrongOperator {
-            ours: operator.pubkey(),
-            venue: platform.operator,
-        }));
-    }
-    let load = |market: &'static str| async move {
-        client
-            .load::<local_venue::Market>(&local_venue::market_address(&name(market)))
-            .await?
-            .ok_or_else(|| anyhow!("the venue has no {market} market"))
-    };
-    let spot = load(crate::solana::SPOT).await?;
-    let perp = load(crate::solana::PERP).await?;
-    let params = TapeParams::TESTNET;
-    let basis = if spot.mark > 0 && perp.mark > 0 && perp.mark != spot.mark {
-        (perp.mark as f64 / spot.mark as f64 - 1.0).clamp(-0.01, 0.01)
-    } else {
-        params.basis_mean
-    };
-    let now = client.now().await?;
-    let mut tape = Tape::with(params, now, spot.mark as f64, basis);
-    tracing::info!(
-        cluster = %served.key,
-        minutes = every.as_secs_f64() / 60.0,
-        spot = spot.mark as f64 / 1e6,
-        "the market operator is running on Solana: a post each interval, from the venue's prices as they stand"
-    );
-    let mut timer = tokio::time::interval(every);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last = tokio::time::Instant::now();
-    loop {
-        timer.tick().await;
-        let hours = last.elapsed().as_secs_f64().max(1.0) / 3_600.0;
-        last = tokio::time::Instant::now();
-        let tick = tape.step_by(hours);
-        let posted = async {
-            let perp = load(crate::solana::PERP).await?;
-            let now = client.now().await?;
-            let elapsed = now
-                .saturating_sub(perp.funding_updated_at)
-                .min(crate::market::LONGEST_ACCRUAL);
-            let paid = paid_per_unit(perp.funding_rate, elapsed);
-            keep_reserves(served).await?;
-            let quote = |market: &str, price: f64| {
-                let mark = price.max(1.0) as u64;
-                let half = tape.half_spread(price) as u64;
-                local_venue::Quote {
-                    market: name(market),
-                    mark,
-                    oracle: mark,
-                    bid: mark.saturating_sub(half),
-                    ask: mark + half,
-                }
-            };
-            client
-                .send(
-                    vec![platform.ix_post(
-                        vec![
-                            quote(crate::solana::SPOT, tick.spot),
-                            quote(crate::solana::PERP, tick.perp),
-                        ],
-                        vec![local_venue::Funding {
-                            market: name(crate::solana::PERP),
-                            rate_per_day: tick.rate_per_day as i128,
-                            paid_per_unit: paid,
-                        }],
-                    )],
-                    &[operator],
-                )
-                .await
-                .context("posting the venue's prices")?;
-            Ok::<_, anyhow::Error>(paid)
-        }
-        .await;
-        match posted {
-            Ok(paid) => tracing::info!(
-                cluster = %served.key,
-                spot = format!("{:.2}", tick.spot / 1e6),
-                perp = format!("{:.2}", tick.perp / 1e6),
-                funding_a_year = format!("{:.2}%", tick.funding_fraction() * 36_500.0),
-                paid_per_unit = paid,
-                "posted"
-            ),
-            Err(error) => {
-                tracing::warn!(cluster = %served.key, error = %format!("{error:#}"), "the post did not land; the next one accrues for this stretch too")
-            }
-        }
-    }
-}
-
-/// The mnemonic here is not the one the cluster was set up with: no retry
-/// changes that.
-#[derive(Debug)]
-pub(crate) struct WrongOperator {
-    ours: Pubkey,
-    venue: Pubkey,
-}
-
-impl std::fmt::Display for WrongOperator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this key's operator is {}, and the venue's is {}: the mnemonic is not the one this cluster was set up with",
-            self.ours, self.venue
-        )
-    }
-}
-
-impl std::error::Error for WrongOperator {}
-
-/// What one unit of the perpetual pays over `elapsed` seconds at
-/// `rate_per_day`, rounded towards zero.
-fn paid_per_unit(rate_per_day: i128, elapsed: u64) -> i128 {
-    rate_per_day * i128::from(elapsed) / i128::from(crate::market::DAY)
-}
-
-/// Keep the venue's reserves at what the set-up gave them: what it has paid
-/// out in funding and profits beyond them is minted back by the admin.
-async fn keep_reserves(served: &SolanaServed) -> Result<()> {
-    let client = &served.client;
-    let short = crate::solana::VENUE_RESERVES
-        .saturating_sub(client.token_balance(&local_venue::vault_address()).await?);
-    if short == 0 {
-        return Ok(());
-    }
-    let admin = client.role(Role::Admin)?;
-    client
-        .send(
-            vec![served.platform.ix_mint_into(
-                &admin.pubkey(),
-                &local_venue::vault_address(),
-                short,
-            )?],
-            &[admin],
-        )
-        .await
-        .context("the venue's reserves")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,14 +757,6 @@ mod tests {
         assert_eq!(solana.fuel_per_sec, modest.fuel_per_sec);
         assert_eq!(solana.memory_mib, modest.memory_mib);
         assert_eq!(solana.gas_per_day, 1_000_000);
-    }
-
-    #[test]
-    fn funding_accrues_the_rate_over_the_time_elapsed_rounded_towards_zero() {
-        let rate = 18_000_000i128;
-        assert_eq!(paid_per_unit(rate, 600), 125_000);
-        assert_eq!(paid_per_unit(rate, 86_400), rate);
-        assert_eq!(paid_per_unit(-rate, 1), -208);
     }
 
     #[test]

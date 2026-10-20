@@ -88,7 +88,7 @@ async fn pay(
         .read(deployments.publishing, IPublishing::feeCall {})
         .await?;
     chain
-        .send(
+        .send_estimated(
             author,
             deployments.usd,
             ILocalUsd::approveCall {
@@ -99,7 +99,7 @@ async fn pay(
         .await
         .context("the fee could not be approved")?;
     chain
-        .send(
+        .send_estimated(
             author,
             deployments.publishing,
             IPublishing::submitCall { upload },
@@ -141,7 +141,7 @@ pub async fn activate_it(
         .await?
         .minimumTank;
     chain
-        .send(
+        .send_estimated(
             author,
             deployments.usd,
             ILocalUsd::approveCall {
@@ -175,7 +175,7 @@ pub async fn activate_it(
         .read(deployments.factory, IVaultFactory::termsCall {})
         .await?;
     chain
-        .send(
+        .send_estimated(
             author,
             deployments.factory,
             IVaultFactory::activateCall {

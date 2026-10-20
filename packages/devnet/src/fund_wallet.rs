@@ -1,15 +1,15 @@
 //! Funding a person's own wallet on the testnets, so the web app's money
-//! flows can be tried with it: the stand-in dollar, and with `--gas` the
-//! chain's coin.
+//! flows can be tried with it: the chain's dollar where anyone may mint it,
+//! and with `--gas` the chain's coin.
 //!
-//! The dollar is minted the way the seed mints it for its own accounts. On an
-//! EVM chain anyone may mint the stand-in dollar, and the funder (which holds
-//! the gas) sends the mint. On a Solana cluster the dollar's mint authority is
-//! the admin, which opens the wallet's dollar account if it isn't there and
-//! mints into it. The coin comes from each chain's funder (the EVM funder, the
-//! Solana deployer), never past the reserve `config/funding.toml` keeps for
-//! it. Both are top-ups: a wallet already holding its amount is left alone,
-//! so running it again sends nothing new. Testnet only.
+//! Each testnet settles in its own public dollar. Where that dollar's mint is
+//! open to anyone (Paxos's USDG on the Robinhood Chain testnet), the funder
+//! (which holds the gas) sends the mint; elsewhere (Circle's USDC) the
+//! dollar comes from its issuer's faucet alone, and none is minted. The coin
+//! comes from each chain's funder (the EVM funder, the Solana deployer),
+//! never past the reserve `config/funding.toml` keeps for it. Both are
+//! top-ups: a wallet already holding its amount is left alone, so running it
+//! again sends nothing new. Testnet only.
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, anyhow, bail};
 use chain::bindings::usd::ILocalUsd;
 use chain::solana::{Pubkey, Signer};
-use chain::{ChainConfig, ChainKey, Deployments, NetworkName, Role};
+use chain::{ChainConfig, ChainKey, Deployments, NetworkName};
 
 use crate::fund::{self, Funding};
 
@@ -52,7 +52,7 @@ impl Wallet {
 
 /// What the wallet is topped up to on each chain.
 pub struct Amounts {
-    /// Whole dollars of the stand-in dollar.
+    /// Whole dollars of the chain's dollar, where it may be minted.
     pub dollars: u64,
     /// Whether to top its coin up to the chain's `default` in the funding
     /// file, from the chain's funder.
@@ -143,11 +143,11 @@ async fn evm(
     }
 
     let usd = deployments.usd;
-    // A public test network's own dollar is minted here only where anyone
-    // may mint it (the Robinhood Chain testnet's USDG).
-    if !crate::deploy::has_stand_ins(&deployments)
-        && !crate::deploy::public_dollar(client.chain_id).is_some_and(|dollar| dollar.mintable)
-    {
+    // Minted only where the chain's public dollar is open to anyone (the
+    // Robinhood Chain testnet's USDG).
+    let mintable = crate::deploy::public_dollar(client.chain_id)
+        .is_some_and(|dollar| dollar.mintable && dollar.address == usd);
+    if !mintable {
         println!(
             "  dollars: this chain's dollar ({usd}) is nobody's to mint here: its issuer's faucet hands it out"
         );
@@ -256,29 +256,13 @@ async fn solana(
     let need = target.saturating_sub(held);
     if need == 0 {
         println!("  dollars: holds {}, enough", lamport_units(held, decimals));
-    } else if !crate::solana::admin_mints(&client, &platform).await? {
-        // Circle's USDC on devnet: nobody here mints it.
+    } else {
+        // A public cluster's dollar (Circle's USDC on devnet): nobody here
+        // mints it.
         println!(
-            "  dollars: holds {}; the dollar ({}) comes from Circle's faucet alone, so none is minted",
+            "  dollars: holds {}; the dollar ({}) comes from its issuer's faucet alone, so none is minted",
             lamport_units(held, decimals),
             platform.mint
-        );
-    } else {
-        let admin = client.role(Role::Admin)?;
-        let landed = client
-            .send(
-                vec![
-                    platform.ix_open_dollars(&admin.pubkey(), &wallet),
-                    platform.ix_mint_to(&admin.pubkey(), &wallet, need)?,
-                ],
-                &[admin],
-            )
-            .await
-            .context("minting the stand-in dollar")?;
-        println!(
-            "  dollars: minted {} into {account} ({})",
-            lamport_units(need, decimals),
-            landed.record.signature
         );
     }
     println!(

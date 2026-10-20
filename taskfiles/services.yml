@@ -68,7 +68,7 @@ tasks:
         seed --api "{{.SEED_API}}" {{.AGENT_ARG}}
 
   demo:
-    desc: "A demo that pays its own way on VAULT_CHAIN: a fresh vault for AGENT (funding-basis by default; published again, or STRATEGY=<id> published with PUBLISH_ONLY=1 and never activated), activated at the modest allowances with its tank filled to and kept at TANK_DAYS (30) days of the daily cap by auto-fill, a depositor's DEPOSIT dollars (25000) in and at work within WORK_MINUTES (30), then left running; prints the vault and how to watch it. Needs the market operator posting (task chains:market) and the services up; TAKE_ON_SECONDS=<s>; API_URL=<url> for a remote API"
+    desc: "A demo that pays its own way on VAULT_CHAIN: a fresh vault for AGENT (funding-basis by default; published again, or STRATEGY=<id> published with PUBLISH_ONLY=1 and never activated), activated at the modest allowances with its tank filled to and kept at TANK_DAYS (30) days of the daily cap by auto-fill, a depositor's DEPOSIT dollars (25000) in and at work within WORK_MINUTES (30), then left running; prints the vault and how to watch it. Needs the services up (on the local chains the devnet plays the stand-in venue's market); TAKE_ON_SECONDS=<s>; API_URL=<url> for a remote API"
     vars:
       SEED_API: '{{.API_URL | default .URL_API_DEV}}'
       DEMO_ARGS: >-
@@ -86,7 +86,7 @@ tasks:
         demo --api "{{.SEED_API}}" {{.DEMO_ARGS}}
 
   economics:
-    desc: "Whether VAULT pays its own way, read from the chain alone (sends nothing): value and share price, the tank (balance, kept at, usage collected), the allowances and their daily cost, the fees owed and the high-water mark, the author's shares and their worth, the gas the vault's key and the keeper spent on it over HOURS (6) priced at the testnet's $0 and at a mainnet-like COIN_USD (ETH 2500, HYPE 25), the keeper's sends an hour, and a day projected: the bill against the author's fee at the funding quoted now and at the market's 10% a year, and the break-even deposit. CARRY_SHARE=<0..1> projects with that share short; JSON=1 for JSON (VAULT=<address> VAULT_CHAIN=<name>)"
+    desc: "Whether VAULT pays its own way, read from the chain alone (sends nothing): value and share price, the tank (balance, kept at, usage collected), the allowances and their daily cost, the fees owed and the high-water mark, the author's shares and their worth, the gas the vault's key and the keeper spent on it over HOURS (6) priced at the testnet's $0 and at a mainnet-like COIN_USD (ETH 2500, HYPE 25), the keeper's sends an hour, and a day projected: the bill against the author's fee at the funding quoted now and at the local market's mean, and the break-even deposit. The stand-in venue's vaults only, so the local chains only. CARRY_SHARE=<0..1> projects with that share short; JSON=1 for JSON (VAULT=<address> VAULT_CHAIN=<name>)"
     requires:
       vars: [VAULT]
     cmds:
