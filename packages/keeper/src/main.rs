@@ -59,6 +59,10 @@
 //! What it remembers having done is remembered only once the transaction was
 //! mined and went through: one refused or reverted is tried again.
 //!
+//! It says at warn, at most every six hours, when its own account on a
+//! chain holds less than a week's spending at its recent rate, or less than
+//! the chain's floor (see [`low_balance`]).
+//!
 //! Its health (`/health`, on `--port`) answers 503 while any chain it is to
 //! keep has not connected, has no keeper account, has a node that can't
 //! simulate, or has not finished a round lately; while a call it still tries
@@ -312,6 +316,18 @@ async fn main() -> Result<()> {
             // kept, on a cadence of their own, so a round slowed by the
             // vaults never holds up a fresh key's blessing, gas and approval.
             tokio::spawn(keep_keys(keys.clone(), executor.clone(), canonical));
+            // The keeper's own account: said at warn when it runs low.
+            let reading = served.client.clone();
+            tokio::spawn(low_balance::watch(
+                served.key.to_string(),
+                keeper.to_string(),
+                18,
+                policy.keeper_balance_floor_micro,
+                move || {
+                    let reading = reading.clone();
+                    async move { Ok(reading.balance(keeper).await?.saturating_to::<u128>()) }
+                },
+            ));
             // The builder's and the reviewer's keys, each on its own cadence.
             for service in &services {
                 tokio::spawn(keep_service_keys(keys.clone(), service.clone()));
@@ -6576,6 +6592,7 @@ async fn serve_status(address: SocketAddr) {
 mod attest;
 mod delayed;
 mod logs;
+mod low_balance;
 mod observed;
 mod solana;
 mod solana_keys;

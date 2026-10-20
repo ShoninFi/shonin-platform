@@ -198,6 +198,11 @@ key_poll_ms = 2000
 # How often keys are looked over for renewal and stocking, against reads per
 # look. 250..=15000.
 key_look_ms = 15000
+# The keeper says at warn, at most every six hours, when its own account on a
+# chain holds less than a week's spending at its rate since its last top-up,
+# or less than this floor, whichever is higher: millionths of the chain's
+# coin. Zero leaves only the week's spending. 0..=1000000000000.
+keeper_balance_floor_micro = 0
 
 # --- Chain clock and observation
 # How old a head may be and still be scheduled from; an older one sends the
@@ -270,7 +275,8 @@ solana_rent_poll_rounds = 30
 solana_history_transactions = 64
 
 # Per chain: receipts are polled at the block interval, and a head's allowed
-# age and lead follow how the chain produces and reports blocks.
+# age and lead follow how the chain produces and reports blocks, and the
+# keeper says at warn when its own account holds less than its floor.
 
 [rpc.chains."evm:31337"]
 head_lag_max_ms = 4000
@@ -287,16 +293,20 @@ head_ahead_max_ms = 5000
 
 [rpc.chains."evm:84532"]
 head_lag_max_ms = 4000
+keeper_balance_floor_micro = 2000
 
 [rpc.chains."evm:998"]
 receipt_poll_ms = 1000
+keeper_balance_floor_micro = 100000
 
 [rpc.chains."evm:46630"]
 receipt_poll_ms = 500
+keeper_balance_floor_micro = 2000
 
 [rpc.chains."solana:devnet"]
 head_lag_max_ms = 10000
 head_ahead_max_ms = 5000
+keeper_balance_floor_micro = 200000
 
 [rpc.chains."evm:8453"]
 head_lag_max_ms = 4000

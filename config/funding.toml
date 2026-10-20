@@ -3,6 +3,12 @@
 # m/44'/60'/0'/0/100). A role already holding its amount is left alone, so the
 # task is safe to run again. `default` covers every role not named.
 #
+# Each amount lasts a month or more at the role's burn, written beside it a
+# month: one run of the task a month keeps every role going, and the Testnet
+# watch says a week ahead when one would run out sooner. A role with no burn
+# beside it sends nothing of its own (the builder's and the reviewer's role
+# accounts, say: their attested keys are the keeper's to stock).
+#
 # The funder keeps `reserve` for itself and funds nothing past it: a role it
 # can't fully top up is reported, not half-funded.
 #
@@ -10,7 +16,8 @@
 # mnemonic, not a role), on the chains whose pools it keeps: a month of its
 # mirror posts (one each time a mainnet feed moves) and its swaps (with a
 # dollar mint before a buy where the dollar is mintable), at the chain's
-# usual gas price. `task chains:fund` tops it up with the roles.
+# usual gas price. `task chains:fund` tops it up with the roles. Its burn is
+# estimated from its rounds.
 #
 # The executor holds no role account: the keeper relays every blessing the
 # executor publishes and, once the chain shows a vault's key blessed, stakes
@@ -20,47 +27,50 @@
 # four; a handover makes one more), the blessings it relays (a Groth16 check
 # is a few hundred thousand gas, renewed every day or so) and its own sends,
 # or a vault is taken on by nobody and its agent never starts. The executor
-# role is given nothing.
+# role is given nothing. The keeper says at warn when its own account runs
+# low (its floors are in config/chains.toml).
 
+# Base Sepolia.
 [testnet."evm:84532"] # Base Sepolia, ETH
 reserve = 0.01
 default = 0.004
-admin = 0.03
+admin = 0.03     # deploys and proposals only: none in the last week
 executor = 0
-keeper = 0.02
-author = 0.008
-market = 0.005
+keeper = 0.02    # 0.0045 a month: its sends 0.0005 (about 15 a day), the rest vault-key stakes and blessings
+operator = 0.005 # 0.0025 a month: 0.000082 a day, a post every ten minutes
+author = 0.008   # activations only: none in the last week
+market = 0.005   # about 0.0015 a month (estimated): a post and a swap each time a feed moves
 
+# Hyperliquid testnet's HyperEVM. The funder buys the HYPE on HyperCore (see
+# [hyperliquid] below) with its HyperCore dollars, which the faucet tops up.
 [testnet."evm:998"] # Hyperliquid testnet's HyperEVM, HYPE
 reserve = 0.05
 default = 0.03
-admin = 0.4
+admin = 0.4      # deploys on big blocks only: none in the last week
 executor = 0
-keeper = 0.2
-author = 0.06
+keeper = 0.5     # about 0.4 a month: its sends 0.008 (0.00028 a day), the rest vault-key stakes, sized by the fee estimate of the moment
+operator = 0.08  # 0.042 to 0.063 a month: 0.0014 to 0.0021 a day, a post every ten minutes
+author = 0.06    # activations only: a few a week
 
-# The funder here is thin (a few hundredths of an ETH at most), so only
-# what the live vaults need for about two weeks unattended: the keeper's
-# vault-key stakes (one more for a handover), the blessings and its own
-# sends; and the market operator's posts, every ten minutes, at about
-# 0.00014 ETH a day.
+# Robinhood Chain testnet. Its public
+# endpoint keeps no past state, so the keeper's burn here is estimated from
+# Base Sepolia's, at this chain's 0.01 gwei.
 [testnet."evm:46630"] # Robinhood Chain testnet, ETH
 reserve = 0.0015
 default = 0.0003
-admin = 0.004
+admin = 0.004    # deploys and proposals only
 executor = 0
-keeper = 0.006
-operator = 0.002
-author = 0.001
-market = 0.005
+keeper = 0.006   # about 0.003 a month (estimated): its sends 0.0015, vault-key stakes 0.0005 each
+operator = 0.005 # 0.0042 a month: 0.00014 a day, a post every ten minutes
+author = 0.001   # activations only
+market = 0.005   # about 0.003 a month (estimated): four mirror feeds' posts and the swaps after them
 
 # Solana devnet, SOL. The funder is the deployer (m/44'/501'/0'/0' of the
 # Solana mnemonic), which paid for the programs; `task chains:solana-setup
-# NETWORK=testnet` tops each role up by transfer (devnet's faucet is
-# rate-limited), and its own set-up's rent and fees come out of the reserve.
-# Each amount is 0.001 SOL or more, or 0. Enough for a week of sends at
-# 5,000 lamports a signature, with room for the rent the keys put into
-# accounts: the keeper's lookup tables, the blessings it relays and the
+# NETWORK=testnet` tops each role up by transfer, and its own set-up's rent
+# and fees come out of the reserve. Each amount is 0.001 SOL or more, or 0.
+# Sends cost 5,000 lamports a signature; the rest is the rent the keys put
+# into accounts: the keeper's lookup tables, the blessings it relays and the
 # vault keys it stocks (0.05 SOL each, once the registry vouches for them; a
 # handover makes one more); the author's activations (a vault, its station,
 # their dollar accounts); the operator's market listings and its posts every
@@ -68,22 +78,22 @@ market = 0.005
 # transaction there: the executor's keys are made in the enclave and stocked
 # by the keeper.
 #
-# `market` is testnet-market's Solana account (m/44'/501'/111'/0'): a month
-# of its swaps in Orca's pool and its seed's resets (a few thousand
-# lamports each), the tick arrays a walk to Pyth's price makes (about 0.07
-# SOL each, a handful once), and the SOL side of its seed and of what it
-# trades with (about a dollar's worth of SOL for each devnet USDC it holds).
+# `market` is testnet-market's Solana account (m/44'/501'/111'/0'): most of
+# its amount is held, not spent: the SOL side of its seed in Orca's pool (as
+# much SOL by value as the devnet USDC it seeds there, so tied to the pool's
+# depth: about 0.7 SOL for 75 USDC), the tick arrays a walk to Pyth's price
+# makes (about 0.07 SOL each, a handful once), and what it trades with.
 [testnet."solana:devnet"]
 reserve = 1
 default = 0.2
-admin = 0.5
-operator = 0.25
-keeper = 2
+admin = 0.5      # deploys and set-ups only
+operator = 0.25  # about 0.03 a month: some 150 signatures a day, and its listings' rent
+keeper = 2       # about 0.3 a month: some 20 signatures a day, lookup tables, 0.05 for each vault key stocked
 executor = 0
-author = 1
+author = 1       # activations' rent only
 platform = 0
 attestor = 0
-market = 3
+market = 3       # about 1.2 held once (its seed's SOL side and tick arrays), and its swaps' fees, about 0.01 a month (estimated)
 
 # On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on
 # HyperEVM, so the task buys HYPE on HyperCore's spot market and sends it to

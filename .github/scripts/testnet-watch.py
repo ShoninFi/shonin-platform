@@ -21,7 +21,9 @@ Public endpoints keep no history, so each run adds a sample to a history file
 
 - an account's burn rate is its fall since its last top-up, over at least
   MIN_SPAN_HOURS; the run fails when the balance would run out within
-  RUNWAY_DAYS at that rate;
+  RUNWAY_DAYS at that rate, or, for the keeper, when it holds less than its
+  floor on that chain (keeper_balance_floor_micro in config/chains.toml): the
+  keeper says the same at warn from inside, by the same rule;
 - the keeper role sends on every chain at least daily (its daily settlement),
   so the run fails when its transaction count on an EVM chain hasn't moved, or
   its newest Solana signature is older, than KEEPER_QUIET_HOURS;
@@ -38,7 +40,9 @@ import json
 import os
 import sys
 import time
+import tomllib
 import urllib.request
+from pathlib import Path
 
 EVM_CHAINS = {
     "base-sepolia": "https://sepolia.base.org",
@@ -46,6 +50,14 @@ EVM_CHAINS = {
     "hyperliquid-testnet": "https://rpc.hyperliquid-testnet.xyz/evm",
 }
 SOLANA_RPC = "https://api.devnet.solana.com"
+# Each chain's key in config/chains.toml.
+CHAIN_KEYS = {
+    "base-sepolia": "evm:84532",
+    "robinhood-testnet": "evm:46630",
+    "hyperliquid-testnet": "evm:998",
+    "solana-devnet": "solana:devnet",
+}
+CHAINS_TOML = Path(__file__).resolve().parents[2] / "config" / "chains.toml"
 HYPERCORE_INFO = "https://api.hyperliquid-testnet.xyz/info"
 API_HEALTH = os.environ.get("API_HEALTH", "https://testnet-api.shonin.fi/health")
 # Where the mirrors' mainnet feeds are read.
@@ -149,9 +161,29 @@ def runway(history, key, now, balance):
     return balance / burn / 86400, span
 
 
+def keeper_floors():
+    """The keeper's balance floor on each chain, in whole coins, as the keeper reads it."""
+    try:
+        with open(CHAINS_TOML, "rb") as f:
+            rpc = tomllib.load(f)["rpc"]
+    except Exception as failure:
+        print(f"::warning::the keeper's floors: unreadable ({failure})")
+        return {}
+    default = rpc["defaults"].get("keeper_balance_floor_micro", 0)
+    return {
+        chain: rpc["chains"].get(key, {}).get("keeper_balance_floor_micro", default) / 1e6
+        for chain, key in CHAIN_KEYS.items()
+    }
+
+
 def check_gas(history, sample):
     now = sample["t"]
+    floors = keeper_floors()
     for key, balance in sorted(sample["balances"].items()):
+        chain, _, role = key.partition("/")
+        floor = floors.get(chain, 0) if role == "keeper" else 0
+        if balance < floor:
+            error(f"{key} holds {balance:.6f}, under the keeper's floor of {floor:g} there: top it up")
         days, span = runway(history, key, now, balance)
         if days is None:
             print(f"{key}: {balance:.6f} (rate needs {MIN_SPAN_HOURS:.0f} h of history, has {span / 3600:.1f} h)")
