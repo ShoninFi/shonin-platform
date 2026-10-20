@@ -25,24 +25,34 @@ use chain::bindings::strategies::IStrategyRegistry;
 use serde_json::{Value, json};
 use shared::model::registry::{Job, JobState};
 
-/// The chain's clock: every block is stamped now, by the wall clock.
+/// The wall clock, in seconds.
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
 }
+
 pub const PUBLISHING: Address = Address::repeat_byte(0x9b);
 const BUILDER_KEY: Address = Address::repeat_byte(0xb1);
 
 /// The stand-in node.
 pub struct Node {
     pub head: AtomicU64,
+    /// The time of block 0: blocks are a second apart, and the head the node
+    /// was made at was made then.
+    pub genesis: u64,
     /// The widest block range one `eth_getLogs` may ask for, as a paid
     /// provider caps it; `None` for no cap.
     pub log_range_cap: Option<u64>,
     /// Whether every `eth_getLogs` fails, as a node that is down does.
     pub logs_fail: AtomicBool,
+    /// Blocks whose logs can't be read: an `eth_getLogs` over any of them
+    /// fails, as an endpoint missing them does.
+    pub unreadable: Mutex<Vec<u64>>,
+    /// Whether the registry's record of each payment (`submissionOf`) can't
+    /// be read.
+    pub record_unreadable: AtomicBool,
     /// `Submitted` payments, at their block.
     pub payments: Mutex<Vec<(u64, alloy::rpc::types::Log)>>,
     /// Every `eth_getLogs` range asked for.
@@ -83,8 +93,11 @@ pub fn stored(bundle: B256) -> Vec<(&'static str, String)> {
 pub fn node(head: u64, log_range_cap: Option<u64>) -> Node {
     Node {
         head: head.into(),
+        genesis: now().saturating_sub(head),
         log_range_cap,
         logs_fail: AtomicBool::new(false),
+        unreadable: Mutex::new(Vec::new()),
+        record_unreadable: AtomicBool::new(false),
         payments: Mutex::new(Vec::new()),
         ranges: Mutex::new(Vec::new()),
         registered: Mutex::new(Vec::new()),
@@ -96,6 +109,11 @@ pub fn node(head: u64, log_range_cap: Option<u64>) -> Node {
 }
 
 impl Node {
+    /// When block `number` was made.
+    pub fn stamped(&self, number: u64) -> u64 {
+        self.genesis + number
+    }
+
     /// A payment of the $1 by `author` against `upload`, at `block`.
     pub fn pay(&self, block: u64, strategy_id: u64, author: Address, upload: B256) {
         let event = IPublishing::Submitted {
@@ -161,9 +179,13 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
         ),
         "eth_blockNumber" => json!(format!("0x{head:x}")),
         "eth_getBlockByNumber" => {
+            // A block asked for by its number; any other, the head.
+            let number = hex_u64(&request["params"][0])
+                .filter(|number| *number <= head)
+                .unwrap_or(head);
             let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-            block.header.inner.number = head;
-            block.header.inner.timestamp = now();
+            block.header.inner.number = number;
+            block.header.inner.timestamp = node.stamped(number);
             block.header.inner.base_fee_per_gas = Some(1_000_000_000);
             serde_json::to_value(block).unwrap()
         }
@@ -200,7 +222,14 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
             let from = hex_u64(&filter["fromBlock"]).unwrap_or(0);
             let to = hex_u64(&filter["toBlock"]).unwrap_or(head);
             node.ranges.lock().unwrap().push((from, to));
-            if node.logs_fail.load(Ordering::SeqCst) {
+            if node.logs_fail.load(Ordering::SeqCst)
+                || node
+                    .unreadable
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|block| (from..=to).contains(block))
+            {
                 return error(-32603, "the node is unavailable");
             }
             if node
@@ -243,6 +272,45 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
                         .filter(|(block, _)| *block <= at)
                         .count();
                     IPublishing::countCall::abi_encode_returns(&U256::from(count))
+                }
+                // The registry's record of a payment by its id: the id-th
+                // payment in block order, paid at its block's time.
+                IPublishing::submissionOfCall::SELECTOR => {
+                    if node.record_unreadable.load(Ordering::SeqCst) {
+                        return error(-32603, "the node is unavailable");
+                    }
+                    let call = IPublishing::submissionOfCall::abi_decode(&input).unwrap();
+                    let id: u64 = call.strategyId.try_into().unwrap();
+                    let mut payments: Vec<(u64, IPublishing::Submitted)> = node
+                        .payments
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(block, log)| {
+                            (
+                                *block,
+                                log.log_decode::<IPublishing::Submitted>()
+                                    .unwrap()
+                                    .inner
+                                    .data,
+                            )
+                        })
+                        .collect();
+                    payments.sort_by_key(|(block, _)| *block);
+                    let submission = id
+                        .checked_sub(1)
+                        .and_then(|at| payments.get(at as usize))
+                        .map(|(block, paid)| chain::bindings::publishing::Submission {
+                            author: paid.author,
+                            upload: paid.upload,
+                            paidAt: node.stamped(*block),
+                        })
+                        .unwrap_or(chain::bindings::publishing::Submission {
+                            author: Address::ZERO,
+                            upload: B256::ZERO,
+                            paidAt: 0,
+                        });
+                    IPublishing::submissionOfCall::abi_encode_returns(&submission)
                 }
                 IStrategyRegistry::isRegisteredCall::SELECTOR => {
                     let call = IStrategyRegistry::isRegisteredCall::abi_decode(&input).unwrap();

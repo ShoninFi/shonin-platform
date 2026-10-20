@@ -14,14 +14,16 @@ async fn a_restart_reads_payments_on_from_where_it_left_off() {
     let head = 9_000;
     let first = black_box::start(black_box::node(head, None), &[]).await;
     let started = Instant::now();
-    while !first
-        .node
-        .ranges
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|&(_, to)| to >= head)
-    {
+    // Read to the head: kept as past it (blocks the registry shows hold no
+    // payment are passed over without their logs).
+    let read_to = |builder: &black_box::Builder| {
+        std::fs::read(builder.store().join("payments.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|read| read["base"].as_u64())
+            .unwrap_or(0)
+    };
+    while read_to(&first) <= head {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the first run never read to the head"

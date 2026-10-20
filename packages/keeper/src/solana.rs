@@ -149,6 +149,19 @@ pub async fn keep_chain(
         looks.clone(),
     ));
     let _keys = Aborting(keys);
+    // The keeper's own account: said at warn when it runs low.
+    let reading = served.client.clone();
+    let account = keeper.pubkey();
+    let _balance = Aborting(tokio::spawn(crate::low_balance::watch(
+        served.key.to_string(),
+        account.to_string(),
+        9,
+        policy.keeper_balance_floor_micro,
+        move || {
+            let reading = reading.clone();
+            async move { Ok(u128::from(reading.lamports(&account).await?)) }
+        },
+    )));
     // The builder's and the reviewer's Solana keys, each on its own cadence.
     let _services: Vec<Aborting> = services
         .into_iter()

@@ -81,6 +81,7 @@ settings!(
     keeper_rate_limit_backoff_factor,
     key_poll_ms,
     key_look_ms,
+    keeper_balance_floor_micro,
     // Chain clock and observation
     head_lag_max_ms,
     head_ahead_max_ms,
@@ -114,6 +115,9 @@ settings!(
 
 /// The longest `record_stale_ms`, and the longest `solana_rescan_ms`: a day.
 const DAY_MS: u64 = 86_400_000;
+
+/// The highest `keeper_balance_floor_micro`: a million of the chain's coin.
+const MOST_FLOOR_MICRO: u64 = 1_000_000_000_000;
 
 /// The `[rpc]` tables of one config file: the defaults, the process-wide
 /// polls, and each chain's partial overrides.
@@ -314,6 +318,12 @@ impl RpcPolicy {
         )?;
         range("key_poll_ms", self.key_poll_ms, 250, 2_000)?;
         range("key_look_ms", self.key_look_ms, 250, 15_000)?;
+        range(
+            "keeper_balance_floor_micro",
+            self.keeper_balance_floor_micro,
+            0,
+            MOST_FLOOR_MICRO,
+        )?;
 
         // Chain clock and observation.
         range("head_lag_max_ms", self.head_lag_max_ms, 500, 30_000)?;
@@ -673,6 +683,7 @@ mod tests {
         ("keeper_rate_limit_backoff_factor", 1, 2, &[]),
         ("key_poll_ms", 250, 2_000, &[]),
         ("key_look_ms", 250, 15_000, &[]),
+        ("keeper_balance_floor_micro", 0, MOST_FLOOR_MICRO, &[]),
         ("head_lag_max_ms", 500, 30_000, &[]),
         ("head_ahead_max_ms", 0, 10_000, &[]),
         ("clock_settle_observations", 1, 20, &[]),
@@ -1079,13 +1090,31 @@ mod tests {
         let defaults = RpcPolicy::default();
         let expected: &[(&str, &[(&str, u64)])] = &[
             ("evm:31337", &[("head_lag_max_ms", 4_000)]),
-            ("evm:84532", &[("head_lag_max_ms", 4_000)]),
+            (
+                "evm:84532",
+                &[
+                    ("head_lag_max_ms", 4_000),
+                    ("keeper_balance_floor_micro", 2_000),
+                ],
+            ),
             ("evm:8453", &[("head_lag_max_ms", 4_000)]),
             ("evm:31338", &[("receipt_poll_ms", 1_000)]),
-            ("evm:998", &[("receipt_poll_ms", 1_000)]),
+            (
+                "evm:998",
+                &[
+                    ("receipt_poll_ms", 1_000),
+                    ("keeper_balance_floor_micro", 100_000),
+                ],
+            ),
             ("evm:999", &[("receipt_poll_ms", 1_000)]),
             ("evm:31339", &[("receipt_poll_ms", 500)]),
-            ("evm:46630", &[("receipt_poll_ms", 500)]),
+            (
+                "evm:46630",
+                &[
+                    ("receipt_poll_ms", 500),
+                    ("keeper_balance_floor_micro", 2_000),
+                ],
+            ),
             ("evm:4663", &[("receipt_poll_ms", 500)]),
             (
                 "solana:localnet",
@@ -1093,7 +1122,11 @@ mod tests {
             ),
             (
                 "solana:devnet",
-                &[("head_lag_max_ms", 10_000), ("head_ahead_max_ms", 5_000)],
+                &[
+                    ("head_lag_max_ms", 10_000),
+                    ("head_ahead_max_ms", 5_000),
+                    ("keeper_balance_floor_micro", 200_000),
+                ],
             ),
             (
                 "solana:mainnet-beta",
