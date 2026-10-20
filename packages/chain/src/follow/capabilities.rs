@@ -87,6 +87,12 @@ pub struct Capabilities {
     /// Whether an observation here needed reads of their own, so whether
     /// hash pins are honoured is asked before the next one.
     pub wants_hash_pin: bool,
+    /// Whether the helper answered a read here with a revert that says
+    /// nothing, which a call inside the read that ran out of the helper's
+    /// gas also gives: whether Multicall3 is here (to read it again with
+    /// more gas) and whether hash pins are honoured (to read it alone) are
+    /// asked before the next observation, though the helper runs.
+    pub wants_more_gas: bool,
     pub(super) checked_at: Option<tokio::time::Instant>,
     /// When an observation or a check here last failed.
     pub(super) failed_at: Option<tokio::time::Instant>,
@@ -132,9 +138,10 @@ impl Capabilities {
         let helper = self.helper();
         Wanted {
             source: !helper || self.wants_hash_pin,
-            multicall3: !helper,
+            multicall3: !helper || self.wants_more_gas,
             gas: !helper && self.multicall3 == Some(true),
-            hash_pin: self.wants_hash_pin || (!helper && self.multicall3 == Some(false)),
+            hash_pin: self.wants_hash_pin
+                || ((!helper || self.wants_more_gas) && self.multicall3 == Some(false)),
         }
     }
 

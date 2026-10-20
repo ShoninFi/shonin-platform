@@ -120,6 +120,11 @@ enum Open {
     NotRun,
     Oversized(u64),
     OutOfGas,
+    /// It reverted with no data. A call it made that ran out of the item's
+    /// gas ends it so too (Solidity passes the failed call's empty data on),
+    /// as does a revert with nothing to say: it is read again with more gas
+    /// than the helper gives an item before it is taken for a revert.
+    EmptyRevert,
 }
 
 /// What an observation has gathered so far.
@@ -235,7 +240,23 @@ impl Follower {
         }
         let deadline = Instant::now() + self.budget();
         self.ready(endpoint, deadline).await;
+        let more_gas_known = self.known(endpoint).wants_more_gas;
         let mut result = self.timed(endpoint, plan, at, deadline).await;
+        // A revert that says nothing, which the helper may have given for a
+        // read that needed more gas, waits for the endpoint to be shown to
+        // have Multicall3 or honour hash pins, when that is first wanted: asked
+        // now, and the observation made again if either is known within the
+        // budget.
+        if result.is_ok() && !more_gas_known && self.known(endpoint).wants_more_gas {
+            self.ready(endpoint, deadline).await;
+            let known = self.known(endpoint);
+            if known.multicall3 == Some(true) || known.hash_pin == Some(true) {
+                let again = self.timed(endpoint, plan, at, deadline).await;
+                if again.is_ok() {
+                    result = again;
+                }
+            }
+        }
         // Reads that need a read of their own wait for the endpoint to be
         // shown to honour hash pins: asked now, and the observation made
         // again if that is known within the budget.
@@ -626,6 +647,7 @@ impl Follower {
                     gathered.items[index] = Some(Item::Returned(result.data.clone()));
                     None
                 }
+                Outcome::Reverted if result.data.is_empty() => Some(Open::EmptyRevert),
                 Outcome::Reverted => {
                     gathered.items[index] = Some(Item::Reverted(result.data.clone()));
                     None
@@ -673,6 +695,7 @@ impl Follower {
         arb_sys: bool,
         gathered: &mut Gathered,
     ) -> Result<(), Failure> {
+        let mut empty = Vec::new();
         for _ in 0..FOLLOW_UP_ROUNDS {
             let open = std::mem::take(&mut gathered.open);
             let mut single = Vec::new();
@@ -680,6 +703,7 @@ impl Follower {
             let mut larger = Vec::new();
             for (index, why) in open {
                 match why {
+                    Open::EmptyRevert => empty.push(index),
                     Open::NotRun => again.push(index),
                     Open::Oversized(size)
                         if size <= view_reads::MAX_RESULT_BYTES
@@ -748,7 +772,25 @@ impl Follower {
             }
             gathered.open.extend(single);
         }
-        let rest = std::mem::take(&mut gathered.open);
+        // Anything still open after the rounds that reverted empty is with
+        // the empty reverts.
+        let mut rest = Vec::new();
+        for (index, why) in std::mem::take(&mut gathered.open) {
+            match why {
+                Open::EmptyRevert => empty.push(index),
+                _ => rest.push((index, why)),
+            }
+        }
+        if !empty.is_empty() {
+            empty.sort_unstable();
+            empty.dedup();
+            rest.extend(
+                self.empty_reverts(endpoint, provider, plan, block, &empty, gathered)
+                    .await?
+                    .into_iter()
+                    .map(|index| (index, Open::EmptyRevert)),
+            );
+        }
         if rest.is_empty() {
             return Ok(());
         }
@@ -764,6 +806,72 @@ impl Follower {
                 Some(single_read(provider, &plan.reads[index], block, gathered).await?);
         }
         Ok(())
+    }
+
+    /// Read again the items the helper answered with an empty revert, with
+    /// more gas than it gives an item: in one Multicall3 call at the block
+    /// (each read given all the gas left, the call's whole budget) where
+    /// Multicall3 is known to be here, the block it ran at checked as every
+    /// Multicall3 answer is. What reverts empty there, with that much gas,
+    /// is a revert with nothing to say, as a read of its own would find.
+    /// Where Multicall3 is not known to be here (or its call is refused),
+    /// the items are returned, to be read one by one, each pinned to the
+    /// block's hash, where hash pins are known to be honoured. Where neither
+    /// is known, they are taken as the helper answered them (a revert with
+    /// no data, as before), and both are asked about before the next
+    /// observation, so it can tell.
+    async fn empty_reverts(
+        &mut self,
+        endpoint: usize,
+        provider: &DynProvider,
+        plan: &Plan,
+        block: &Header,
+        empty: &[usize],
+        gathered: &mut Gathered,
+    ) -> Result<Vec<usize>, Failure> {
+        let known = self.known(endpoint);
+        let (Some(true), Some(source)) = (known.multicall3, known.source) else {
+            if known.hash_pin == Some(true) {
+                return Ok(empty.to_vec());
+            }
+            if !known.wants_more_gas {
+                self.learn(endpoint, |known| known.wants_more_gas = true);
+            }
+            for index in empty {
+                gathered.items[*index] = Some(Item::Reverted(Bytes::new()));
+            }
+            return Ok(Vec::new());
+        };
+        let reads: Vec<Read> = empty.iter().map(|i| plan.reads[*i].clone()).collect();
+        let numbers = if block.number > 0 {
+            vec![block.number - 1]
+        } else {
+            Vec::new()
+        };
+        let batch = Batch::new(self.options.multicall3, source, numbers, &[], &reads);
+        let parts = match self.multicall_at(provider, &batch, block, gathered).await {
+            Ok(parts) => parts,
+            // Refused here: read one by one instead, where pins are honoured;
+            // otherwise taken as the helper answered them.
+            Err(Failure::Unsupported(_) | Failure::TooBig | Failure::OutOfGas | Failure::Fewer) => {
+                if known.hash_pin == Some(true) {
+                    return Ok(empty.to_vec());
+                }
+                for index in empty {
+                    gathered.items[*index] = Some(Item::Reverted(Bytes::new()));
+                }
+                return Ok(Vec::new());
+            }
+            Err(failure) => return Err(failure),
+        };
+        for (index, result) in empty.iter().zip(parts.reads.iter()) {
+            gathered.items[*index] = Some(if result.success {
+                Item::Returned(result.returnData.clone())
+            } else {
+                Item::Reverted(result.returnData.clone())
+            });
+        }
+        Ok(Vec::new())
     }
 
     /// The Multicall3 path: the endpoint's header first, then every call
