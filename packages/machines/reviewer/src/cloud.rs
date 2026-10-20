@@ -133,12 +133,15 @@ impl Signer {
 }
 
 /// What a machine tells the API about itself, for the waker: whether it
-/// stopped busy, when its blessing is next due, and how far it has read
+/// stopped busy, when its blessing is next due, when a read it could not
+/// finish is next to be tried (unix seconds), and how far it has read
 /// payments on each chain, by chain id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WakePlan {
     pub busy: bool,
     pub renew_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<u64>,
     pub payments_seen: BTreeMap<String, u64>,
 }
 
@@ -964,6 +967,7 @@ mod tests {
         let plan = WakePlan {
             busy: false,
             renew_at: None,
+            retry_at: None,
             payments_seen: BTreeMap::new(),
         };
         *api.refuse.lock().unwrap() = Some(403);

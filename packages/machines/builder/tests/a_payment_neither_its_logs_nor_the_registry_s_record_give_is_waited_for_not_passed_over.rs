@@ -2,14 +2,17 @@
 //! is waited for, never passed over: payments on that chain stop where they
 //! are, the builder says so at warn, and it no longer counts that chain as
 //! work in hand, so it can still go idle and exit rather than stay up for
-//! a payment it can't read. The next start reads from where it stopped.
+//! a payment it can't read. It reads there again later, and the wake plan
+//! carries when, so the next start is not left to chance.
 //!
-//! Sequence: the chain stands at 0x40 and the build service exits after two
-//! idle seconds. An author pays at 0x20 for an upload waiting since an hour
-//! ago; no log of block 0x20 can be read, nor the registry's record of any
-//! payment. The builder says payments there are not read, the upload still
-//! waits, where payments were read to never passes 0x20, and the build
-//! service exits, cleanly.
+//! Sequence: the chain stands at 3,000, every block made in the same second,
+//! and the build service exits after two idle seconds. An author pays at
+//! 0x20 for an upload waiting since an hour ago, no log of block 0x20 can be
+//! read, and another payment is made at block 2,000, past the page holding
+//! 0x20: the record, read, can't tell which of the payments that page
+//! holds. The builder says payments there wait, the upload still waits,
+//! where payments were read to never passes 0x20, and the build service
+//! exits, cleanly.
 
 mod black_box;
 
@@ -30,11 +33,17 @@ async fn a_payment_neither_its_logs_nor_the_registry_s_record_give_is_waited_for
         &archive,
         time::Duration::hours(1),
     )]);
-    let node = black_box::node(0x40, None);
-    node.pay(0x20, 1, author, reference);
-    node.unreadable.lock().unwrap().push(0x20);
-    node.record_unreadable
+    let node = black_box::node(3_000, None);
+    node.frozen_time
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    node.pay(0x20, 1, author, reference);
+    node.pay(
+        2_000,
+        2,
+        Address::repeat_byte(0x78),
+        B256::repeat_byte(0x45),
+    );
+    node.unreadable.lock().unwrap().push(0x20);
     let mut builder = black_box::spawn_with(node, &[queue], &["--idle-exit-seconds", "2"]).await;
 
     let started = Instant::now();
@@ -55,7 +64,7 @@ async fn a_payment_neither_its_logs_nor_the_registry_s_record_give_is_waited_for
         "exited, but not cleanly ({status}):\n{said}"
     );
     assert!(
-        said.contains("payments on this chain are not read, nor waited for"),
+        said.contains("payments on this chain wait at these blocks"),
         "{said}"
     );
     assert!(

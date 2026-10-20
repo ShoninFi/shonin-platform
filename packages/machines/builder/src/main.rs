@@ -327,10 +327,9 @@ struct Service {
     /// On each chain, by chain id, how many payments the registry had taken
     /// at the last block payments were read through.
     payments_seen: Mutex<BTreeMap<String, u64>>,
-    /// The chains, by chain id, whose payments can't be read past a block
-    /// for now (see [`Halted`]): left out of the wake plan and of what keeps
-    /// the build service busy.
-    payments_halted: std::sync::Mutex<BTreeSet<String>>,
+    /// The chains, by chain id, whose last turn of reading payments failed,
+    /// and when each is read again (see [`Stalled`]).
+    payments_stalled: std::sync::Mutex<BTreeMap<String, Stalled>>,
     /// When the build service last had anything to do.
     idle: cloud::Idle,
     /// The work loops' turns, closed before the state is written at exit.
@@ -404,13 +403,14 @@ impl Service {
             })
     }
 
-    /// Whether payments on the chain `chain_id` can't be read past a block
-    /// for now.
-    fn payments_halted_on(&self, chain_id: &str) -> bool {
-        self.payments_halted
+    /// Whether the last turn of reading payments on the chain `chain_id`
+    /// failed, and if so when it is read again.
+    fn stalled_on(&self, chain_id: &str) -> Option<Stalled> {
+        self.payments_stalled
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(chain_id)
+            .get(chain_id)
+            .copied()
     }
 
     /// Whether the API would take the wake plan: in the attested image, once
@@ -868,7 +868,7 @@ async fn main() -> Result<()> {
             .map(|launched| launched.attestation.clone()),
         internal,
         payments_seen: Mutex::new(BTreeMap::new()),
-        payments_halted: Default::default(),
+        payments_stalled: Default::default(),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
         turns: cloud::Turns::default(),
         sweeping: std::sync::Mutex::new(None),
@@ -952,14 +952,18 @@ async fn main() -> Result<()> {
     }
     // Busy as it stands now: a payment or a job that came in while closing
     // has the waker start the build service again.
-    let busy = service.busy(unread_payments(&service).await).await;
+    let unread = unread_payments(&service).await;
+    let busy = service.busy(unread.now).await;
     if busy {
         tracing::info!("work came in while closing: the wake plan says busy");
     }
     if let Some(internal) = &service.internal
         && service.plan_taken()
     {
-        match internal.put_plan(&plan(&service, busy).await).await {
+        match internal
+            .put_plan(&plan(&service, busy, &unread).await)
+            .await
+        {
             Err(error) if error.is::<cloud::NotBlessed>() => tracing::info!("{error}"),
             told => told?,
         }
@@ -1021,32 +1025,54 @@ fn archive_name(id: &str) -> String {
 }
 
 /// The build service's wake plan.
-async fn plan(service: &Service, busy: bool) -> cloud::WakePlan {
+async fn plan(service: &Service, busy: bool, unread: &Unread) -> cloud::WakePlan {
     cloud::WakePlan {
         busy,
         renew_at: service.attestation.as_ref().and_then(|a| a.renew_at()),
-        // A chain whose payments are no longer read is left out: the waker
-        // takes a chain the plan doesn't name as one with nothing to wake
-        // the build service for, since it could do nothing there.
+        retry_at: unread.retry_at,
+        // A chain whose payments can't be read for now is left out, so a
+        // payment there doesn't have the waker start the build service over
+        // and over: the retry time starts it instead.
         payments_seen: service
             .payments_seen
             .lock()
             .await
             .iter()
-            .filter(|(chain_id, _)| !service.payments_halted_on(chain_id))
+            .filter(|(chain_id, _)| !unread.stalled.contains(*chain_id))
             .map(|(chain_id, &count)| (chain_id.clone(), count))
             .collect(),
     }
 }
 
-/// Whether a chain connected has taken a payment the build service has not
-/// read yet: its registry's count now is past the count at the last block
-/// read through. A chain whose count can't be read now holds nothing up.
-async fn unread_payments(service: &Service) -> bool {
+/// What the build service has of payments it has not read yet, on the
+/// chains connected (see [`unread_payments`]).
+#[derive(Debug, Default)]
+struct Unread {
+    /// A payment it has not read waits on a chain whose payments are read
+    /// now or soon: work in hand.
+    now: bool,
+    /// The chains, by chain id, where a payment may wait unread while their
+    /// reads fail: each is left out of the wake plan's counts.
+    stalled: BTreeSet<String>,
+    /// When the first of those chains is read again, in unix seconds: the
+    /// waker starts the build service then, if it has exited.
+    retry_at: Option<u64>,
+}
+
+/// What a chain connected has taken of payments the build service has not
+/// read yet: its registry's count now past the count at the last block read
+/// through. On a chain whose reads are failing ([`Stalled`]), a payment that
+/// may wait (the count past the one seen, or not to be had) is work in hand
+/// only while it is read again soon and its last read failed for no reason
+/// of the registry's own; otherwise it gives the plan a retry time. A chain
+/// whose reads are not failing and whose count can't be read now holds
+/// nothing up.
+async fn unread_payments(service: &Service) -> Unread {
+    let mut unread = Unread::default();
     if let Ok(on) = service.on_solana()
         && solana::unread(service, &on).await
     {
-        return true;
+        unread.now = true;
     }
     let connected: Vec<Arc<Served>> = service
         .connected
@@ -1054,33 +1080,48 @@ async fn unread_payments(service: &Service) -> bool {
         .map(|connected| connected.values().cloned().collect())
         .unwrap_or_default();
     for on in connected {
-        // A payment there can't be read this run: nothing to stay up for.
-        if service.payments_halted_on(&on.client.chain_id.to_string()) {
-            continue;
-        }
-        let Some(seen) = service
-            .payments_seen
-            .lock()
-            .await
-            .get(&on.client.chain_id.to_string())
-            .copied()
-        else {
+        let chain_id = on.client.chain_id.to_string();
+        let stalled = service.stalled_on(&chain_id);
+        let seen = service.payments_seen.lock().await.get(&chain_id).copied();
+        let waiting = match seen {
             // Not read through even once yet.
-            return true;
+            None => true,
+            Some(seen) => match on
+                .client
+                .read(on.deployments.publishing, IPublishing::countCall {})
+                .await
+            {
+                Ok(count) => count > alloy::primitives::U256::from(seen),
+                Err(error) => {
+                    tracing::debug!(chain = %on.vault_chain, error = format!("{error:#}"), "the payments taken could not be counted");
+                    stalled.is_some()
+                }
+            },
         };
-        match on
-            .client
-            .read(on.deployments.publishing, IPublishing::countCall {})
-            .await
-        {
-            Ok(count) if count > alloy::primitives::U256::from(seen) => return true,
-            Ok(_) => {}
-            Err(error) => {
-                tracing::debug!(chain = %on.vault_chain, error = format!("{error:#}"), "the payments taken could not be counted")
-            }
+        if waiting {
+            unread.waiting(chain_id, stalled, unix_now());
         }
     }
-    false
+    unread
+}
+
+impl Unread {
+    /// Note a payment that may wait unread on the chain `chain_id`, whose
+    /// reads are failing as `stalled` says, at `now` (unix seconds).
+    fn waiting(&mut self, chain_id: String, stalled: Option<Stalled>, now: u64) {
+        let Some(stalled) = stalled else {
+            self.now = true;
+            return;
+        };
+        if !stalled.paused && stalled.retry_at <= now + STALLED_KEEPS_UP.as_secs() {
+            self.now = true;
+        }
+        self.stalled.insert(chain_id);
+        self.retry_at = Some(
+            self.retry_at
+                .map_or(stalled.retry_at, |at| at.min(stalled.retry_at)),
+        );
+    }
 }
 
 /// Watch whether the build service has anything to do, telling the API's
@@ -1101,8 +1142,9 @@ async fn watch_idle(service: &Service) {
             );
             said_kept = true;
         }
-        let busy = service.busy(unread_payments(service).await).await;
-        let plan = plan(service, busy).await;
+        let unread = unread_payments(service).await;
+        let busy = service.busy(unread.now).await;
+        let plan = plan(service, busy, &unread).await;
         let taken = service.plan_taken();
         if service.internal.is_some() && !taken && !said_waiting {
             tracing::info!(
@@ -1540,57 +1582,94 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
         .unwrap_or(on.deployments.deployed_block);
     // Where payments were last noted read through, for the wake plan.
     let mut noted = None;
+    let chain_id = on.client.chain_id.to_string();
+    let mut wait = STALLED_FIRST_WAIT;
     loop {
         let Some(turn) = service.turns.turn().await else {
             return;
         };
         let read = admit(&service, &on, &mut from).await;
-        if let Err(error) = &read
-            && let Some(halted) = error.downcast_ref::<Halted>()
-        {
-            service
-                .payments_halted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(on.client.chain_id.to_string());
-            tracing::warn!(
-                %chain,
-                from = halted.from,
-                to = halted.to,
-                error = halted.why,
-                minutes = HALTED_FOR.as_secs() / 60,
-                "payments on this chain are not read, nor waited for, until these blocks can be: \
-                 their logs could not be read, and passing over them could miss a payment"
-            );
-            drop(turn);
-            tokio::time::sleep(HALTED_FOR).await;
-            continue;
-        }
-        if read.is_ok()
-            && service
-                .payments_halted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&on.client.chain_id.to_string())
-        {
-            tracing::info!(%chain, "payments on this chain are read again");
-        }
         // Read through further, or not yet noted: one past read a turn at most.
         if noted != Some(from) && note_payments_seen(&service, &on, from).await {
             noted = Some(from);
         }
         drop(turn);
-        if let Err(error) = read {
-            tracing::warn!(%chain, error = format!("{error:#}"), "could not read payments");
+        let Err(error) = read else {
+            if service
+                .payments_stalled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&chain_id)
+                .is_some()
+            {
+                tracing::info!(%chain, "payments on this chain are read again");
+            }
+            wait = STALLED_FIRST_WAIT;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+        let halted = error.downcast_ref::<Halted>();
+        service
+            .payments_stalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                chain_id.clone(),
+                Stalled {
+                    retry_at: unix_now() + wait.as_secs(),
+                    paused: halted.is_some(),
+                },
+            );
+        match halted {
+            Some(halted) => tracing::warn!(
+                %chain,
+                from = halted.from,
+                to = halted.to,
+                error = halted.why,
+                seconds = wait.as_secs(),
+                "payments on this chain wait at these blocks: their logs could not be read, and \
+                 the registry's record of them does not prove which payments they hold; \
+                 read again later"
+            ),
+            None => tracing::warn!(
+                %chain,
+                error = format!("{error:#}"),
+                seconds = wait.as_secs(),
+                "could not read payments; trying again"
+            ),
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(STALLED_LONGEST_WAIT);
     }
 }
 
-/// How long a chain whose payments could not be read past a block (see
-/// [`Halted`]) waits before it is tried again. The build service may well be
-/// idle and gone by then: the next start tries again.
-const HALTED_FOR: Duration = Duration::from_secs(600);
+/// A chain whose last turn of reading payments failed: it is read again at
+/// `retry_at` (unix seconds), sooner after a first failure, later after
+/// each next one, never later than [`STALLED_LONGEST_WAIT`]. While a payment
+/// may wait unread there, the chain gives the wake plan that time, so the
+/// waker starts the build service again by then if it has exited.
+#[derive(Clone, Copy, Debug)]
+struct Stalled {
+    retry_at: u64,
+    /// Whether the registry's record could not prove which payments blocks
+    /// whose logs could not be read hold ([`Halted`]), rather than a read
+    /// that failed: that is not waited for with the build service kept up.
+    paused: bool,
+}
+
+/// The wait before reading payments again on a chain whose last turn
+/// failed; it doubles with each failed turn after.
+const STALLED_FIRST_WAIT: Duration = Duration::from_secs(5);
+
+/// The longest wait before reading payments again on a chain whose turns
+/// keep failing: the most a payment there waits for the build service to
+/// try again, once the waker honours the plan's retry time.
+const STALLED_LONGEST_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How soon a failed read must be tried again for a payment that may wait
+/// behind it to keep the build service up: a brief failure is read past in
+/// the same run, a longer one is left to the plan's retry time.
+const STALLED_KEEPS_UP: Duration = Duration::from_secs(60);
 
 /// Note how many payments the registry on `on` had taken at the last block
 /// payments were read through (`from` is the next to read), for the wake
@@ -2112,8 +2191,9 @@ fn check(
 /// over unread when the registry proves they hold none ([`first_payable`]).
 /// A page whose logs still fail after [`PAGE_TRIES`] tries is passed over
 /// only with every payment in it taken from the registry's record
-/// ([`recorded_between`]); when that record can't be had, or doesn't add
-/// up, the read ends in [`Halted`] rather than pass over a payment.
+/// ([`recorded_between`]). When that record can't be read, the turn fails
+/// and is tried again; when it is read but doesn't prove which payments the
+/// page holds, the read ends in [`Halted`]. Neither passes over a payment.
 async fn admit(service: &Arc<Service>, on: &Served, from: &mut u64) -> Result<()> {
     let confirmations = service
         .confirmations
@@ -2151,7 +2231,7 @@ async fn admit(service: &Arc<Service>, on: &Served, from: &mut u64) -> Result<()
     let mut pages = 0;
     while at <= confirmed && pages < PAGES_PER_TURN {
         pages += 1;
-        let to = confirmed.min(at + PAYMENT_SPAN - 1);
+        let mut to = confirmed.min(at + PAYMENT_SPAN - 1);
         let payments = match read_page(on, at, to).await {
             Ok(payments) => payments,
             Err(error) => {
@@ -2163,20 +2243,30 @@ async fn admit(service: &Arc<Service>, on: &Served, from: &mut u64) -> Result<()
                     error = format!("{error:#}"),
                     "the payments in these blocks could not be read: taking them from the registry's record"
                 );
-                let recorded = recorded_between(on, at, to).await.map_err(|why| Halted {
-                    from: at,
-                    to,
-                    why: format!("{why:#}"),
-                })?;
-                tracing::warn!(
-                    chain = %on.vault_chain,
-                    from = at,
-                    to,
-                    payments = recorded.len(),
-                    "passed over blocks whose logs could not be read, with every payment the \
-                     registry records in them"
-                );
-                recorded
+                match recorded_between(on, at, to, confirmed)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "the payments in blocks {at} to {to} could not be read, \
+                             from their logs nor from the registry's record"
+                        )
+                    })? {
+                    Recorded::Proven { payments, through } => {
+                        tracing::warn!(
+                            chain = %on.vault_chain,
+                            from = at,
+                            to = through,
+                            payments = payments.len(),
+                            "passed over blocks whose logs could not be read, with every \
+                             payment the registry records in them"
+                        );
+                        to = through;
+                        payments
+                    }
+                    Recorded::Unproven(why) => {
+                        return Err(Halted { from: at, to, why }.into());
+                    }
+                }
             }
         };
         if !payments.is_empty() {
@@ -2212,11 +2302,10 @@ const PAGE_TRIES: u32 = 3;
 /// The wait before a page of payments is asked for again, doubled each time.
 const PAGE_RETRY_WAIT: Duration = Duration::from_secs(2);
 
-/// Payments on a chain could not be read in blocks `from..=to`, nor taken
-/// from the registry's record of them: reading on would pass over a
-/// payment, so that chain's payments are not read for a while
-/// ([`HALTED_FOR`]), and the chain neither keeps the build service up nor
-/// is named in its wake plan meanwhile.
+/// Payments on a chain could not be read in blocks `from..=to`, and the
+/// registry's record, read, does not prove which payments those blocks
+/// hold: reading on could pass over a payment, so that chain's payments
+/// wait there ([`Stalled`]), without keeping the build service up.
 #[derive(Debug)]
 struct Halted {
     from: u64,
@@ -2288,33 +2377,38 @@ async fn read_page(on: &Served, from: u64, to: u64) -> Result<Vec<Payment>> {
     }
 }
 
-/// How many payments the registry on `on` had taken by the end of `block`,
-/// as the chain's endpoints say: none before it was deployed.
+/// How many payments the registry on `on` had taken by the end of `block`:
+/// none before it was deployed. Read only through an endpoint known to
+/// answer as of the block asked, never one that may answer with an earlier
+/// or later block's state: blocks are passed over on this count.
 async fn count_at(on: &Served, block: Option<u64>) -> Result<u64> {
     let Some(block) = block.filter(|block| *block >= on.deployments.deployed_block) else {
         return Ok(0);
     };
     let count = on
         .client
-        .read_at(
-            on.deployments.publishing,
-            IPublishing::countCall {},
-            alloy::eips::BlockId::number(block),
-        )
+        .read_at_honoured(on.deployments.publishing, IPublishing::countCall {}, block)
         .await?;
     Ok(count.saturating_to())
 }
 
-/// The registry's record of payment `id`: who paid, for what, and when.
+/// The registry's record of payment `id`: who paid, for what, and when. A
+/// record not there (an endpoint whose state is behind answers so for a
+/// payment it hasn't seen) is an error, never a payment made at time 0.
 async fn submission(on: &Served, id: u64) -> Result<chain::bindings::publishing::Submission> {
-    on.client
+    let paid = on
+        .client
         .read(
             on.deployments.publishing,
             IPublishing::submissionOfCall {
                 strategyId: alloy::primitives::U256::from(id),
             },
         )
-        .await
+        .await?;
+    if paid.author == Address::ZERO || paid.paidAt == 0 {
+        bail!("the registry's record of payment {id} is not there to be read");
+    }
+    Ok(paid)
 }
 
 /// Whether payment `id` was made before block `block`, by its own record:
@@ -2324,33 +2418,57 @@ async fn paid_before(on: &Served, id: u64, block: u64) -> Result<bool> {
 }
 
 /// Whether payment `id` was made after block `block`, by its own record:
-/// paid after that block's time, or not made yet (`now` is the count at the
-/// head).
-async fn paid_after(on: &Served, id: u64, block: u64, now: u64) -> Result<bool> {
-    Ok(id > now || submission(on, id).await?.paidAt > on.client.block_timestamp_at(block).await?)
+/// paid after that block's time, or not made by block `last` (`taken` is the
+/// count there, `block <= last`).
+async fn paid_after(on: &Served, id: u64, block: u64, taken: u64) -> Result<bool> {
+    Ok(
+        id > taken
+            || submission(on, id).await?.paidAt > on.client.block_timestamp_at(block).await?,
+    )
 }
 
-/// Whether no payment was made in blocks `from..=to`, `before` being the
-/// count of payments made before `from` as an endpoint says it. Ids follow
-/// the blocks they were paid in, so it is proven by what no endpoint can
-/// answer wrong: payment `before` was paid before `from`'s time, and payment
-/// `before + 1` after `to`'s. An endpoint that answers a past read with the
-/// head's state fails the proof rather than pass it; so do two blocks with
-/// the same time.
-async fn none_between(on: &Served, from: u64, to: u64, before: u64, now: u64) -> Result<bool> {
-    Ok(before <= now
-        && paid_before(on, before, from).await?
-        && paid_after(on, before + 1, to, now).await?)
+/// How many block edges a proof by the times payments were made moves
+/// past, one block at a time, when an edge falls between two blocks of the
+/// same time (which can't tell a payment in one from a payment in the
+/// other).
+const EDGE_SHIFTS: u64 = 4;
+
+/// The last block from `from` to `to`, `to` first then each block before it
+/// down to [`EDGE_SHIFTS`] blocks, such that no payment was made in blocks
+/// `from..=it`, `before` being the count before `from`; `None` when none of
+/// those is proven. Ids follow the blocks they were paid in, so it is
+/// proven by the times the payments on either side were made: payment
+/// `before` before `from`'s time, and payment `before + 1` after the last
+/// block's. `taken` is the count at a block at or past `to`.
+async fn none_through(
+    on: &Served,
+    from: u64,
+    to: u64,
+    before: u64,
+    taken: u64,
+) -> Result<Option<u64>> {
+    if before > taken || !paid_before(on, before, from).await? {
+        return Ok(None);
+    }
+    for last in (from.max(to.saturating_sub(EDGE_SHIFTS))..=to).rev() {
+        if paid_after(on, before + 1, last, taken).await? {
+            return Ok(Some(last));
+        }
+    }
+    Ok(None)
 }
 
 /// The first block from `from` to `to` that may hold a payment, or `to + 1`
 /// if none does, as far as the registry proves it: `from` when it proves
 /// nothing. The counts at past blocks find the block where the count first
-/// rises, and [`none_between`] proves the blocks before it hold none.
+/// rises, and [`none_through`] proves the blocks before it hold none. Every
+/// count is read as of the block asked ([`count_at`]), so an endpoint behind
+/// fails it rather than pass it.
 async fn first_payable(on: &Served, from: u64, to: u64) -> Result<u64> {
     let before = count_at(on, from.checked_sub(1)).await?;
+    let taken = count_at(on, Some(to)).await?;
     let mut first = to + 1;
-    if count_at(on, Some(to)).await? != before {
+    if taken != before {
         let (mut low, mut high) = (from, to);
         while low < high {
             let middle = low + (high - low) / 2;
@@ -2365,53 +2483,79 @@ async fn first_payable(on: &Served, from: u64, to: u64) -> Result<u64> {
     if first == from {
         return Ok(from);
     }
-    let now: u64 = on
-        .client
-        .read(on.deployments.publishing, IPublishing::countCall {})
+    Ok(none_through(on, from, first - 1, before, taken)
         .await?
-        .saturating_to();
-    Ok(if none_between(on, from, first - 1, before, now).await? {
-        first
-    } else {
-        from
-    })
+        .map_or(from, |last| last + 1))
 }
 
-/// Every payment made in blocks `from..=to`, from the registry's record
-/// rather than its logs: the payments numbered after the count before
-/// `from` up to the count at `to`, once [`none_between`] proves none before
-/// or after them falls in those blocks. An error when it can't be proven.
-async fn recorded_between(on: &Served, from: u64, to: u64) -> Result<Vec<Payment>> {
-    let before = count_at(on, from.checked_sub(1)).await?;
-    let through = count_at(on, Some(to)).await?;
-    let now: u64 = on
-        .client
-        .read(on.deployments.publishing, IPublishing::countCall {})
-        .await?
-        .saturating_to();
-    if through < before
-        || through > now
-        || !paid_before(on, before, from).await?
-        || !paid_after(on, through + 1, to, now).await?
-    {
-        bail!(
-            "the registry's count of payments before and through these blocks does not match \
-             when its payments were made"
-        );
-    }
-    let mut payments = Vec::new();
-    for id in before + 1..=through {
-        let paid = submission(on, id).await?;
-        if paid.author == Address::ZERO {
-            bail!("the registry holds no payment {id}");
+/// What the registry's record says of the payments in a span of blocks.
+enum Recorded {
+    /// Every payment made in blocks from the span's first to `through`.
+    Proven {
+        payments: Vec<Payment>,
+        through: u64,
+    },
+    /// The record was read, but doesn't prove which payments the span holds.
+    Unproven(String),
+}
+
+/// Every payment made in blocks `from..=to`, or in a span from `from` that
+/// ends a few blocks short of `to` ([`EDGE_SHIFTS`]), from the registry's
+/// record rather than its logs: the payments numbered after the count
+/// before `from` up to the count at the span's end, once the times payments
+/// were made prove none before or after them falls in those blocks
+/// ([`none_through`], with the first block moved back as far when its edge
+/// is what fails). An error when the record can't be read (it may say more
+/// when read again); [`Recorded::Unproven`] when it is read and proves
+/// nothing.
+async fn recorded_between(on: &Served, from: u64, to: u64, confirmed: u64) -> Result<Recorded> {
+    let taken = count_at(on, Some(confirmed)).await?;
+    let mut start = None;
+    let lowest = from
+        .saturating_sub(EDGE_SHIFTS)
+        .max(on.deployments.deployed_block);
+    for first in (lowest..=from).rev() {
+        let before = count_at(on, first.checked_sub(1)).await?;
+        if before <= taken && paid_before(on, before, first).await? {
+            start = Some(before);
+            break;
         }
-        payments.push(Payment {
-            strategy_id: id,
-            upload: paid.upload,
-            author: Wallet::Evm(paid.author),
+    }
+    let Some(before) = start else {
+        return Ok(Recorded::Unproven(
+            "the payments before these blocks were not all made before their first block's \
+             time"
+                .into(),
+        ));
+    };
+    for last in (from.max(to.saturating_sub(EDGE_SHIFTS))..=to).rev() {
+        let through = count_at(on, Some(last)).await?;
+        if through < before || through > taken {
+            return Ok(Recorded::Unproven(format!(
+                "the registry's count of payments goes from {before} to {through} through these \
+                 blocks, and stands at {taken} later"
+            )));
+        }
+        if !paid_after(on, through + 1, last, taken).await? {
+            continue;
+        }
+        let mut payments = Vec::new();
+        for id in before + 1..=through {
+            let paid = submission(on, id).await?;
+            payments.push(Payment {
+                strategy_id: id,
+                upload: paid.upload,
+                author: Wallet::Evm(paid.author),
+            });
+        }
+        return Ok(Recorded::Proven {
+            payments,
+            through: last,
         });
     }
-    Ok(payments)
+    Ok(Recorded::Unproven(
+        "the payment after these blocks was not made after their last block's time".into(),
+    ))
 }
 
 /// Note that every payment on `on` up to `block` has been read and acted on,
@@ -3410,6 +3554,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::File::open(directory)?.sync_all()
 }
 
+/// The wall clock, in unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 fn now() -> time::PrimitiveDateTime {
     let now = time::OffsetDateTime::now_utc();
     time::PrimitiveDateTime::new(now.date(), now.time())
@@ -3460,7 +3611,7 @@ mod tests {
             attestation: None,
             internal,
             payments_seen: Mutex::new(BTreeMap::new()),
-            payments_halted: Default::default(),
+            payments_stalled: Default::default(),
             idle: cloud::Idle::new(None),
             turns: cloud::Turns::default(),
             sweeping: std::sync::Mutex::new(None),
@@ -3749,29 +3900,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A chain whose payments can't be read past a block is left out of the
-    /// wake plan, so a payment the build service can't read there never
-    /// wakes it; once it is read again, the chain is back in the plan.
+    /// A chain whose reads are failing with a payment that may wait there is
+    /// left out of the wake plan's counts, and gives the plan the time it is
+    /// read again, so the waker starts the build service by then; a chain
+    /// read as usual stays in the plan with no retry time.
     #[tokio::test]
-    async fn a_chain_whose_payments_cannot_be_read_is_left_out_of_the_wake_plan() {
-        let dir = a_scratch("plan-halted");
+    async fn a_chain_whose_payments_cannot_be_read_gives_the_wake_plan_a_time_to_try_again() {
+        let dir = a_scratch("plan-stalled");
         let service = a_service(&dir, None);
         service
             .payments_seen
             .lock()
             .await
             .extend([("998".to_string(), 3), ("84532".to_string(), 1)]);
-        service
-            .payments_halted
-            .lock()
-            .unwrap()
-            .insert("998".to_string());
+        let now = 1_000_000;
+        let mut unread = Unread::default();
+        unread.waiting(
+            "998".to_string(),
+            Some(Stalled {
+                retry_at: now + 900,
+                paused: false,
+            }),
+            now,
+        );
+        let left = plan(&service, false, &unread).await;
         assert_eq!(
-            plan(&service, false).await.payments_seen,
+            left.payments_seen,
             BTreeMap::from([("84532".to_string(), 1)])
         );
-        service.payments_halted.lock().unwrap().clear();
-        assert_eq!(plan(&service, false).await.payments_seen.len(), 2);
+        assert_eq!(left.retry_at, Some(now + 900));
+        let read = plan(&service, false, &Unread::default()).await;
+        assert_eq!(read.payments_seen.len(), 2);
+        assert_eq!(read.retry_at, None);
+    }
+
+    /// A payment that may wait behind a failed read keeps the build service
+    /// up only while the read is tried again soon, and only when the read
+    /// failed rather than the registry's record proving nothing; otherwise
+    /// it is left to the plan's retry time, the earliest of all the chains'.
+    #[test]
+    fn a_payment_behind_a_failed_read_is_work_in_hand_only_while_it_is_read_again_soon() {
+        let now = 1_000_000;
+        let stalled = |retry_at: u64, paused: bool| Some(Stalled { retry_at, paused });
+        let weighed = |chains: &[Option<Stalled>]| {
+            let mut unread = Unread::default();
+            for (at, stalled) in chains.iter().enumerate() {
+                unread.waiting(at.to_string(), *stalled, now);
+            }
+            unread
+        };
+        // Read as usual: work in hand, no retry time.
+        let unread = weighed(&[None]);
+        assert!(unread.now && unread.stalled.is_empty() && unread.retry_at.is_none());
+        // A brief failure: tried again soon, in this run.
+        let unread = weighed(&[stalled(now + 5, false)]);
+        assert!(unread.now, "{unread:?}");
+        assert_eq!(unread.retry_at, Some(now + 5));
+        // Failing a while: not kept up for, but woken for.
+        let unread = weighed(&[stalled(now + 600, false), stalled(now + 300, false)]);
+        assert!(!unread.now, "{unread:?}");
+        assert_eq!(unread.retry_at, Some(now + 300));
+        assert_eq!(unread.stalled.len(), 2);
+        // The record proves nothing: never kept up for, still woken for.
+        let unread = weighed(&[stalled(now + 5, true)]);
+        assert!(!unread.now, "{unread:?}");
+        assert_eq!(unread.retry_at, Some(now + 5));
     }
 
     /// The build service is busy with a paid job waiting, being reviewed or
