@@ -300,7 +300,13 @@ pub async fn run(
     let _ = std::fs::remove_dir_all(&work);
 
     for (index, plan) in PLAN.iter().enumerate() {
-        let prepared = prepare(&agents, &agent, &work.join(index.to_string()), plan)?;
+        let prepared = prepare(
+            &agents,
+            &agent,
+            &work.join(index.to_string()),
+            plan,
+            vault_chain,
+        )?;
         tracing::info!(title = plan.title, "publishing");
         let published = crate::publish::publish(
             client,
@@ -1064,7 +1070,6 @@ async fn killed(
     Ok(())
 }
 
-/// Copy the agent into a scratch tree, under the title a plan asks for.
 /// A copy of the agents with `project`'s manifest naming `vault_chain` as its
 /// vault's chain, when it names another; none when it already names it.
 pub(crate) fn on_vault_chain(
@@ -1073,6 +1078,25 @@ pub(crate) fn on_vault_chain(
     vault_chain: shared::Chain,
 ) -> Result<Option<PathBuf>> {
     let manifest = std::fs::read_to_string(project.join("shonin.toml"))?;
+    let Some(rewritten) = naming_vault_chain(&manifest, vault_chain) else {
+        return Ok(None);
+    };
+    let into = std::env::temp_dir().join(format!("shonin-seed-{}", vault_chain.name()));
+    let _ = std::fs::remove_dir_all(&into);
+    copy_tree(agents, &into)?;
+    let relative = project.strip_prefix(agents).unwrap_or(project);
+    let moved = into.join(relative);
+    std::fs::write(moved.join("shonin.toml"), rewritten)?;
+    tracing::info!(
+        chain = vault_chain.name(),
+        "the manifest names another vault chain: publishing a copy that names this one"
+    );
+    Ok(Some(moved))
+}
+
+/// `manifest` with its vault's chain named `vault_chain`, or `None` when it
+/// already names it.
+fn naming_vault_chain(manifest: &str, vault_chain: shared::Chain) -> Option<String> {
     let wanted = format!("chain = \"{}\"", vault_chain.name());
     let mut in_vault = false;
     let mut changed = false;
@@ -1091,23 +1115,19 @@ pub(crate) fn on_vault_chain(
             }
         })
         .collect();
-    if !changed {
-        return Ok(None);
-    }
-    let into = std::env::temp_dir().join(format!("shonin-seed-{}", vault_chain.name()));
-    let _ = std::fs::remove_dir_all(&into);
-    copy_tree(agents, &into)?;
-    let relative = project.strip_prefix(agents).unwrap_or(project);
-    let moved = into.join(relative);
-    std::fs::write(moved.join("shonin.toml"), rewritten.join("\n") + "\n")?;
-    tracing::info!(
-        chain = vault_chain.name(),
-        "the manifest names another vault chain: publishing a copy that names this one"
-    );
-    Ok(Some(moved))
+    changed.then(|| rewritten.join("\n") + "\n")
 }
 
-fn prepare(agents: &Path, agent: &Path, into: &Path, plan: &Plan) -> Result<PathBuf> {
+/// Copy the agent into a scratch tree, under the title a plan asks for and
+/// naming `vault_chain` as its vault's chain: the build service refuses a
+/// manifest that names another chain than the one it is uploaded for.
+fn prepare(
+    agents: &Path,
+    agent: &Path,
+    into: &Path,
+    plan: &Plan,
+    vault_chain: shared::Chain,
+) -> Result<PathBuf> {
     copy_tree(agents, into)?;
     let relative = agent
         .strip_prefix(agents)
@@ -1115,7 +1135,9 @@ fn prepare(agents: &Path, agent: &Path, into: &Path, plan: &Plan) -> Result<Path
     let project = into.join(relative);
 
     let manifest_path = project.join("shonin.toml");
-    let manifest: String = std::fs::read_to_string(&manifest_path)?
+    let manifest = std::fs::read_to_string(&manifest_path)?;
+    let manifest = naming_vault_chain(&manifest, vault_chain).unwrap_or(manifest);
+    let manifest: String = manifest
         .lines()
         .map(|line| {
             if line.starts_with("title = ") {
@@ -1201,4 +1223,57 @@ pub(crate) fn guess_agents() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_full_seed_publishes_its_agent_naming_the_chain_it_is_seeded_on() {
+        let scratch = std::env::temp_dir().join(format!(
+            "shonin-seed-prepare-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agents = scratch.join("agents");
+        let agent = agents.join("packages/agents/funding-basis");
+        std::fs::create_dir_all(agent.join("src")).unwrap();
+        std::fs::write(
+            agent.join("shonin.toml"),
+            "[vault]\nchain = \"base\"\n\n[description]\ntitle = \"Funding basis\"\n\n[drivers.local]\n",
+        )
+        .unwrap();
+        std::fs::write(agent.join("src/lib.rs"), "").unwrap();
+
+        let project = prepare(
+            &agents,
+            &agent,
+            &scratch.join("work"),
+            &PLAN[0],
+            shared::Chain::Robinhood,
+        )
+        .unwrap();
+        let manifest = std::fs::read_to_string(project.join("shonin.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            manifest.contains("[vault]\nchain = \"robinhood\"\n"),
+            "{manifest}"
+        );
+        assert!(manifest.contains(&format!("title = \"{}\"", PLAN[0].title)));
+        assert!(!manifest.contains("\"base\""), "{manifest}");
+    }
+
+    #[test]
+    fn a_manifest_already_naming_the_chain_is_left_as_it_is() {
+        let manifest = "[vault]\nchain = \"base\"\n[description]\nchain = \"x\"\n";
+        assert_eq!(naming_vault_chain(manifest, shared::Chain::Base), None);
+        assert_eq!(
+            naming_vault_chain(manifest, shared::Chain::Hyperliquid).as_deref(),
+            Some("[vault]\nchain = \"hyperliquid\"\n[description]\nchain = \"x\"\n")
+        );
+    }
 }

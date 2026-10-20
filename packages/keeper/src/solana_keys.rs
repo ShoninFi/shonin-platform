@@ -148,6 +148,10 @@ pub(crate) type Stakes = HashMap<Pubkey, Instant>;
 
 /// How long a `bless` that went through holds the next one for the same
 /// leaf back: long enough for any node the keeper asks to have its slot.
+/// A hold ends sooner once the cluster shows the key blessed for longer than
+/// when the `bless` was sent: the send is seen to have landed, and on a
+/// development cluster's fast clock a blessing lasts less than this, so the
+/// next renewal is due before it is over.
 const DONE_HOLD: Duration = Duration::from_secs(90);
 
 /// How long a `bless`, or a stake, that may still land holds the next one
@@ -179,7 +183,10 @@ pub(crate) fn top_up(holds: u64, stake: u64) -> u64 {
 /// rounds.
 #[derive(Default)]
 pub(crate) struct Memory {
-    held: HashMap<Read, Instant>,
+    /// Each leaf whose `bless` was sent, until when no other is sent for
+    /// it, and when the key's blessing ended as the send went out: a
+    /// blessing read to end later says the send landed, and ends the hold.
+    held: HashMap<Read, (Instant, u64)>,
     /// Each leaf whose blessing the registry stopped counting although it
     /// runs on, and the issue time of the seal sent again for it.
     resent: HashMap<Read, u64>,
@@ -238,7 +245,7 @@ pub(crate) async fn round(
     let published_leaves: HashSet<&Read> = leaves.iter().collect();
     memory
         .held
-        .retain(|leaf, until| published_leaves.contains(leaf) && at < *until);
+        .retain(|leaf, (until, _)| published_leaves.contains(leaf) && at < *until);
     memory
         .resent
         .retain(|leaf, _| published_leaves.contains(leaf));
@@ -276,6 +283,13 @@ pub(crate) async fn round(
         if !renews && !recounts {
             continue;
         }
+        if memory
+            .held
+            .get(leaf)
+            .is_some_and(|(_, sent_over)| blessed.until > *sent_over)
+        {
+            memory.held.remove(leaf);
+        }
         if memory.held.contains_key(leaf) {
             continue;
         }
@@ -291,7 +305,7 @@ pub(crate) async fn round(
             Sent::Failed => None,
         };
         if let Some(hold) = hold {
-            memory.held.insert(leaf.clone(), at + hold);
+            memory.held.insert(leaf.clone(), (at + hold, blessed.until));
         }
         if sent == Sent::Done {
             if recounts {
@@ -704,6 +718,52 @@ mod tests {
         one_round(&stand, &published, &mut memory).await;
         one_round(&stand, &published, &mut memory).await;
         assert_eq!(*stand.sent.lock().unwrap(), vec![key(1)]);
+    }
+
+    #[tokio::test]
+    async fn a_blessing_seen_to_land_does_not_hold_back_the_next_renewal() {
+        // On a development cluster's fast clock a blessing lasts about a
+        // minute, less than a relay that went through holds the next back.
+        let stand = Stand::new();
+        let blessed = |until| Blessed {
+            until,
+            executor: true,
+            counts: true,
+            ttl: TTL,
+        };
+        stand
+            .blessings
+            .lock()
+            .unwrap()
+            .insert(key(1), blessed(NOW + TTL / 4));
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        round(
+            &stand,
+            "solana:devnet",
+            &published(vec![leaf(1)], Some(NOW)),
+            &mut memory,
+            start,
+        )
+        .await
+        .unwrap();
+        // It landed, and the clock ran on: the blessing it gave is down to a
+        // third already, well inside the hold, and a newer seal is out.
+        stand
+            .blessings
+            .lock()
+            .unwrap()
+            .insert(key(1), blessed(NOW + TTL / 4 + 60));
+        round(
+            &stand,
+            "solana:devnet",
+            &published(vec![leaf(1)], Some(NOW + 60)),
+            &mut memory,
+            start + Duration::from_secs(45),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*stand.sent.lock().unwrap(), vec![key(1), key(1)]);
     }
 
     #[tokio::test]
