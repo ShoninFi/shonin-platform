@@ -85,6 +85,10 @@ struct Pool {
     /// one past the highest nonce it holds, gaps or not, as some nodes
     /// count them.
     counts_past_gaps: bool,
+    /// Whether its answers about a transaction (its receipt, the
+    /// transaction itself) come from a node behind the one that counts the
+    /// account's sends, as behind a load balancer: none yet.
+    lagging_receipts: bool,
 }
 
 type Shared = Arc<Mutex<Pool>>;
@@ -220,6 +224,9 @@ impl Pool {
         let refused = |message: String| json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": message}});
         let hash_param = || -> B256 { params[0].as_str().unwrap().parse().unwrap() };
         match asked["method"].as_str().unwrap_or_default() {
+            "eth_getTransactionReceipt" | "eth_getTransactionByHash" if self.lagging_receipts => {
+                ok(Value::Null)
+            }
             "eth_chainId" => ok(json!(format!("0x{SIGNED_FOR:x}"))),
             "eth_blockNumber" => ok(json!(format!("0x{:x}", self.head))),
             "eth_gasPrice" | "eth_maxPriorityFeePerGas" => ok(json!("0x3b9aca00")),
@@ -725,7 +732,7 @@ async fn a_send_of_the_same_key_from_elsewhere_never_has_a_duty_sent_twice() {
         until_pooled(&pool, 1).await;
         pool.lock().unwrap().external(keeper);
         // Blocks go on being mined.
-        for _ in 0..40 {
+        for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             pool.lock().unwrap().mine();
         }
@@ -745,6 +752,95 @@ async fn a_send_of_the_same_key_from_elsewhere_never_has_a_duty_sent_twice() {
             .collect::<Vec<_>>(),
         vec![(None, 0), (Some(vault(1)), 1)],
         "the valuation landed twice, or not after the other send"
+    );
+}
+
+/// A valuation that landed is not said not to have gone out because the
+/// node answering for its receipt is some blocks behind the one that counts
+/// the account's sends: its receipt is looked for until it comes.
+#[tokio::test]
+async fn a_landed_send_whose_receipt_lags_the_count_is_seen_to_land() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(100))).await;
+    let (client, keeper) = the_keeper_on(&url, Duration::from_secs(20)).await;
+    let lagging = async {
+        until_pooled(&pool, 1).await;
+        pool.lock().unwrap().lagging_receipts = true;
+        // Mined, its receipt ten blocks behind.
+        while mined(&pool, keeper).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        pool.lock().unwrap().lagging_receipts = false;
+    };
+    let (outcome, ()) = tokio::join!(value(&client, keeper, vault(1)), lagging);
+    assert_eq!(
+        mined(&pool, keeper),
+        vec![(Some(vault(1)), 0, 17, true)],
+        "it landed"
+    );
+    assert_eq!(outcome, Outcome::Done, "a landed valuation said not sent");
+}
+
+/// A landed send whose receipt no node answering gives before its deadline
+/// is said never to have landed, which may yet be wrong, never superseded:
+/// nothing says another transaction took its nonce.
+#[tokio::test]
+async fn a_landed_send_whose_receipt_never_comes_is_not_said_superseded() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(100))).await;
+    let (client, keeper) = the_keeper_on(&url, Duration::from_secs(2)).await;
+    let lagging = async {
+        until_pooled(&pool, 1).await;
+        pool.lock().unwrap().lagging_receipts = true;
+    };
+    let (sent, ()) = tokio::join!(
+        client.send(keeper, vault(1), IVault::recordValuationCall {}),
+        lagging
+    );
+    let error = sent.expect_err("no receipt was ever given");
+    assert_eq!(mined(&pool, keeper).len(), 1, "it landed");
+    assert!(
+        !error
+            .chain()
+            .any(|cause| cause.is::<chain::client::Superseded>()),
+        "a landed send was said superseded: {error:#}"
+    );
+    assert!(chain::unanswered(&error), "{error:#}");
+}
+
+/// A send whose nonce another transaction of the same key took is still
+/// said to have been superseded, once its receipt has stayed missing for
+/// longer than a node behind another explains, and before its deadline.
+#[tokio::test]
+async fn a_send_whose_nonce_another_took_is_said_superseded_before_its_deadline() {
+    let (pool, url) = a_node_with_a_pool(Some(Duration::from_millis(50))).await;
+    pool.lock().unwrap().never_mines.insert(vault(1));
+    let wait = Duration::from_secs(20);
+    let (client, keeper) = the_keeper_on(&url, wait).await;
+    let started = std::time::Instant::now();
+    let (sent, ()) = tokio::join!(
+        client.send(keeper, vault(1), IVault::recordValuationCall {}),
+        async {
+            until_pooled(&pool, 1).await;
+            pool.lock().unwrap().external(keeper);
+        }
+    );
+    let error = sent.expect_err("its nonce was taken");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<chain::client::Superseded>()),
+        "{error:#}"
+    );
+    assert!(
+        started.elapsed() < wait / 2,
+        "it was said superseded only at its deadline"
+    );
+    assert_eq!(
+        mined(&pool, keeper)
+            .iter()
+            .map(|(to, nonce, ..)| (*to, *nonce))
+            .collect::<Vec<_>>(),
+        vec![(None, 0)]
     );
 }
 

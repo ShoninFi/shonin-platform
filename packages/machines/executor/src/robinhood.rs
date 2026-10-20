@@ -276,13 +276,24 @@ impl StockHalf {
                         feed_updated_at: u64::try_from(round.updatedAt).unwrap_or(0),
                         market_price: units(market, self.trader.dollar_decimals),
                         multiplier: units(token.uiMultiplier().call().await.unwrap_or(whole), 18),
-                        paused: token.oraclePaused().call().await.unwrap_or(false),
+                        paused: oracle_paused(provider, listed.token).await,
                     });
                 }
                 Ok(strategy_sdk::to_payload(&prices))
             }
         }
     }
+}
+
+/// Whether `token`'s oracle is paused, as the agent is told: one whose read
+/// failed is told paused, so the agent leaves it alone until it is read.
+async fn oracle_paused(provider: &alloy::providers::DynProvider, token: Address) -> bool {
+    robinhood::trader::oracle_paused(provider, token)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%token, error = %format!("{error:#}"), "whether the token's oracle is paused wasn't read: it is told paused");
+            true
+        })
 }
 
 // Lighter -------------------------------------------------------------------------
@@ -960,6 +971,29 @@ pub fn read_together(took: Duration, started_at: u64, as_of: u64) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token's oracle read that gets no answer is told the agent as
+    /// paused, so it is not traded on; one the token doesn't have (it
+    /// reverts) is told not paused.
+    #[tokio::test]
+    async fn a_token_whose_oracle_read_fails_is_told_paused() {
+        use alloy::providers::{Provider, ProviderBuilder};
+        let token = Address::repeat_byte(0x11);
+        let unanswered = ProviderBuilder::new()
+            .connect_mocked_client(alloy::transports::mock::Asserter::new())
+            .erased();
+        assert!(oracle_paused(&unanswered, token).await);
+        let reverting = alloy::transports::mock::Asserter::new();
+        reverting.push_failure(alloy::rpc::json_rpc::ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        });
+        let reverting = ProviderBuilder::new()
+            .connect_mocked_client(reverting)
+            .erased();
+        assert!(!oracle_paused(&reverting, token).await);
+    }
 
     #[test]
     fn a_post_is_made_at_once_when_the_driver_waits_for_one_read_after_a_time_now_past() {
