@@ -63,6 +63,11 @@ pub struct ChainInfo {
     /// the chain is first read.
     #[serde(default)]
     pub as_of: Option<PrimitiveDateTime>,
+    /// Whether the chain's history is still being read (after a start, or
+    /// after a reorganisation undid part of it): `block` and `as_of` are then
+    /// the last block read whole, and the record is not yet current.
+    #[serde(default)]
+    pub catching_up: bool,
 }
 
 impl Snapshot {
@@ -91,6 +96,10 @@ pub struct Config {
     pub asset_decimals: u8,
     /// The terms the platform is running under on this chain, read from it.
     pub terms: Terms,
+    /// When the terms were read, on the chain's own clock: they are read in
+    /// the background with the record and served as last read.
+    #[serde(default)]
+    pub terms_as_of: Option<PrimitiveDateTime>,
     /// Set on a development chain, where accounts are unlocked and the app can
     /// offer one as a wallet. Never set anywhere else.
     pub dev: Option<DevMode>,
@@ -213,8 +222,10 @@ pub struct Holding {
     pub exit_value: f64,
     /// What was paid for them, read from the vault's own deposits and
     /// withdrawals, so a profit or loss is the chain's arithmetic rather than
-    /// something the browser remembered.
-    pub cost: f64,
+    /// something the browser remembered. None when it is not known (the
+    /// vault's history not read through yet): never shown as nothing paid.
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 /// A claim this address is waiting on.

@@ -201,8 +201,14 @@ pub struct Vault {
     /// The vault's station on its own chain: the master of its venue
     /// accounts.
     pub station: String,
-    /// Everything the vault is worth at its last valuation, less the tank.
+    /// Every share at the price of the last valuation (the price every
+    /// request is priced at): a deposit priced since is in it, as the shares
+    /// it made. Dollars in escrow are not. A closed vault is worth its cash.
     pub value: f64,
+    /// When that valuation was made, on the chain's own clock; None before
+    /// the first.
+    #[serde(default)]
+    pub valued_at: Option<PrimitiveDateTime>,
     /// Its cash, which pays withdrawals without closing anything.
     pub idle: f64,
     /// Deposits waiting for a valuation, held apart.

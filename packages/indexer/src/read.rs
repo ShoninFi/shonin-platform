@@ -4,17 +4,26 @@
 //! is asked of the vault itself at each past block, so the record is not a
 //! store anyone has to trust: delete this service's memory and it rebuilds
 //! the same numbers from the chain.
+//!
+//! The record is built from two things the chain's reader gathers (see
+//! `crate::evm`): the views of one observation, every read at one block
+//! ([`Views`]), and what the chain's logs up to that block come to
+//! ([`History`], folded log by log in order). Building reads nothing of the
+//! chain itself; the readings taken at past blocks (each vault's hourly
+//! value, the supply a paid claim was paid from) are taken apart, through
+//! [`Past`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
-use alloy::rpc::types::{Filter, Log};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
+use chain::Deployments;
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::profiles::IAuthorProfiles;
+use chain::bindings::publishing::IPublishing;
 use chain::bindings::reviews::IReviewRegistry;
 use chain::bindings::station::IStationVault;
 use chain::bindings::strategies::IStrategyRegistry;
@@ -23,7 +32,6 @@ use chain::bindings::vault::{
     VaultState as ChainVaultState,
 };
 use chain::bindings::venue::ILocalVenue;
-use chain::{Client, Deployments};
 use shared::model::activity::{EventKind, Kill, Side, Trade, VaultEvent};
 use shared::model::attestation::{Approval, Attestation, BlessedKey, Image, KeyRole};
 use shared::model::bundle::{Bundle, ModelFile};
@@ -37,13 +45,15 @@ use shared::model::vault::{
 use shared::model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};
 use time::{Date, OffsetDateTime, PrimitiveDateTime};
 
-use crate::logs::{Cursor, read_on};
 use crate::store::Store;
+pub use crate::views::Views;
 
-/// What the indexer remembers between reads of a chain: the samples it has
-/// taken, and what it has made of each stream of logs and how far each has
-/// been read.
-#[derive(Default)]
+/// What the indexer remembers of a chain between refreshes: what its logs
+/// have come to, the readings it has taken, and what it has learned not to
+/// read again. All of it is derived from the chain as of one block, and kept
+/// whole as a checkpoint at each refresh, so a reorganisation undoes it to a
+/// block that is still on the chain.
+#[derive(Clone, Default)]
 pub struct History {
     /// Each vault's readings, oldest first: hourly for the last
     /// [`HOURLY_FOR`], daily before that.
@@ -65,69 +75,38 @@ pub struct History {
     /// How many refreshes in a row each paid claim's supply before its
     /// payment has gone unanswered, by vault and id.
     unmeasured: HashMap<(Address, u64), u32>,
+    /// The supply each paid claim was paid from, as read at the block before
+    /// its payment, by vault and id.
+    supplies: HashMap<(Address, u64), U256>,
     /// What is known of each vault's requests: where its waiting ones start.
     requests: HashMap<Address, Requests>,
     /// Each vault as last read whole, and the chain time it was: what is
     /// shown while a later read of it fails part-way.
     last_whole: HashMap<Address, (Strategy, u64)>,
     /// The factory's `Activated` logs: the block each vault was created in.
-    activated: Stream<HashMap<Address, u64>>,
+    activated: HashMap<Address, u64>,
     /// The registry's registrations, for the feed.
-    registrations: Stream<Vec<Registration>>,
+    registrations: Vec<Registration>,
     /// The images proposed for the allowlist, for the feed.
-    images: Stream<Vec<(u64, B256)>>,
+    images: Vec<(u64, B256)>,
     /// Each vault's own logs.
-    vaults: HashMap<Address, Stream<VaultLogs>>,
+    vaults: HashMap<Address, VaultLogs>,
     /// Each vault's blessings.
-    blessings: HashMap<Address, Stream<VecDeque<Blessing>>>,
+    blessings: HashMap<Address, VecDeque<Blessing>>,
     /// Each station's fills: the vault never trades itself, its home station
     /// does.
-    fills: HashMap<Address, Stream<Fills>>,
-}
-
-/// One stream of logs: what has been made of it, and how far it has been
-/// read.
-#[derive(Default)]
-struct Stream<T> {
-    cursor: Option<Cursor>,
-    made: T,
-}
-
-impl<T> Stream<T> {
-    /// Read whatever is new up to `head`, from `from` the first time, and
-    /// fold each log taken into what has been made of the stream. Whether it
-    /// is read to the head; a stream that can't be read is said so in the
-    /// log and keeps what it had.
-    async fn read(
-        &mut self,
-        chain: &Client,
-        filter: &Filter,
-        from: u64,
-        head: u64,
-        what: &str,
-        mut fold: impl FnMut(&mut T, &Log),
-    ) -> bool {
-        let cursor = self.cursor.get_or_insert(Cursor::from(from));
-        let pages = read_on(chain, filter, cursor, head).await;
-        for log in &pages.logs {
-            fold(&mut self.made, log);
-        }
-        if let Some(error) = pages.error {
-            tracing::warn!(%error, "could not read {what}; kept what was read before");
-        }
-        cursor.caught_up(head)
-    }
+    fills: HashMap<Address, Fills>,
 }
 
 /// A block and its time.
-#[derive(Clone, Copy)]
-struct Mark {
-    block: u64,
-    time: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub block: u64,
+    pub time: u64,
 }
 
 /// One reading of a vault, dated by its block's time.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Sample {
     pub(crate) at: u64,
     pub(crate) value_per_share: f64,
@@ -135,6 +114,7 @@ pub(crate) struct Sample {
 }
 
 /// A registration, as the feed tells of it.
+#[derive(Clone)]
 struct Registration {
     at: u64,
     strategy_id: u64,
@@ -142,7 +122,7 @@ struct Registration {
 }
 
 /// What a vault's own logs come to.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct VaultLogs {
     /// The newest of what the page shows, oldest first.
     events: VecDeque<VaultEvent>,
@@ -153,16 +133,21 @@ struct VaultLogs {
     paid_in: HashMap<u64, Paid>,
     /// The newest time the vault was stopped, however many events since.
     killed: Option<VaultEvent>,
+    /// What each holder has paid for what they hold.
+    costs: Costs,
 }
 
-/// Where a claim's `ClaimPaid` lies: its block, and its place in the block.
-#[derive(Clone, Copy)]
-struct Paid {
-    block: u64,
-    log_index: u64,
+/// Where a claim's `ClaimPaid` lies: its block, that block's hash, and its
+/// place in the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paid {
+    pub block: u64,
+    pub block_hash: B256,
+    pub log_index: u64,
 }
 
 /// A blessing of a key for a vault.
+#[derive(Clone)]
 struct Blessing {
     signer: Address,
     until: u64,
@@ -170,7 +155,7 @@ struct Blessing {
 }
 
 /// A station's fills: how many, and the newest in full.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Fills {
     count: u32,
     newest: VecDeque<Trade>,
@@ -233,58 +218,410 @@ pub(crate) fn address_of(value: Address) -> String {
     format!("{value:?}")
 }
 
+// The logs -------------------------------------------------------------------
+
+/// The first topics of every log the record folds: the factory's
+/// activations, the registry's registrations, the allowlist's proposals and
+/// blessings, the stand-in venue's fills, and every event of a vault's the
+/// page shows or a holder's cost is reckoned from.
+pub fn topics() -> Vec<B256> {
+    vec![
+        IVaultFactory::Activated::SIGNATURE_HASH,
+        IStrategyRegistry::Registered::SIGNATURE_HASH,
+        IAttestationRegistry::ImageProposed::SIGNATURE_HASH,
+        IAttestationRegistry::Blessed::SIGNATURE_HASH,
+        ILocalVenue::Filled::SIGNATURE_HASH,
+        IVault::Transfer::SIGNATURE_HASH,
+        IVault::Requested::SIGNATURE_HASH,
+        IVault::Deposited::SIGNATURE_HASH,
+        IVault::Refunded::SIGNATURE_HASH,
+        IVault::Withdrawn::SIGNATURE_HASH,
+        IVault::FeesPaid::SIGNATURE_HASH,
+        IVault::ClaimBooked::SIGNATURE_HASH,
+        IVault::ClaimTried::SIGNATURE_HASH,
+        IVault::ClaimPaid::SIGNATURE_HASH,
+        IVault::ClaimPartPaid::SIGNATURE_HASH,
+        IVault::ProRataTaken::SIGNATURE_HASH,
+        IVault::UnitsPaid::SIGNATURE_HASH,
+        IVault::TankFunded::SIGNATURE_HASH,
+        IVault::TankCharged::SIGNATURE_HASH,
+        IVault::TankFilled::SIGNATURE_HASH,
+        IVault::StateChanged::SIGNATURE_HASH,
+        IVault::Halted::SIGNATURE_HASH,
+        IVault::ToStation::SIGNATURE_HASH,
+        IVault::FromStation::SIGNATURE_HASH,
+    ]
+}
+
+impl History {
+    /// The block `vault` was created in, as the factory's log has it.
+    pub fn created_in(&self, vault: &Address) -> Option<u64> {
+        self.activated.get(vault).copied()
+    }
+
+    /// Every vault the factory's log has activated.
+    pub fn activated(&self) -> impl Iterator<Item = (&Address, &u64)> {
+        self.activated.iter()
+    }
+
+    /// What `owner` paid for what it holds of `vault`, from the vault's logs
+    /// folded so far: everything put in, less everything taken out.
+    pub fn cost(&self, vault: &Address, owner: &Address) -> f64 {
+        self.vaults
+            .get(vault)
+            .map_or(0.0, |logs| logs.costs.of(owner))
+    }
+
+    /// Every holder's cost in every vault, as folded so far.
+    pub fn costs(&self) -> HashMap<Address, HashMap<Address, f64>> {
+        self.vaults
+            .iter()
+            .map(|(vault, logs)| (*vault, logs.costs.all()))
+            .collect()
+    }
+
+    /// The claims whose payment is in the logs and whose supply before it
+    /// has not been read: each to be read at the block before its payment.
+    pub fn unmeasured_payments(&self) -> Vec<(Address, u64, Paid)> {
+        let mut out = Vec::new();
+        for (vault, logs) in &self.vaults {
+            for (id, paid) in &logs.paid_in {
+                let measured = self
+                    .paid_claims
+                    .get(vault)
+                    .is_some_and(|claims| claims.contains_key(id))
+                    || self.supplies.contains_key(&(*vault, *id));
+                if !measured {
+                    out.push((*vault, *id, *paid));
+                }
+            }
+        }
+        out.sort_by_key(|(vault, id, _)| (*vault, *id));
+        out
+    }
+
+    /// The supply a paid claim was paid from, as read at the block before.
+    pub fn measured(&mut self, vault: Address, id: u64, supply: U256) {
+        self.supplies.insert((vault, id), supply);
+    }
+
+    /// Fold logs read and checked, in block and log order, into what is
+    /// known of the chain. `deployments` says whose each log is.
+    pub fn fold(&mut self, deployments: &Deployments, logs: &[Log]) {
+        let platform = [
+            deployments.factory,
+            deployments.strategies,
+            deployments.attestation,
+            deployments.venue,
+        ];
+        let mut by_vault: Vec<(Address, Vec<&Log>)> = Vec::new();
+        for log in logs {
+            let address = log.address();
+            if !platform.contains(&address) {
+                match by_vault.iter_mut().find(|(vault, _)| *vault == address) {
+                    Some((_, logs)) => logs.push(log),
+                    None => by_vault.push((address, vec![log])),
+                }
+                continue;
+            }
+            if address == deployments.factory
+                && let (Ok(activated), Some(block)) = (
+                    log.log_decode::<IVaultFactory::Activated>(),
+                    log.block_number,
+                )
+            {
+                self.activated.insert(activated.inner.data.vault, block);
+            }
+            if address == deployments.strategies
+                && let Ok(event) = log.log_decode::<IStrategyRegistry::Registered>()
+            {
+                self.registrations.push(Registration {
+                    at: log.block_timestamp.unwrap_or_default(),
+                    strategy_id: event.inner.strategyId.try_into().unwrap_or_default(),
+                    bundle_hash: event.inner.data.bundleHash,
+                });
+            }
+            if address == deployments.attestation {
+                if let Ok(event) = log.log_decode::<IAttestationRegistry::ImageProposed>() {
+                    self.images.push((
+                        log.block_timestamp.unwrap_or_default(),
+                        event.inner.imageDigest,
+                    ));
+                }
+                if let Ok(blessed) = log.log_decode::<IAttestationRegistry::Blessed>() {
+                    let made = self.blessings.entry(blessed.inner.vault).or_default();
+                    made.push_back(Blessing {
+                        signer: blessed.inner.signer,
+                        until: blessed.inner.data.blessedUntil,
+                        proof_tx: log
+                            .transaction_hash
+                            .map(|hash| format!("{hash:?}"))
+                            .unwrap_or_default(),
+                    });
+                    if made.len() > BLESSINGS {
+                        made.pop_front();
+                    }
+                }
+            }
+            if address == deployments.venue
+                && deployments.venue != Address::ZERO
+                && let Ok(filled) = log.log_decode::<ILocalVenue::Filled>()
+            {
+                let event = filled.inner.data;
+                let made = self.fills.entry(event.master).or_default();
+                made.count += 1;
+                made.newest.push_back(Trade {
+                    at: moment(log.block_timestamp.unwrap_or_default()),
+                    venue: "Local venue".to_string(),
+                    market: name_of(event.market),
+                    side: if event.isBuy { Side::Buy } else { Side::Sell },
+                    size: shares(event.size),
+                    price: dollars(event.price),
+                    notional: dollars(event.notional),
+                    kind: if event.reduceOnly {
+                        "reduce-only".to_string()
+                    } else {
+                        "taker".to_string()
+                    },
+                    reference: log
+                        .transaction_hash
+                        .map(|hash| format!("{hash:?}"))
+                        .unwrap_or_default(),
+                });
+                if made.newest.len() > SHOWN {
+                    made.newest.pop_front();
+                }
+            }
+        }
+        for (vault, logs) in by_vault {
+            let made = self.vaults.entry(vault).or_default();
+            for log in &logs {
+                made.fold(log);
+            }
+            made.costs.fold(&logs);
+        }
+    }
+}
+
+impl VaultLogs {
+    /// One of the vault's own logs: the events the page shows, and, kept as
+    /// they are read, why it last halted, where each claim was paid, and
+    /// when it was last stopped.
+    fn fold(&mut self, log: &Log) {
+        if let Ok(halted) = log.log_decode::<IVault::Halted>() {
+            self.halted = Some(halted.inner.data.reason);
+            self.halted_in = Some((log.block_number, log.transaction_hash));
+        }
+        if let (Ok(paid), Some(block), Some(block_hash), Some(log_index)) = (
+            log.log_decode::<IVault::ClaimPaid>(),
+            log.block_number,
+            log.block_hash,
+            log.log_index,
+        ) && let Ok(id) = u64::try_from(paid.inner.data.claimId)
+        {
+            self.paid_in.insert(
+                id,
+                Paid {
+                    block,
+                    block_hash,
+                    log_index,
+                },
+            );
+        }
+        // The newest sixty the feed shows, counted after the logs it doesn't
+        // show (share transfers and the like) are left out.
+        let event = vault_event(log).or_else(|| killed_after_halt(self, log));
+        if let Some(event) = event {
+            if event.kind == EventKind::Killed {
+                self.killed = Some(event.clone());
+            }
+            self.events.push_back(event);
+            if self.events.len() > SHOWN {
+                self.events.pop_front();
+            }
+        }
+    }
+}
+
+/// What each holder of a vault paid for what they still hold: everything
+/// they put in, less everything they took out. The vault's own log is the
+/// whole of it.
+///
+/// What a holder took out is found three ways, since the vault says so three
+/// ways:
+///
+/// - a withdrawal, or a claim paid while the vault ran: `Withdrawn` under the
+///   owner (and, for a claim, a `ClaimPaid` right after it);
+/// - a claim paid once the vault closed (`claimClosed`): a `ClaimPaid` alone,
+///   which names only the claim, so the owner is the one its `ClaimBooked`
+///   names;
+/// - shares redeemed once the vault closed (`redeemClosed`): a `Withdrawn`
+///   under the receiver, whoever that is, so it is counted for the holder
+///   whose shares were burnt for it in the same transaction, and not for the
+///   receiver.
+///
+/// Shares never move from one holder to another (the vault refuses
+/// `transfer`), so no cost moves with them.
+#[derive(Clone, Default)]
+struct Costs {
+    paid: HashMap<Address, f64>,
+    /// Who booked each claim.
+    booked: HashMap<U256, Address>,
+}
+
+impl Costs {
+    fn of(&self, owner: &Address) -> f64 {
+        self.paid.get(owner).copied().unwrap_or(0.0).max(0.0)
+    }
+
+    fn all(&self) -> HashMap<Address, f64> {
+        self.paid
+            .iter()
+            .map(|(owner, paid)| (*owner, paid.max(0.0)))
+            .collect()
+    }
+
+    /// Fold one batch of the vault's logs (whole blocks, in order): each
+    /// transaction's logs are read together, since a withdrawal is told
+    /// apart by the log that follows it.
+    fn fold(&mut self, logs: &[&Log]) {
+        let mut start = 0;
+        while start < logs.len() {
+            let tx = (logs[start].block_number, logs[start].transaction_hash);
+            let mut end = start + 1;
+            while end < logs.len() && (logs[end].block_number, logs[end].transaction_hash) == tx {
+                end += 1;
+            }
+            self.transaction(&logs[start..end]);
+            start = end;
+        }
+    }
+
+    /// One transaction's logs of the vault, in order.
+    fn transaction(&mut self, logs: &[&Log]) {
+        // The log at a place in the transaction's block, by log index.
+        let at = |index: Option<u64>| {
+            index.and_then(|index| logs.iter().find(|log| log.log_index == Some(index)))
+        };
+        let is_claim_paid = |log: Option<&&Log>| {
+            log.is_some_and(|log| log.log_decode::<IVault::ClaimPaid>().is_ok())
+        };
+        // Every redemption a closed vault paid, to whomever: a `Withdrawn`
+        // for no request with no claim paid after it, and its place.
+        let mut redeemed_closed: Vec<(IVault::Withdrawn, Option<u64>)> = Vec::new();
+        for log in logs {
+            if let Ok(event) = log.log_decode::<IVault::Deposited>() {
+                *self.paid.entry(event.inner.data.owner).or_default() +=
+                    dollars(event.inner.data.assets);
+            } else if let Ok(event) = log.log_decode::<IVault::ClaimBooked>() {
+                self.booked
+                    .insert(event.inner.data.claimId, event.inner.data.owner);
+            } else if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
+                let event = event.inner.data;
+                let before_a_claim_paid = is_claim_paid(at(log.log_index.map(|i| i + 1)));
+                // A closed vault's redemption names its receiver: it is
+                // counted below, for whoever held the shares.
+                if event.requestId.is_zero() && !before_a_claim_paid {
+                    redeemed_closed.push((event, log.log_index));
+                    continue;
+                }
+                *self.paid.entry(event.owner).or_default() -= dollars(event.assets);
+            } else if let Ok(event) = log.log_decode::<IVault::ClaimPaid>() {
+                // A claim paid once the vault closed, with no `Withdrawn`
+                // before it: its owner's, who booked it.
+                let after_a_withdrawal = log
+                    .log_index
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| at(Some(i)))
+                    .is_some_and(|before| before.log_decode::<IVault::Withdrawn>().is_ok());
+                if !after_a_withdrawal
+                    && let Some(owner) = self.booked.get(&event.inner.data.claimId).copied()
+                {
+                    *self.paid.entry(owner).or_default() -= dollars(event.inner.data.assets);
+                }
+            } else if let Ok(event) = log.log_decode::<IVault::ProRataTaken>() {
+                *self.paid.entry(event.inner.data.owner).or_default() -=
+                    dollars(event.inner.data.assets);
+            } else if let Ok(event) = log.log_decode::<IVault::UnitsPaid>() {
+                *self.paid.entry(event.inner.data.owner).or_default() -=
+                    dollars(event.inner.data.assets);
+            }
+        }
+        if redeemed_closed.is_empty() {
+            return;
+        }
+        // Each holder's part: the redemption each of its burns paid for, the
+        // first after the burn in the same transaction for the same shares.
+        let mut counted = HashSet::new();
+        for log in logs {
+            let Ok(burnt) = log.log_decode::<IVault::Transfer>() else {
+                continue;
+            };
+            let burnt = burnt.inner.data;
+            if burnt.to != Address::ZERO || burnt.from == Address::ZERO {
+                continue;
+            }
+            let paid_for = redeemed_closed
+                .iter()
+                .filter(|(redeemed, after)| {
+                    redeemed.shares == burnt.value
+                        && after
+                            .zip(log.log_index)
+                            .is_some_and(|(after, index)| after > index)
+                        && !counted.contains(after)
+                })
+                .min_by_key(|(_, after)| *after);
+            if let Some((redeemed, place)) = paid_for {
+                counted.insert(*place);
+                *self.paid.entry(burnt.from).or_default() -= dollars(redeemed.assets);
+            }
+        }
+    }
+}
+
+// The record -----------------------------------------------------------------
+
+/// Readings at past blocks this refresh asked for and could not take, by
+/// what they were for: a paid claim's supply, by vault and id.
+#[derive(Default)]
+pub struct PastReads {
+    /// The supply each claim was paid from that could not be read this
+    /// refresh, with why.
+    pub failed: HashMap<(Address, u64), String>,
+}
+
 /// Every vault, as the site shows it. `vault_chain` is the chain these
-/// vaults live on, by the name a manifest gives it.
+/// vaults live on, by the name a manifest gives it. `now` is the chain time
+/// of the observation's block. Fails when the factory's list of vaults can't
+/// be read.
 #[allow(clippy::too_many_arguments)]
-pub async fn strategies(
-    chain: &Client,
+pub fn strategies(
+    views: &Views,
     vault_chain: Chain,
     deployments: &Deployments,
     store: &Store,
     history: &mut History,
     health: &HashMap<Address, shared::model::health::Health>,
-    head: u64,
     now: u64,
+    read_through: bool,
+    past: &PastReads,
 ) -> Result<Vec<Strategy>> {
-    let addresses = chain
-        .read(deployments.factory, IVaultFactory::vaultsCall {})
-        .await?;
-
-    // Where each vault was created, so its record starts there: until the
-    // factory's log has been read through, a vault not found in it yet may
-    // still be.
-    let activations = history
-        .activated
-        .read(
-            chain,
-            &Filter::new()
-                .address(deployments.factory)
-                .event_signature(IVaultFactory::Activated::SIGNATURE_HASH),
-            deployments.deployed_block,
-            head,
-            "the vaults' activations",
-            |made, log| {
-                if let (Ok(activated), Some(block)) = (
-                    log.log_decode::<IVaultFactory::Activated>(),
-                    log.block_number,
-                ) {
-                    made.insert(activated.inner.data.vault, block);
-                }
-            },
-        )
-        .await;
+    let addresses = views.read(deployments.factory, IVaultFactory::vaultsCall {})?;
 
     let mut out = Vec::new();
     for address in &addresses {
-        let created_in = match history.activated.made.get(address) {
+        // Where each vault was created, so its record starts there: until the
+        // factory's log has been read through, a vault not found in it yet may
+        // still be.
+        let created_in = match history.activated.get(address) {
             Some(block) => Some((*block).max(deployments.deployed_block)),
             // Read through and not there: no vault existed before the
             // platform did.
-            None if activations => Some(deployments.deployed_block),
+            None if read_through => Some(deployments.deployed_block),
             None => None,
         };
         match one(
-            chain,
+            views,
             vault_chain,
             deployments,
             store,
@@ -292,11 +629,9 @@ pub async fn strategies(
             health,
             *address,
             created_in,
-            head,
             now,
-        )
-        .await
-        {
+            past,
+        ) {
             Ok(strategy) => {
                 history.last_whole.insert(*address, (strategy.clone(), now));
                 out.push(strategy);
@@ -314,13 +649,18 @@ pub async fn strategies(
                 }
                 None => {
                     tracing::warn!(vault = %address, %error, "could not read a vault never read whole; shown as not read yet");
-                    out.push(unread(chain, vault_chain, deployments, *address).await);
+                    out.push(unread(views, vault_chain, deployments, *address));
                 }
             },
         }
     }
 
     Ok(out)
+}
+
+/// The vaults the factory lists, as the observation read them.
+pub fn vaults(views: &Views, deployments: &Deployments) -> Result<Vec<Address>> {
+    views.read(deployments.factory, IVaultFactory::vaultsCall {})
 }
 
 /// When a vault never read whole was last read whole: the Unix epoch, which
@@ -342,21 +682,18 @@ pub fn never_read(strategy: &Strategy) -> bool {
 /// strategy id and author), marked stale as of [`NEVER_READ`], with no
 /// figures. It counts toward its chain's staleness as any stale vault does,
 /// and toward no total.
-async fn unread(
-    chain: &Client,
+fn unread(
+    views: &Views,
     vault_chain: Chain,
     deployments: &Deployments,
     address: Address,
 ) -> Strategy {
-    let id: u64 = match chain.read(address, IVault::strategyIdCall {}).await {
+    let id: u64 = match views.read(address, IVault::strategyIdCall {}) {
         Ok(id) => id.try_into().unwrap_or_default(),
         Err(_) => 0,
     };
-    let (author, author_address) = match chain.read(address, IVault::authorCall {}).await {
-        Ok(author) => (
-            handle_of(chain, deployments, author).await,
-            address_of(author),
-        ),
+    let (author, author_address) = match views.read(address, IVault::authorCall {}) {
+        Ok(author) => (handle_of(views, deployments, author), address_of(author)),
         Err(_) => (String::new(), String::new()),
     };
     placeholder(vault_chain, id, author, author_address, address_of(address))
@@ -409,6 +746,7 @@ pub(crate) fn placeholder(
             created: epoch,
             station: String::new(),
             value: 0.0,
+            valued_at: None,
             idle: 0.0,
             escrow: 0.0,
             shares: 0.0,
@@ -463,8 +801,8 @@ pub(crate) fn placeholder(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn one(
-    chain: &Client,
+fn one(
+    views: &Views,
     vault_chain: Chain,
     deployments: &Deployments,
     store: &Store,
@@ -472,44 +810,46 @@ async fn one(
     health: &HashMap<Address, shared::model::health::Health>,
     address: Address,
     created_in: Option<u64>,
-    head: u64,
     now: u64,
+    past: &PastReads,
 ) -> Result<Strategy> {
-    let strategy_id = chain.read(address, IVault::strategyIdCall {}).await?;
+    let strategy_id = views.read(address, IVault::strategyIdCall {})?;
     let id: u64 = strategy_id.try_into().unwrap_or_default();
-    let author = chain.read(address, IVault::authorCall {}).await?;
-    let created = chain.read(address, IVault::createdAtCall {}).await?;
-    let state = chain.read(address, IVault::stateCall {}).await?;
-    let bundle_hash = chain.read(address, IVault::bundleHashCall {}).await?;
-    let registered = chain
-        .read(
-            deployments.strategies,
-            IStrategyRegistry::strategyOfCall {
-                strategyId: strategy_id,
-            },
-        )
-        .await?;
+    let author = views.read(address, IVault::authorCall {})?;
+    let created = views.read(address, IVault::createdAtCall {})?;
+    let state = views.read(address, IVault::stateCall {})?;
+    let bundle_hash = views.read(address, IVault::bundleHashCall {})?;
+    let registered = views.read(
+        deployments.strategies,
+        IStrategyRegistry::strategyOfCall {
+            strategyId: strategy_id,
+        },
+    )?;
 
     let slug = Strategy::slug_for(vault_chain, id);
-    let days_live = (now.saturating_sub(created as u64)) / 86_400;
+    let days_live = (now.saturating_sub(created)) / 86_400;
 
-    let events = read_events(chain, history, address, created_in, head).await;
-    let vault = read_vault(chain, vault_chain, history, address, &state).await?;
+    let events = read_events(history, address, created_in);
+    let vault = read_vault(views, vault_chain, history, address, &state, past)?;
     let station: Address = vault.station.parse().unwrap_or_default();
-    let (trades, trade_count) =
-        read_trades(chain, deployments, history, station, created_in, head).await;
-    sample(chain, address, created_in, history, head, now).await;
+    let (trades, trade_count) = read_trades(deployments, history, station, created_in);
     let record = build_record(history, address, &vault, now, trade_count);
-    let legs = read_legs(chain, deployments, &vault).await?;
-    let review = read_review(chain, deployments, store, strategy_id).await?;
-    let attestation =
-        read_attestation(chain, deployments, history, address, created_in, head, now).await?;
+    let legs = read_legs(views, deployments, &vault)?;
+    let review = read_review(views, deployments, store, strategy_id)?;
+    let attestation = read_attestation(
+        views,
+        deployments,
+        history,
+        address,
+        created_in.is_some(),
+        now,
+    )?;
     let bundle = read_bundle(store, &registered, bundle_hash);
 
     let kill = history
         .vaults
         .get(&address)
-        .and_then(|logs| logs.made.killed.as_ref())
+        .and_then(|logs| logs.killed.as_ref())
         .map(|event| Kill {
             at: event.at,
             reason: "the admin key stopped it".to_string(),
@@ -546,7 +886,7 @@ async fn one(
             .as_ref()
             .map(|manifest| manifest.description.claims.clone())
             .unwrap_or_default(),
-        author: handle_of(chain, deployments, author).await,
+        author: handle_of(views, deployments, author),
         author_address: address_of(author),
         standing,
         registered: day(registered.registeredAt),
@@ -591,35 +931,35 @@ fn standing(state: &ChainVaultState, days_live: u64) -> Standing {
     }
 }
 
-async fn read_vault(
-    chain: &Client,
+fn read_vault(
+    views: &Views,
     vault_chain: Chain,
     history: &mut History,
     address: Address,
     state: &ChainVaultState,
+    past: &PastReads,
 ) -> Result<Vault> {
-    let fees = chain.read(address, IVault::feesCall {}).await?;
-    let tank = chain.read(address, IVault::tankCall {}).await?;
-    let value = chain.read(address, IVault::totalValueCall {}).await?;
-    let cash = chain.read(address, IVault::cashCall {}).await?;
-    let escrow = chain.read(address, IVault::escrowCall {}).await?;
-    let share_price = chain.read(address, IVault::sharePriceCall {}).await?;
-    let mark = chain.read(address, IVault::markCall {}).await?;
-    let last_payment = chain.read(address, IVault::lastPaymentCall {}).await?;
-    let created = chain.read(address, IVault::createdAtCall {}).await?;
-    let timers = chain.read(address, IVault::timersCall {}).await?;
-    let exit_band = chain.read(address, IVault::exitBandBpsCall {}).await?;
-    let station = chain.read(address, IVault::homeStationCall {}).await?;
-    let floor = chain.read(address, IVault::idleFloorCall {}).await?;
-    let allowances = chain.read(address, IVault::allowancesCall {}).await?;
-    let restricted = chain.read(address, IVault::restrictedCall {}).await?;
-    let halted = chain.read(address, IStationVault::haltedAtCall {}).await?;
-    let supply = chain.read(address, IVault::totalSupplyCall {}).await?;
+    let fees = views.read(address, IVault::feesCall {})?;
+    let tank = views.read(address, IVault::tankCall {})?;
+    let cash = views.read(address, IVault::cashCall {})?;
+    let escrow = views.read(address, IVault::escrowCall {})?;
+    let share_price = views.read(address, IVault::sharePriceCall {})?;
+    let last_priced = views.read(address, IVault::lastPricedCall {})?;
+    let mark = views.read(address, IVault::markCall {})?;
+    let last_payment = views.read(address, IVault::lastPaymentCall {})?;
+    let created = views.read(address, IVault::createdAtCall {})?;
+    let timers = views.read(address, IVault::timersCall {})?;
+    let exit_band = views.read(address, IVault::exitBandBpsCall {})?;
+    let station = views.read(address, IVault::homeStationCall {})?;
+    let floor = views.read(address, IVault::idleFloorCall {})?;
+    let allowances = views.read(address, IVault::allowancesCall {})?;
+    let restricted = views.read(address, IVault::restrictedCall {})?;
+    let halted = views.read(address, IStationVault::haltedAtCall {})?;
+    let supply = views.read(address, IVault::totalSupplyCall {})?;
 
     let mut claims = Vec::new();
-    let count: u64 = chain
-        .read(address, IVault::claimCountCall {})
-        .await?
+    let count: u64 = views
+        .read(address, IVault::claimCountCall {})?
         .try_into()
         .unwrap_or(0);
     for id in 1..=count {
@@ -631,16 +971,14 @@ async fn read_vault(
             claims.push(claim.clone());
             continue;
         }
-        let claim = chain
-            .read(
-                address,
-                IVault::claimAtCall {
-                    claimId: U256::from(id),
-                },
-            )
-            .await?;
+        let claim = views.read(
+            address,
+            IVault::claimAtCall {
+                claimId: U256::from(id),
+            },
+        )?;
         let (fraction, measured) = if matches!(claim.state, ChainClaimState::Paid) {
-            closed_by_paid(chain, history, address, id, claim.shares, supply).await
+            closed_by_paid(views, history, address, id, claim.shares, supply, past)
         } else {
             let fraction = fraction_of(claim.shares, supply);
             history
@@ -683,25 +1021,36 @@ async fn read_vault(
 
     // A depositor's waiting request unread is not a request gone: the read
     // fails, and the vault is shown as it was last read whole, marked stale.
-    let requests = read_requests(chain, history, address).await?;
+    let requests = read_requests(views, history, address)?;
 
+    let state = match state {
+        ChainVaultState::Activating => VaultState::Activating,
+        ChainVaultState::Open => VaultState::Open,
+        ChainVaultState::WindingDown => VaultState::WindingDown,
+        ChainVaultState::Frozen => VaultState::Frozen,
+        ChainVaultState::Killed => VaultState::Killed,
+        ChainVaultState::Cancelled => VaultState::Cancelled,
+        _ => VaultState::Closed,
+    };
+    // Every share at the last valuation's price, the price each request is
+    // priced at: a deposit priced since then is in it as the shares it
+    // made, and dollars still in escrow are not. A closed vault is worth
+    // the cash its holders are paid from.
+    let value = if state == VaultState::Closed {
+        dollars(cash)
+    } else {
+        shares(supply) * dollars(share_price)
+    };
     let daily = shared::Prices::published().daily_cap(&shared_allowances(&allowances));
     Ok(Vault {
         address: address_of(address),
         chain: vault_chain,
         asset: vault_chain.dollar().to_string(),
-        state: match state {
-            ChainVaultState::Activating => VaultState::Activating,
-            ChainVaultState::Open => VaultState::Open,
-            ChainVaultState::WindingDown => VaultState::WindingDown,
-            ChainVaultState::Frozen => VaultState::Frozen,
-            ChainVaultState::Killed => VaultState::Killed,
-            ChainVaultState::Cancelled => VaultState::Cancelled,
-            _ => VaultState::Closed,
-        },
+        state,
         created: day(created),
         station: address_of(station),
-        value: dollars(value),
+        value,
+        valued_at: last_priced.priced.then(|| moment(last_priced.time)),
         idle: dollars(cash),
         escrow: dollars(escrow),
         shares: shares(supply),
@@ -759,25 +1108,40 @@ fn fraction_of(claimed: U256, supply: U256) -> f64 {
 /// closed for good. Paying it burned its shares, so the supply now no longer
 /// counts them: it is measured against the supply the block before it was
 /// paid, less the shares of the claims paid before it in the same block, once
-/// its payment is in the vault's log. Until then (the log not read that far
-/// yet, or the supply then not answered) it is the share it stood for when
-/// last read waiting, or today's supply with its own shares put back, and is
-/// worked out again at the next refresh; once the supply then has gone
-/// unanswered [`UNANSWERED_TRIES`] refreshes in a row (a node that keeps no
-/// state that far back), that share is kept for good, so a claim no node
-/// will measure isn't read again at every refresh for ever.
-async fn closed_by_paid(
-    chain: &Client,
+/// its payment is in the vault's log and that supply has been read (at the
+/// block before, apart: see [`History::unmeasured_payments`]). Until then
+/// (the log not read that far yet, or the supply then not answered) it is
+/// the share it stood for when last read waiting, or today's supply with its
+/// own shares put back, and is worked out again at the next refresh; once
+/// the supply then has gone unanswered [`UNANSWERED_TRIES`] refreshes in a
+/// row (a node that keeps no state that far back), that share is kept for
+/// good, so a claim no node will measure isn't read again at every refresh
+/// for ever.
+fn closed_by_paid(
+    views: &Views,
     history: &mut History,
     vault: Address,
     id: u64,
     claimed: U256,
     supply: U256,
+    past: &PastReads,
 ) -> (f64, bool) {
-    let paid_in = history.vaults.get(&vault).map(|logs| &logs.made.paid_in);
+    let paid_in = history.vaults.get(&vault).map(|logs| &logs.paid_in);
     let mut given_up = false;
     if let Some(paid) = paid_in.and_then(|paid_in| paid_in.get(&id)) {
-        match supply_before(chain, vault, *paid, paid_in.into_iter().flatten()).await {
+        let measured = match history.supplies.get(&(vault, id)) {
+            Some(before) => {
+                supply_before(views, vault, *before, *paid, paid_in.into_iter().flatten())
+            }
+            None => Err(anyhow::anyhow!(
+                "{}",
+                past.failed
+                    .get(&(vault, id))
+                    .cloned()
+                    .unwrap_or_else(|| "the supply before it is not read yet".to_string())
+            )),
+        };
+        match measured {
             Ok(before) => {
                 history.unmeasured.remove(&(vault, id));
                 return (fraction_of(claimed, before), true);
@@ -805,31 +1169,25 @@ async fn closed_by_paid(
 }
 
 /// The vault's supply just before the payment `paid`: as it was the block
-/// before, less the shares of every claim paid ahead of it in its block.
-async fn supply_before<'a>(
-    chain: &Client,
+/// before (`at_block_before`), less the shares of every claim paid ahead of
+/// it in its block.
+fn supply_before<'a>(
+    views: &Views,
     vault: Address,
+    at_block_before: U256,
     paid: Paid,
     every: impl Iterator<Item = (&'a u64, &'a Paid)>,
 ) -> Result<U256> {
-    let mut supply = chain
-        .read_at(
-            vault,
-            IVault::totalSupplyCall {},
-            BlockId::number(paid.block.saturating_sub(1)),
-        )
-        .await?;
+    let mut supply = at_block_before;
     for (earlier, _) in
         every.filter(|(_, other)| other.block == paid.block && other.log_index < paid.log_index)
     {
-        let claim = chain
-            .read(
-                vault,
-                IVault::claimAtCall {
-                    claimId: U256::from(*earlier),
-                },
-            )
-            .await?;
+        let claim = views.read(
+            vault,
+            IVault::claimAtCall {
+                claimId: U256::from(*earlier),
+            },
+        )?;
         supply = supply.saturating_sub(claim.shares);
     }
     Ok(supply)
@@ -837,7 +1195,7 @@ async fn supply_before<'a>(
 
 /// What is known of a vault's requests from one refresh to the next: a
 /// request once done stays done, so it is not read again.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Requests {
     /// The first request not known to be done: every one before it is.
     from: u64,
@@ -855,19 +1213,14 @@ const REQUEST_READS: u32 = 256;
 /// over. A refresh reads at most [`REQUEST_READS`] of them; one with more to
 /// read fails, so the vault is shown as last read whole, marked stale, never
 /// with part of its waiting requests as if they were all.
-async fn read_requests(
-    chain: &Client,
-    history: &mut History,
-    address: Address,
-) -> Result<Vec<Request>> {
-    let count: u64 = chain
-        .read(address, IVault::requestCountCall {})
-        .await?
+fn read_requests(views: &Views, history: &mut History, address: Address) -> Result<Vec<Request>> {
+    let count: u64 = views
+        .read(address, IVault::requestCountCall {})?
         .try_into()
         .unwrap_or(0);
     let known = history.requests.entry(address).or_default();
     known.from = known.from.max(1);
-    let read = waiting_requests(chain, known, address, count).await;
+    let read = waiting_requests(views, known, address, count);
     // Every request before the first not done is done.
     while known.done.remove(&known.from) {
         known.from += 1;
@@ -875,8 +1228,8 @@ async fn read_requests(
     read
 }
 
-async fn waiting_requests(
-    chain: &Client,
+fn waiting_requests(
+    views: &Views,
     known: &mut Requests,
     address: Address,
     count: u64,
@@ -893,14 +1246,12 @@ async fn waiting_requests(
             );
         }
         reads += 1;
-        let request = chain
-            .read(
-                address,
-                IVault::requestAtCall {
-                    requestId: U256::from(id),
-                },
-            )
-            .await?;
+        let request = views.read(
+            address,
+            IVault::requestAtCall {
+                requestId: U256::from(id),
+            },
+        )?;
         if request.done {
             known.done.insert(id);
             continue;
@@ -940,6 +1291,23 @@ fn shared_allowances(on_chain: &chain::bindings::prices::Allowances) -> shared::
     }
 }
 
+// Readings at past blocks ----------------------------------------------------
+
+/// Reads at past blocks, for a vault's hourly readings.
+pub trait Past {
+    /// Block `number`'s header.
+    fn header(
+        &mut self,
+        number: u64,
+    ) -> impl std::future::Future<Output = Result<chain::follow::Header>> + Send;
+    /// The vault's value per share and what it was worth, at `block`.
+    fn prices(
+        &mut self,
+        vault: Address,
+        block: chain::follow::Header,
+    ) -> impl std::future::Future<Output = Result<(f64, f64)>> + Send;
+}
+
 /// Take the vault's readings due since the last: one an hour of chain time
 /// (one a day for what is older than [`HOURLY_FOR`]), from the block it was
 /// created in on. Each reading is taken at the first block whose time is
@@ -951,15 +1319,17 @@ fn shared_allowances(on_chain: &chain::bindings::prices::Allowances) -> shared::
 /// on from where it stopped. A reading whose block's time can't be read, or
 /// that the vault doesn't answer, is not taken: it is asked for again at the
 /// next refresh, never dated by a guess. `created_in` is `None` while the
-/// block the vault was created in isn't known yet.
-async fn sample(
-    chain: &Client,
+/// block the vault was created in isn't known yet. `head` is the block the
+/// record is read at.
+pub async fn sample<P: Past>(
+    past: &mut P,
     address: Address,
     created_in: Option<u64>,
     history: &mut History,
-    head: u64,
-    now: u64,
+    head: chain::follow::Header,
 ) {
+    let now = head.timestamp;
+    let mut headers: HashMap<u64, chain::follow::Header> = HashMap::from([(head.number, head)]);
     let mut reads = 0;
     let mut last = match history.sampled.get(&address) {
         Some(last) => *last,
@@ -967,12 +1337,16 @@ async fn sample(
             let Some(start) = created_in else {
                 return;
             };
-            let block = start.clamp(1, head.max(1));
+            let block = start.clamp(1, head.number.max(1));
             reads += 1;
-            let Ok(time) = block_time(chain, block).await else {
+            let Ok(header) = header_at(past, &mut headers, block).await else {
                 return;
             };
-            match take(chain, history, address, Mark { block, time }).await {
+            let at = Mark {
+                block,
+                time: header.timestamp,
+            };
+            match take(past, history, address, at, header).await {
                 Some(taken) => taken,
                 None => return,
             }
@@ -986,14 +1360,14 @@ async fn sample(
             HOUR
         };
         let due = last.time.saturating_add(spacing);
-        if due > now || last.block >= head {
+        if due > now || last.block >= head.number {
             break;
         }
         // The first block at or after `due` lies past `low`, whose time is
         // before it, and no further than `high`, whose time is not.
         let mut low = last;
         let mut high = Mark {
-            block: head,
+            block: head.number,
             time: now,
         };
         let mut halve = false;
@@ -1008,26 +1382,42 @@ async fn sample(
                 blocks_until(low, high, due).min(left - 1)
             };
             reads += 1;
-            let Ok(time) = block_time(chain, low.block + ahead).await else {
+            let Ok(header) = header_at(past, &mut headers, low.block + ahead).await else {
                 break 'readings;
             };
             let mark = Mark {
                 block: low.block + ahead,
-                time,
+                time: header.timestamp,
             };
-            if time >= due {
+            if mark.time >= due {
                 high = mark;
             } else {
                 low = mark;
             }
             halve = (high.block - low.block) * 2 > left;
         }
-        match take(chain, history, address, high).await {
+        let Some(header) = headers.get(&high.block).copied() else {
+            break;
+        };
+        match take(past, history, address, high, header).await {
             Some(taken) => last = taken,
             None => break,
         }
     }
     prune(history.samples.entry(address).or_default(), now);
+}
+
+async fn header_at<P: Past>(
+    past: &mut P,
+    headers: &mut HashMap<u64, chain::follow::Header>,
+    number: u64,
+) -> Result<chain::follow::Header> {
+    if let Some(header) = headers.get(&number) {
+        return Ok(*header);
+    }
+    let header = past.header(number).await?;
+    headers.insert(number, header);
+    Ok(header)
 }
 
 /// How many blocks past `low` the time `due` falls, at the pace the chain
@@ -1046,8 +1436,14 @@ fn blocks_until(low: Mark, high: Mark, due: u64) -> u64 {
 /// over, so a block it can't be read at holds up no reading after it. The
 /// block is where the next reading is looked for from, unless this one is
 /// to be asked for again.
-async fn take(chain: &Client, history: &mut History, address: Address, at: Mark) -> Option<Mark> {
-    match price_at(chain, address, at.block).await {
+async fn take<P: Past>(
+    past: &mut P,
+    history: &mut History,
+    address: Address,
+    at: Mark,
+    header: chain::follow::Header,
+) -> Option<Mark> {
+    match past.prices(address, header).await {
         Ok((value_per_share, aum)) => {
             history.samples.entry(address).or_default().push(Sample {
                 at: at.time,
@@ -1064,7 +1460,7 @@ async fn take(chain: &Client, history: &mut History, address: Address, at: Mark)
             if tries.1 < UNANSWERED_TRIES {
                 return None;
             }
-            tracing::warn!(vault = %address, block = at.block, %error, "a reading the vault never answered was passed over");
+            tracing::warn!(vault = %address, block = at.block, error = format!("{error:#}"), "a reading the vault never answered was passed over");
         }
     }
     history.unanswered.remove(&address);
@@ -1164,85 +1560,43 @@ fn daily(points: &[Point]) -> Vec<Point> {
     out
 }
 
-async fn price_at(chain: &Client, address: Address, block: u64) -> Result<(f64, f64)> {
-    let price = chain
-        .read_at(address, IVault::sharePriceCall {}, BlockId::number(block))
-        .await?;
-    let value = chain
-        .read_at(address, IVault::totalValueCall {}, BlockId::number(block))
-        .await?;
+/// What a vault's price and worth are read as at a past block: its share
+/// price and its total value then.
+pub fn price_reads(vault: Address) -> chain::follow::Plan {
+    let mut plan = chain::follow::Plan::default();
+    plan.read(vault, &IVault::sharePriceCall {});
+    plan.read(vault, &IVault::totalValueCall {});
+    plan
+}
+
+/// The answers to [`price_reads`].
+pub fn prices_from(observed: &chain::follow::Observed) -> Result<(f64, f64)> {
+    let price = observed.decode::<IVault::sharePriceCall>(0)?;
+    let value = observed.decode::<IVault::totalValueCall>(1)?;
     Ok((dollars(price), dollars(value)))
 }
 
-async fn block_time(chain: &Client, block: u64) -> Result<u64> {
-    chain.block_timestamp_at(block).await
-}
-
 /// Every fill the vault's home station has had (the vault never trades
-/// itself: its station is the venue account the agent trades), read on from
-/// where the last read stopped: the last few in full, for the page, and how
-/// many there were altogether, for the record. Fills that can't be read
-/// this time leave what was read before. The station was made with its
-/// vault, so they are read from the block the vault was created in, and not
-/// at all while that isn't known yet.
-async fn read_trades(
-    chain: &Client,
+/// itself: its station is the venue account the agent trades), as the
+/// stand-in venue's logs have been read so far: the last few in full, for
+/// the page, and how many there were altogether, for the record. The station
+/// was made with its vault, so none are shown while the block the vault was
+/// created in isn't known yet.
+fn read_trades(
     deployments: &Deployments,
-    history: &mut History,
+    history: &History,
     station: Address,
     created_in: Option<u64>,
-    head: u64,
 ) -> (Vec<Trade>, u32) {
     // The stand-in venue's fills alone are read here; a public test
     // network's deployment has no stand-in venue.
-    if station == Address::ZERO || deployments.venue == Address::ZERO {
+    if station == Address::ZERO || deployments.venue == Address::ZERO || created_in.is_none() {
         return (Vec::new(), 0);
     }
-    let fills = history.fills.entry(station).or_default();
-    if let Some(created_in) = created_in {
-        fills
-            .read(
-                chain,
-                &Filter::new()
-                    .address(deployments.venue)
-                    .event_signature(ILocalVenue::Filled::SIGNATURE_HASH)
-                    .topic1(station.into_word()),
-                created_in,
-                head,
-                "a station's fills",
-                |made, log| {
-                    let Ok(filled) = log.log_decode::<ILocalVenue::Filled>() else {
-                        return;
-                    };
-                    let event = filled.inner.data;
-                    made.count += 1;
-                    made.newest.push_back(Trade {
-                        at: moment(log.block_timestamp.unwrap_or_default()),
-                        venue: "Local venue".to_string(),
-                        market: name_of(event.market),
-                        side: if event.isBuy { Side::Buy } else { Side::Sell },
-                        size: shares(event.size),
-                        price: dollars(event.price),
-                        notional: dollars(event.notional),
-                        kind: if event.reduceOnly {
-                            "reduce-only".to_string()
-                        } else {
-                            "taker".to_string()
-                        },
-                        reference: log
-                            .transaction_hash
-                            .map(|hash| format!("{hash:?}"))
-                            .unwrap_or_default(),
-                    });
-                    if made.newest.len() > SHOWN {
-                        made.newest.pop_front();
-                    }
-                },
-            )
-            .await;
+    match history.fills.get(&station) {
+        Some(fills) => (fills.newest.iter().rev().cloned().collect(), fills.count),
+        None => (Vec::new(), 0),
     }
-    let fills = &fills.made;
-    (fills.newest.iter().rev().cloned().collect(), fills.count)
 }
 
 /// How many fills a vault's home station has had altogether, as last read:
@@ -1254,16 +1608,12 @@ pub fn trade_count(history: &History, strategy: &Strategy) -> u32 {
         .parse::<Address>()
         .ok()
         .and_then(|station| history.fills.get(&station))
-        .map_or(strategy.trades.len() as u32, |fills| fills.made.count)
+        .map_or(strategy.trades.len() as u32, |fills| fills.count)
 }
 
 /// Why the vault halted, from its last `Halted` log, in words.
 fn halt_reason(history: &History, address: Address) -> String {
-    let Some(reason) = history
-        .vaults
-        .get(&address)
-        .and_then(|logs| logs.made.halted)
-    else {
+    let Some(reason) = history.vaults.get(&address).and_then(|logs| logs.halted) else {
         return String::new();
     };
     match name_of(reason).as_str() {
@@ -1275,58 +1625,17 @@ fn halt_reason(history: &History, address: Address) -> String {
     }
 }
 
-/// The vault's events the page shows, newest first, read on from where the
-/// last read stopped; and, kept as they are read, why it last halted and
-/// where each claim was paid, and when it was last stopped. Logs that can't
-/// be read this time leave what was read before. They are read from the
-/// block the vault was created in, and not at all while that isn't known
-/// yet.
-async fn read_events(
-    chain: &Client,
-    history: &mut History,
-    address: Address,
-    created_in: Option<u64>,
-    head: u64,
-) -> Vec<VaultEvent> {
-    let logs = history.vaults.entry(address).or_default();
-    let Some(created_in) = created_in else {
+/// The vault's events the page shows, newest first, as its logs have been
+/// read so far; none while the block it was created in isn't known yet.
+fn read_events(history: &History, address: Address, created_in: Option<u64>) -> Vec<VaultEvent> {
+    if created_in.is_none() {
         return Vec::new();
-    };
-    logs.read(
-        chain,
-        &Filter::new().address(address),
-        created_in,
-        head,
-        "a vault's events",
-        |made, log| {
-            if let Ok(halted) = log.log_decode::<IVault::Halted>() {
-                made.halted = Some(halted.inner.data.reason);
-                made.halted_in = Some((log.block_number, log.transaction_hash));
-            }
-            if let (Ok(paid), Some(block), Some(log_index)) = (
-                log.log_decode::<IVault::ClaimPaid>(),
-                log.block_number,
-                log.log_index,
-            ) && let Ok(id) = u64::try_from(paid.inner.data.claimId)
-            {
-                made.paid_in.insert(id, Paid { block, log_index });
-            }
-            // The newest sixty the feed shows, counted after the logs it
-            // doesn't show (share transfers and the like) are left out.
-            let event = vault_event(log).or_else(|| killed_after_halt(made, log));
-            if let Some(event) = event {
-                if event.kind == EventKind::Killed {
-                    made.killed = Some(event.clone());
-                }
-                made.events.push_back(event);
-                if made.events.len() > SHOWN {
-                    made.events.pop_front();
-                }
-            }
-        },
-    )
-    .await;
-    logs.made.events.iter().rev().cloned().collect()
+    }
+    history
+        .vaults
+        .get(&address)
+        .map(|logs| logs.events.iter().rev().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// The admin's kill of a vault that had already halted (frozen, or its
@@ -1530,25 +1839,21 @@ fn vault_event(log: &Log) -> Option<VaultEvent> {
     })
 }
 
-async fn read_legs(chain: &Client, deployments: &Deployments, vault: &Vault) -> Result<Vec<Leg>> {
+fn read_legs(views: &Views, deployments: &Deployments, vault: &Vault) -> Result<Vec<Leg>> {
     // The stand-in venue's leg alone is read here; a public test network's
     // deployment has none.
     if deployments.venue == Address::ZERO {
         return Ok(Vec::new());
     }
     let station: Address = vault.station.parse().unwrap_or_default();
-    let on_venue = chain
-        .read(
-            deployments.venue,
-            ILocalVenue::accountValueCall { master: station },
-        )
-        .await?;
-    let held = chain
-        .read(
-            deployments.venue,
-            ILocalVenue::marketsHeldByCall { master: station },
-        )
-        .await?;
+    let on_venue = views.read(
+        deployments.venue,
+        ILocalVenue::accountValueCall { master: station },
+    )?;
+    let held = views.read(
+        deployments.venue,
+        ILocalVenue::marketsHeldByCall { master: station },
+    )?;
     let share = if vault.value > 0.0 {
         (dollars(on_venue) / vault.value).clamp(0.0, 1.0)
     } else {
@@ -1593,20 +1898,18 @@ async fn read_legs(chain: &Client, deployments: &Deployments, vault: &Vault) -> 
 
 /// A strategy's one review, from the chain, with the rest of its report from
 /// the store. Refusals have no vault, so they are read with the job instead.
-pub async fn read_review(
-    chain: &Client,
+pub fn read_review(
+    views: &Views,
     deployments: &Deployments,
     store: &Store,
     strategy_id: U256,
 ) -> Result<Option<Review>> {
-    let entry = chain
-        .read(
-            deployments.reviews,
-            IReviewRegistry::reviewOfCall {
-                strategyId: strategy_id,
-            },
-        )
-        .await?;
+    let entry = views.read(
+        deployments.reviews,
+        IReviewRegistry::reviewOfCall {
+            strategyId: strategy_id,
+        },
+    )?;
     let signed = entry.review;
     if signed.reviewedAt == 0 {
         return Ok(None);
@@ -1638,89 +1941,51 @@ pub async fn read_review(
     }))
 }
 
-async fn read_attestation(
-    chain: &Client,
+fn read_attestation(
+    views: &Views,
     deployments: &Deployments,
-    history: &mut History,
+    history: &History,
     address: Address,
-    created_in: Option<u64>,
-    head: u64,
+    created_in_known: bool,
     now: u64,
 ) -> Result<Option<Attestation>> {
-    // The newest few blessings, read on from where the last read stopped,
-    // from the block the vault was created in; a read that fails leaves
-    // those read before.
-    let blessings = history.blessings.entry(address).or_default();
-    if let Some(created_in) = created_in {
-        blessings
-            .read(
-                chain,
-                &Filter::new()
-                    .address(deployments.attestation)
-                    .event_signature(IAttestationRegistry::Blessed::SIGNATURE_HASH)
-                    .topic2(address.into_word()),
-                created_in,
-                head,
-                "a vault's blessings",
-                |made, log| {
-                    let Ok(blessed) = log.log_decode::<IAttestationRegistry::Blessed>() else {
-                        return;
-                    };
-                    made.push_back(Blessing {
-                        signer: blessed.inner.signer,
-                        until: blessed.inner.data.blessedUntil,
-                        proof_tx: log
-                            .transaction_hash
-                            .map(|hash| format!("{hash:?}"))
-                            .unwrap_or_default(),
-                    });
-                    if made.len() > BLESSINGS {
-                        made.pop_front();
-                    }
-                },
-            )
-            .await;
-    }
-
+    // The newest few blessings, as the registry's logs have been read so
+    // far: none while the block the vault was created in isn't known.
     let mut keys = Vec::new();
-    for blessing in blessings.made.iter().rev() {
-        if blessing.until < now {
-            continue;
+    if created_in_known && let Some(blessings) = history.blessings.get(&address) {
+        for blessing in blessings.iter().rev() {
+            if blessing.until < now {
+                continue;
+            }
+            keys.push(BlessedKey {
+                address: address_of(blessing.signer),
+                zone: "this machine".to_string(),
+                blessed_until: moment(blessing.until),
+                proof_tx: blessing.proof_tx.clone(),
+                role: KeyRole::Primary,
+            });
         }
-        keys.push(BlessedKey {
-            address: address_of(blessing.signer),
-            zone: "this machine".to_string(),
-            blessed_until: moment(blessing.until),
-            proof_tx: blessing.proof_tx.clone(),
-            role: KeyRole::Primary,
-        });
     }
     if keys.is_empty() {
         return Ok(None);
     }
 
-    let image = chain
-        .read(
-            deployments.attestation,
-            IAttestationRegistry::imageOfCall {
-                imageDigest: alloy::primitives::keccak256("shonin-dev-image:executor"),
-            },
-        )
-        .await?;
-    let builder = chain
-        .read(
-            deployments.attestation,
-            IAttestationRegistry::imageOfCall {
-                imageDigest: alloy::primitives::keccak256("shonin-dev-image:builder"),
-            },
-        )
-        .await?;
-    let ttl = chain
-        .read(
-            deployments.attestation,
-            IAttestationRegistry::blessingTtlCall {},
-        )
-        .await?;
+    let image = views.read(
+        deployments.attestation,
+        IAttestationRegistry::imageOfCall {
+            imageDigest: alloy::primitives::keccak256("shonin-dev-image:executor"),
+        },
+    )?;
+    let builder = views.read(
+        deployments.attestation,
+        IAttestationRegistry::imageOfCall {
+            imageDigest: alloy::primitives::keccak256("shonin-dev-image:builder"),
+        },
+    )?;
+    let ttl = views.read(
+        deployments.attestation,
+        IAttestationRegistry::blessingTtlCall {},
+    )?;
 
     Ok(Some(Attestation {
         image: Image {
@@ -1792,14 +2057,11 @@ pub(crate) fn bundle_from(
 
 /// What to call an author: the handle they chose, or their address if they
 /// chose none. Nothing depends on it either way.
-async fn handle_of(chain: &Client, deployments: &Deployments, author: Address) -> String {
-    match chain
-        .read(
-            deployments.profiles,
-            IAuthorProfiles::profileOfCall { author },
-        )
-        .await
-    {
+fn handle_of(views: &Views, deployments: &Deployments, author: Address) -> String {
+    match views.read(
+        deployments.profiles,
+        IAuthorProfiles::profileOfCall { author },
+    ) {
         Ok(profile) if !profile.handle.is_empty() => profile.handle,
         _ => address_of(author),
     }
@@ -1808,24 +2070,20 @@ async fn handle_of(chain: &Client, deployments: &Deployments, author: Address) -
 /// Everyone who has published, each with their address, which is who they
 /// are: the handle is only what they are called (see the indexer's
 /// `shown_names`), and two authors are never one for sharing it.
-pub async fn authors(chain: &Client, deployments: &Deployments) -> Result<Vec<(Address, Author)>> {
+pub fn authors(views: &Views, deployments: &Deployments) -> Result<Vec<(Address, Author)>> {
     let mut out: Vec<(Address, Author)> = Vec::new();
-    let owners = chain
-        .read(deployments.factory, IVaultFactory::vaultsCall {})
-        .await?;
+    let owners = views.read(deployments.factory, IVaultFactory::vaultsCall {})?;
     let mut seen: Vec<Address> = Vec::new();
     for vault in owners {
-        let address = chain.read(vault, IVault::authorCall {}).await?;
+        let address = views.read(vault, IVault::authorCall {})?;
         if seen.contains(&address) {
             continue;
         }
         seen.push(address);
-        let profile = chain
-            .read(
-                deployments.profiles,
-                IAuthorProfiles::profileOfCall { author: address },
-            )
-            .await?;
+        let profile = views.read(
+            deployments.profiles,
+            IAuthorProfiles::profileOfCall { author: address },
+        )?;
         let handle = if profile.handle.is_empty() {
             address_of(address)
         } else {
@@ -1835,7 +2093,7 @@ pub async fn authors(chain: &Client, deployments: &Deployments) -> Result<Vec<(A
             address,
             Author {
                 handle,
-                joined: day(profile.joinedAt as u64),
+                joined: day(profile.joinedAt),
                 blurb: if profile.blurb.is_empty() {
                     "This author has not said anything about themselves.".to_string()
                 } else {
@@ -1852,41 +2110,12 @@ pub async fn authors(chain: &Client, deployments: &Deployments) -> Result<Vec<(A
     Ok(out)
 }
 
-/// What is worth announcing, newest first. The registry's and the
-/// allowlist's logs are read on from where the last read stopped; one that
-/// can't be read leaves what was read before, and holds up nothing else.
-pub async fn feed(
-    chain: &Client,
-    vault_chain: Chain,
-    deployments: &Deployments,
-    history: &mut History,
-    head: u64,
-    strategies: &[Strategy],
-) -> Vec<FeedEvent> {
+/// What is worth announcing, newest first: the registry's and the
+/// allowlist's logs as they have been read so far, and what the vaults show.
+pub fn feed(vault_chain: Chain, history: &History, strategies: &[Strategy]) -> Vec<FeedEvent> {
     let mut out = Vec::new();
 
-    history
-        .registrations
-        .read(
-            chain,
-            &Filter::new()
-                .address(deployments.strategies)
-                .event_signature(IStrategyRegistry::Registered::SIGNATURE_HASH),
-            deployments.deployed_block,
-            head,
-            "the registrations",
-            |made, log| {
-                if let Ok(event) = log.log_decode::<IStrategyRegistry::Registered>() {
-                    made.push(Registration {
-                        at: log.block_timestamp.unwrap_or_default(),
-                        strategy_id: event.inner.strategyId.try_into().unwrap_or_default(),
-                        bundle_hash: event.inner.data.bundleHash,
-                    });
-                }
-            },
-        )
-        .await;
-    for registration in &history.registrations.made {
+    for registration in &history.registrations {
         let id = registration.strategy_id;
         out.push(FeedEvent {
             at: moment(registration.at),
@@ -1902,27 +2131,7 @@ pub async fn feed(
         });
     }
 
-    history
-        .images
-        .read(
-            chain,
-            &Filter::new()
-                .address(deployments.attestation)
-                .event_signature(IAttestationRegistry::ImageProposed::SIGNATURE_HASH),
-            deployments.deployed_block,
-            head,
-            "the images proposed",
-            |made, log| {
-                if let Ok(event) = log.log_decode::<IAttestationRegistry::ImageProposed>() {
-                    made.push((
-                        log.block_timestamp.unwrap_or_default(),
-                        event.inner.imageDigest,
-                    ));
-                }
-            },
-        )
-        .await;
-    for (at, digest) in &history.images.made {
+    for (at, digest) in &history.images {
         out.push(FeedEvent {
             at: moment(*at),
             kind: FeedKind::ImageProposed,
@@ -1975,22 +2184,89 @@ pub async fn feed(
     out
 }
 
+/// The terms the platform is running under, asked of the contracts that
+/// enforce them. They are governed rather than fixed, so the app is told them
+/// instead of being built with them.
+pub fn terms(views: &Views, deployments: &Deployments) -> Result<shared::Terms> {
+    const DAY: f64 = 86_400.0;
+
+    let vaults = views.read(deployments.factory, IVaultFactory::configCall {})?;
+    let timelock = views.read(
+        deployments.attestation,
+        IAttestationRegistry::timelockCall {},
+    )?;
+    let publish_fee = views.read(deployments.publishing, IPublishing::feeCall {})?;
+    let terms_hash = views.read(deployments.factory, IVaultFactory::termsCall {})?;
+
+    Ok(shared::Terms {
+        minimum_tank: dollars(vaults.minimumTank),
+        publish_fee: dollars(publish_fee),
+        fees: shared::Fees {
+            holding_bps: vaults.holdingBps as u32,
+            author_bps: vaults.authorBps as u32,
+            platform_bps: vaults.platformBps as u32,
+            transaction_bps: vaults.transactionBps as u32,
+        },
+        exit_band_bps: vaults.exitBandBps as u32,
+        freeze_after_days: vaults.timers.freezeAfter as f64 / DAY,
+        image_timelock_days: timelock as f64 / DAY,
+        minimum_deposit: dollars(vaults.minimumDeposit),
+        terms_hash: format!("{terms_hash:?}"),
+    })
+}
+
+/// How many payments the publishing contract has taken.
+pub fn payments(views: &Views, deployments: &Deployments) -> Result<u64> {
+    Ok(views
+        .read(deployments.publishing, IPublishing::countCall {})?
+        .try_into()
+        .unwrap_or(u64::MAX))
+}
+
+/// What the chain is asked to complete a job: its author's profile, its
+/// strategy's review, and the vault the factory made for it.
+pub fn job_reads(deployments: &Deployments, job: &Job) -> Vec<(Address, alloy::primitives::Bytes)> {
+    use alloy::sol_types::SolCall;
+    let mut reads = Vec::new();
+    if let Ok(author) = job.author.parse::<Address>() {
+        reads.push((
+            deployments.profiles,
+            IAuthorProfiles::profileOfCall { author }
+                .abi_encode()
+                .into(),
+        ));
+    }
+    if let Some(id) = job.strategy_id {
+        let strategy_id = U256::from(id);
+        reads.push((
+            deployments.reviews,
+            IReviewRegistry::reviewOfCall {
+                strategyId: strategy_id,
+            }
+            .abi_encode()
+            .into(),
+        ));
+        reads.push((
+            deployments.factory,
+            IVaultFactory::vaultOfCall {
+                strategyId: strategy_id,
+            }
+            .abi_encode()
+            .into(),
+        ));
+    }
+    reads
+}
+
 /// A job, as the builder reports it, with what the chain adds: its review
 /// (a refusal's included), whether it has been activated, and who its author
 /// is called. Any read the chain doesn't answer leaves the job uncompleted.
-pub async fn job(
-    chain: &Client,
-    deployments: &Deployments,
-    store: &Store,
-    mut job: Job,
-) -> Result<Job> {
+pub fn job(views: &Views, deployments: &Deployments, store: &Store, mut job: Job) -> Result<Job> {
     if let Ok(author) = job.author.parse::<Address>() {
-        let profile = chain
-            .read(
-                deployments.profiles,
-                IAuthorProfiles::profileOfCall { author },
-            )
-            .await?;
+        let profile = views.read(
+            deployments.profiles,
+            IAuthorProfiles::profileOfCall { author },
+        )?;
         job.author = if profile.handle.is_empty() {
             address_of(author)
         } else {
@@ -2001,15 +2277,13 @@ pub async fn job(
         return Ok(job);
     };
     let strategy_id = U256::from(id);
-    job.review = read_review(chain, deployments, store, strategy_id).await?;
-    let vault = chain
-        .read(
-            deployments.factory,
-            IVaultFactory::vaultOfCall {
-                strategyId: strategy_id,
-            },
-        )
-        .await?;
+    job.review = read_review(views, deployments, store, strategy_id)?;
+    let vault = views.read(
+        deployments.factory,
+        IVaultFactory::vaultOfCall {
+            strategyId: strategy_id,
+        },
+    )?;
     if vault != Address::ZERO {
         job.state = JobState::Activated;
         job.strategy_slug = Some(Strategy::slug_for(job.chain, id));
@@ -2063,5 +2337,219 @@ mod tests {
         assert_eq!(blocks_until(low, high, 1_001), 1);
         assert_eq!(blocks_until(low, high, 1_000), 1);
         assert_eq!(blocks_until(low, high, 9_999), 100);
+    }
+
+    // A vault's log, as it is folded into its holders' costs ---------------
+
+    const VAULT: Address = Address::repeat_byte(0x11);
+    const HOLDER: Address = Address::repeat_byte(0x22);
+    const SOMEONE_ELSE: Address = Address::repeat_byte(0x33);
+
+    /// One of the vault's events, in transaction `tx` at `index`.
+    fn logged(event: impl alloy::sol_types::SolEvent, tx: u8, index: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: VAULT,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(B256::repeat_byte(tx)),
+            block_number: Some(tx as u64),
+            block_timestamp: None,
+            transaction_hash: Some(B256::repeat_byte(tx)),
+            transaction_index: Some(0),
+            log_index: Some(index),
+            removed: false,
+        }
+    }
+
+    fn usd(dollars: u64) -> U256 {
+        U256::from(dollars * 1_000_000)
+    }
+
+    fn shares_of(count: u64) -> U256 {
+        U256::from(count) * U256::from(10u64.pow(18))
+    }
+
+    fn deposited(owner: Address, dollars: u64, tx: u8) -> Log {
+        logged(
+            IVault::Deposited {
+                requestId: U256::from(tx),
+                owner,
+                assets: usd(dollars),
+                shares: shares_of(dollars),
+            },
+            tx,
+            0,
+        )
+    }
+
+    /// The costs `logs` fold to, folded in batches cut at every block
+    /// boundary as pages would cut them, and all at once: both the same.
+    fn cost_of(logs: &[Log], who: Address) -> f64 {
+        let deployments = crate::evm::tests::deployments();
+        let mut whole = History::default();
+        whole.fold(&deployments, logs);
+        let mut paged = History::default();
+        for block in logs
+            .iter()
+            .filter_map(|log| log.block_number)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let page: Vec<Log> = logs
+                .iter()
+                .filter(|log| log.block_number == Some(block))
+                .cloned()
+                .collect();
+            paged.fold(&deployments, &page);
+        }
+        assert_eq!(whole.cost(&VAULT, &who), paged.cost(&VAULT, &who));
+        whole.cost(&VAULT, &who)
+    }
+
+    #[test]
+    fn a_claim_paid_once_the_vault_closed_comes_off_its_owner_s_cost_once() {
+        let logs = vec![
+            deposited(HOLDER, 100, 1),
+            deposited(SOMEONE_ELSE, 50, 2),
+            // A claim paid while the vault ran: its `Withdrawn` and its
+            // `ClaimPaid`, one after the other.
+            logged(
+                IVault::ClaimBooked {
+                    claimId: U256::from(8),
+                    owner: HOLDER,
+                    shares: shares_of(20),
+                },
+                3,
+                0,
+            ),
+            logged(
+                IVault::Withdrawn {
+                    requestId: U256::from(4),
+                    owner: HOLDER,
+                    shares: shares_of(20),
+                    assets: usd(20),
+                    feeShares: U256::ZERO,
+                },
+                4,
+                3,
+            ),
+            logged(
+                IVault::ClaimPaid {
+                    claimId: U256::from(8),
+                    assets: usd(20),
+                },
+                4,
+                4,
+            ),
+            // Two claims paid once the vault closed (`claimClosed`): a burn,
+            // then the `ClaimPaid` alone.
+            logged(
+                IVault::ClaimBooked {
+                    claimId: U256::from(9),
+                    owner: HOLDER,
+                    shares: shares_of(30),
+                },
+                5,
+                0,
+            ),
+            logged(
+                IVault::ClaimBooked {
+                    claimId: U256::from(10),
+                    owner: SOMEONE_ELSE,
+                    shares: shares_of(10),
+                },
+                5,
+                1,
+            ),
+            logged(
+                IVault::Transfer {
+                    from: VAULT,
+                    to: Address::ZERO,
+                    value: shares_of(30),
+                },
+                6,
+                0,
+            ),
+            logged(
+                IVault::ClaimPaid {
+                    claimId: U256::from(9),
+                    assets: usd(30),
+                },
+                6,
+                2,
+            ),
+            logged(
+                IVault::Transfer {
+                    from: VAULT,
+                    to: Address::ZERO,
+                    value: shares_of(10),
+                },
+                7,
+                0,
+            ),
+            logged(
+                IVault::ClaimPaid {
+                    claimId: U256::from(10),
+                    assets: usd(10),
+                },
+                7,
+                2,
+            ),
+        ];
+        assert_eq!(cost_of(&logs, HOLDER), 50.0);
+        assert_eq!(cost_of(&logs, SOMEONE_ELSE), 40.0);
+    }
+
+    #[test]
+    fn a_closed_vault_s_redemption_comes_off_the_holder_s_cost_not_the_receiver_s() {
+        let logs = vec![
+            deposited(HOLDER, 100, 1),
+            deposited(SOMEONE_ELSE, 50, 2),
+            // `redeemClosed(5 shares, someone else)`, sent by the holder: the
+            // holder's shares burnt, the dollars to the receiver.
+            logged(
+                IVault::Transfer {
+                    from: HOLDER,
+                    to: Address::ZERO,
+                    value: shares_of(5),
+                },
+                3,
+                0,
+            ),
+            logged(
+                IVault::Withdrawn {
+                    requestId: U256::ZERO,
+                    owner: SOMEONE_ELSE,
+                    shares: shares_of(5),
+                    assets: usd(40),
+                    feeShares: U256::ZERO,
+                },
+                3,
+                2,
+            ),
+            // And one the receiver redeems for themselves.
+            logged(
+                IVault::Transfer {
+                    from: SOMEONE_ELSE,
+                    to: Address::ZERO,
+                    value: shares_of(1),
+                },
+                4,
+                0,
+            ),
+            logged(
+                IVault::Withdrawn {
+                    requestId: U256::ZERO,
+                    owner: SOMEONE_ELSE,
+                    shares: shares_of(1),
+                    assets: usd(8),
+                    feeShares: U256::ZERO,
+                },
+                4,
+                2,
+            ),
+        ];
+        assert_eq!(cost_of(&logs, HOLDER), 60.0);
+        assert_eq!(cost_of(&logs, SOMEONE_ELSE), 42.0);
     }
 }

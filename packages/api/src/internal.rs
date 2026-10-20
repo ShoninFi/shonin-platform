@@ -151,6 +151,18 @@ impl Reads for ChainReads {
                     return None;
                 }
                 Some(async move {
+                    // The record's count, when it was read within one
+                    // refresh: no read of its own.
+                    let name = match &lookup {
+                        Lookup::Served(served) => served.client.chain_id.to_string(),
+                        Lookup::Solana(served) => served.key.to_string(),
+                        _ => return None,
+                    };
+                    if let Some(within) = self.indexer.refresh_every(chain)
+                        && let Some(count) = self.indexer.payments(chain, within).await
+                    {
+                        return Some((name, count));
+                    }
                     let count = tokio::time::timeout(COUNT_TIMEOUT, async {
                         match lookup {
                             Lookup::Served(served) => served
