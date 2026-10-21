@@ -34,7 +34,7 @@ use super::{AccountMeta, Instruction, Pubkey};
 
 pub use shonin_orca_driver::network::{
     self, ASSET_DECIMALS, ASSET_MINT, CONFIG, DOLLAR_DECIMALS, DOLLAR_MINT, FEED_ID, MAX_AGE,
-    POOLS, PRICE_ACCOUNT, PYTH_RECEIVER, Pool as Listed, WHIRLPOOL_PROGRAM,
+    NEAR_BPS, POOLS, PRICE_ACCOUNT, PYTH_RECEIVER, Pool as Listed, WHIRLPOOL_PROGRAM,
 };
 pub use shonin_orca_driver::orca::Position;
 pub use shonin_orca_driver::{
@@ -683,10 +683,48 @@ pub fn deposit(
     })
 }
 
-/// Integer roots strictly inside the driver's price band, in dollar-price
-/// order. Its raw lower boundary is rounded up by one and both boundaries
-/// are excluded. Using these roots for trades leaves valuation available
-/// even when a swap reaches its limit.
+/// How far, in basis points of price, the driver lets a pool stand from
+/// Pyth's price inside `band_bps`: [`NEAR_BPS`], or the band if narrower.
+pub fn near_bps(band_bps: u16) -> u64 {
+    (band_bps as u64).min(NEAR_BPS)
+}
+
+/// The driver's roots `bps` of price either side of the root `root`, in
+/// square-root price order, each rounded towards it as the driver rounds
+/// them: below, `root * (1 - t / 2)` and a unit more; above, `root * (1 + t
+/// / 2 - t^2 / 8)`, a price under `1 + t`. A pool at or past either is too
+/// far from Pyth's price to be valued or closed through.
+fn near_of_root(root: U256, bps: u64) -> (u128, u128) {
+    let clamp = |value: U256| {
+        value
+            .min(U256::from(math::MAX_SQRT_PRICE))
+            .max(U256::from(math::MIN_SQRT_PRICE))
+            .low_u128()
+    };
+    let (two, whole) = (U256::from(20_000u64), U256::from(800_000_000u64));
+    let bps = U256::from(bps.min(10_000));
+    let low = clamp(root * (two - bps) / two).saturating_add(1);
+    let high = clamp(root * (whole + U256::from(40_000u64) * bps - bps * bps) / whole);
+    (low, high)
+}
+
+/// The square-root prices at or past which the driver finds a pool too far
+/// from `price` (a price here, Pyth's) to value or close a station of
+/// `band_bps` (see [`near_bps`]): the root at the lowest dollar price first,
+/// then at the highest, whichever way the pool keeps its prices.
+pub fn near_roots(price: u128, band_bps: u16) -> (u128, u128) {
+    let (low, high) = near_of_root(U256::from(sqrt_of_price(price)), near_bps(band_bps));
+    if asset_is_a() {
+        (low, high)
+    } else {
+        (high, low)
+    }
+}
+
+/// Integer roots strictly inside where the driver lets the pool stand from
+/// Pyth's price (see [`near_bps`]), in dollar-price order: a unit inside
+/// each of the driver's own. Using these roots for trades leaves valuation
+/// available even when a swap reaches its limit.
 pub fn trading_roots(price: &Price, band_bps: u16) -> Option<(u128, u128)> {
     use shonin_orca_driver::wide::W;
 
@@ -715,16 +753,9 @@ pub fn trading_roots(price: &Price, band_bps: u16) -> Option<(u128, u128)> {
         return None;
     }
     let root = U256::from(shonin_orca_driver::logic::sqrt_price_for(raw));
-    let two = U256::from(20_000u64);
-    let band = U256::from(band_bps as u64);
-    let clamp = |value: U256| {
-        value
-            .min(U256::from(math::MAX_SQRT_PRICE))
-            .max(U256::from(math::MIN_SQRT_PRICE))
-            .low_u128()
-    };
-    let low = clamp(root * (two - band.min(two)) / two).checked_add(2)?;
-    let high = clamp(root * (two + band) / two).checked_sub(1)?;
+    let (low, high) = near_of_root(root, near_bps(band_bps));
+    let low = low.checked_add(1)?;
+    let high = high.checked_sub(1)?;
     if low > high {
         return None;
     }
@@ -1307,6 +1338,42 @@ mod tests {
             assert!(took > most, "{took} against {most}");
         }
         assert_eq!(liquidity_within(ticks, (low, high), 0, 0).unwrap().0, 0);
+    }
+
+    #[test]
+    fn the_pool_may_stand_from_pyth_s_price_by_no_more_than_the_tolerance_or_the_band() {
+        let root = sqrt_of_price(PRICE);
+        for band in [10u16, 100, 1_000] {
+            let t = near_bps(band);
+            assert_eq!(t, (band as u64).min(NEAR_BPS));
+            let (low, high) = near_roots(PRICE, band);
+            let (low, high) = (low.min(high), low.max(high));
+            assert!(low < root && root < high);
+            // Never past the tolerance in price on either side.
+            let (at_low, at_high) = (price_of_sqrt(low), price_of_sqrt(high));
+            assert!(
+                at_low >= PRICE - PRICE * t as u128 / 10_000,
+                "{band}: {at_low}"
+            );
+            assert!(
+                at_high <= PRICE + PRICE * t as u128 / 10_000,
+                "{band}: {at_high}"
+            );
+            // And within a hair of it.
+            assert!(at_high >= PRICE + PRICE * t as u128 / 10_000 - PRICE / 100_000);
+            // Trades stay strictly inside.
+            let price = Price {
+                price: 150_00000000,
+                confidence: 0,
+                exponent: -8,
+                publish_time: 0,
+                full: true,
+            };
+            if let Some(trading) = trading_roots(&price, band) {
+                let (a, b) = (trading.0.min(trading.1), trading.0.max(trading.1));
+                assert!(a > low && b < high, "{band}");
+            }
+        }
     }
 
     #[test]

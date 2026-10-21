@@ -3,9 +3,10 @@
 //! they have earned, and a leaver's fraction is withdrawn, sold inside the
 //! band and sent home while the stayers keep theirs; and everything that
 //! should be refused is: a foreign destination or pool, a look-alike or
-//! unfit price, a pool pushed outside the band, a position left out, a
-//! delegate, a position at any mint but the authority's own slots, and a
-//! sale the pool can't fill inside the band.
+//! unfit price, a pool pushed further from Pyth's price than it may stand
+//! (however wide the band), a position left out, a delegate, a position at
+//! any mint but the authority's own slots, and a sale the pool can't fill
+//! inside the band.
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
@@ -1074,41 +1075,149 @@ fn a_pool_pushed_far_above_pyth_is_outside_and_never_an_error() {
     assert!(outcome.blocked && received == 0);
 }
 
-/// A pool pushed up inside the band lifts `exit` above the Pyth-priced
-/// `mark` (the vault takes the difference from deposits of that moment), by
-/// no more than the band.
+/// The square-root price `share` thousandths of the way from Pyth's to the
+/// low root `bps` of price below it, as the driver bounds a pool there.
+fn pushed_down(env: &Env, bps: u64, share: u128) -> u128 {
+    let root = sqrt_at(env.sol_price());
+    root * (2 * BPS as u128 * 1_000 - bps as u128 * share) / (2 * BPS as u128 * 1_000)
+}
+
+/// The highest square-root price the driver lets a pool stand at `bps` of
+/// price above Pyth's: its root times `1 + t / 2 - t^2 / 8`.
+fn high_root(env: &Env, bps: u64) -> u128 {
+    let root = sqrt_at(env.sol_price());
+    let whole = 8 * BPS as u128 * BPS as u128;
+    let bps = bps as u128;
+    root * (whole + 4 * BPS as u128 * bps - bps * bps) / whole
+}
+
+/// Bob swaps the pool's price to `target`, Pyth's staying where it is.
+fn push_to(env: &mut Env, target: u128) {
+    let bob = env.bob.insecure_clone();
+    let down = target < env.pool_state().sqrt_price;
+    let push = env.ix_swap(
+        &bob.pubkey(),
+        &env.wsol_of(&bob.pubkey()),
+        &get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
+        1_000_000_000_000,
+        target,
+        down,
+    );
+    let price = env.sol_price();
+    expect_ok(env.send(vec![push], &[&bob]));
+    assert_eq!(env.sol_price(), price);
+}
+
+/// A pool pushed up lifts `exit` above the Pyth-priced `mark` (the vault
+/// takes the difference from deposits of that moment) by no more than the
+/// band, and the pool may stand no higher than the band's own price above
+/// Pyth's: pushed to where a sale's limit at the band's top root would be,
+/// a hair past the band, the valuation is outside.
 #[test]
-fn a_push_inside_the_band_lifts_exit_above_the_mark_by_less_than_the_band() {
+fn a_pool_pushed_up_lifts_exit_by_no_more_than_the_band_and_never_stands_past_it() {
     let (mut env, home) = world();
     // A station mostly in SOL: $1,500 of it.
     expect_ok(env.station_buys_sol(&home, 1_500_000_000));
     env.price_follows_pool();
-    let bob = env.bob.insecure_clone();
-    let (bob_wsol, bob_usd) = (
-        env.wsol_of(&bob.pubkey()),
-        get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
-    );
-    // Up to just inside the band's high root (half the band from Pyth's).
-    let pyth_root = sqrt_at(env.sol_price());
-    let target = pyth_root * (2 * BPS as u128 + EXIT_BAND as u128) / (2 * BPS as u128) - 2;
-    let push = env.ix_swap(
-        &bob.pubkey(),
-        &bob_wsol,
-        &bob_usd,
-        1_000_000_000_000,
-        target,
-        false,
-    );
-    expect_ok(env.send(vec![push], &[&bob]));
+    let band = (EXIT_BAND as u64).min(shonin_orca_driver::network::NEAR_BPS);
+    // Just inside the highest the pool may stand.
+    let target = high_root(&env, band) - 2;
+    push_to(&mut env, target);
     let pushed = env.value(&home);
     let idle = env.idle(&home);
     let (mark, exit) = (pushed.mark - idle, pushed.exit - idle);
     assert!(!pushed.outside);
     assert!(exit > mark, "mark {mark} exit {exit}");
-    assert!(
-        exit - mark <= mark * EXIT_BAND as u64 / BPS,
-        "mark {mark} exit {exit}"
-    );
+    assert!(exit - mark <= mark * band / BPS, "mark {mark} exit {exit}");
+    // Half the band from Pyth's root: a price `b + b^2 / 4` above it.
+    let root = sqrt_at(env.sol_price());
+    let past = root * (2 * BPS as u128 + band as u128) / (2 * BPS as u128) - 2;
+    push_to(&mut env, past);
+    assert!(env.value(&home).outside);
+    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 2));
+    assert!(outcome.blocked && received == 0);
+}
+
+/// A station's world for a push: the test pool deepened, a station holding
+/// about a SOL, a band four times what the pool may stand from Pyth's.
+fn a_station_to_push() -> (Env, Home, u64) {
+    let mut env = Env::with_orca();
+    let near = shonin_orca_driver::network::NEAR_BPS;
+    let band = 4 * near;
+    let home = env.orca_home_with_band("orca", band as u16);
+    expect_ok(env.station_buys_sol(&home, 150_000_000));
+    deepen(&mut env);
+    env.price_follows_pool();
+    (env, home, band)
+}
+
+/// A push down in the transaction that values moves `exit` by no more than
+/// how far the pool may stand from Pyth's, however wide the band: pushed
+/// nearly to the band's own reach, the valuation is outside (void), and
+/// pushed nearly to the tolerance, `exit` falls by about that and no more.
+/// The push up, which lifts what a deposit pays, is bounded alike.
+#[test]
+fn a_push_before_a_valuation_moves_exit_by_no_more_than_the_pool_may_stand_from_pyth() {
+    let near = shonin_orca_driver::network::NEAR_BPS;
+    let (mut env, home, band) = a_station_to_push();
+    let before = env.value(&home);
+    assert!(!before.outside, "{before:?}");
+    let idle = env.idle(&home);
+    let exit0 = before.exit - idle;
+    // 98% of the way to the band's low root: the reach a sale has.
+    let target = pushed_down(&env, band, 980);
+    push_to(&mut env, target);
+    let far = env.value(&home);
+    println!("unpushed {exit0}, pushed by 98% of the band: {far:?}");
+    assert!(far.outside, "{far:?}");
+    // Back near Pyth's price, then 95% of the way to the tolerance's root.
+    let (mut env, home, _) = a_station_to_push();
+    let target = pushed_down(&env, near, 950);
+    push_to(&mut env, target);
+    let near_down = env.value(&home);
+    println!("pushed down by 95% of the tolerance: {near_down:?}");
+    assert!(!near_down.outside, "{near_down:?}");
+    let exit = near_down.exit - idle;
+    assert!(exit <= exit0);
+    assert!(exit0 - exit <= exit0 * near / BPS, "{exit0} {exit}");
+    // And up, 95% of the way to the highest it may stand.
+    let (mut env, home, _) = a_station_to_push();
+    let root = sqrt_at(env.sol_price());
+    let target = root + (high_root(&env, near) - root) * 95 / 100;
+    push_to(&mut env, target);
+    let up = env.value(&home);
+    println!("pushed up by 95% of the tolerance: {up:?}");
+    assert!(!up.outside, "{up:?}");
+    let exit = up.exit - idle;
+    assert!(exit >= exit0);
+    assert!(exit - exit0 <= exit0 * near / BPS, "{exit0} {exit}");
+}
+
+/// A push down before a claim's close, in the same transaction as anyone
+/// may send it, pays the leaver no less than how far the pool may stand
+/// from Pyth's allows: pushed nearly to the band's reach, the close is
+/// refused and the claim waits; pushed nearly to the tolerance, what comes
+/// home falls by no more than it. An honest pool's close is served.
+#[test]
+fn a_push_before_a_claim_s_close_pays_the_leaver_no_less_than_the_pool_may_stand_from_pyth() {
+    let near = shonin_orca_driver::network::NEAR_BPS;
+    let (mut env, home, band) = a_station_to_push();
+    let (honest, _, _) = ok(env.orca_unwind(&home, WAD / 2));
+    assert!(!honest.blocked && honest.sent_home > 0, "{honest:?}");
+    let (mut env, home, _) = a_station_to_push();
+    let target = pushed_down(&env, band, 980);
+    push_to(&mut env, target);
+    let (far, received, _) = ok(env.orca_unwind(&home, WAD / 2));
+    println!("honest {honest:?}, pushed by 98% of the band: {far:?}");
+    assert!(far.blocked && received == 0, "{far:?}");
+    let (mut env, home, _) = a_station_to_push();
+    let target = pushed_down(&env, near, 950);
+    push_to(&mut env, target);
+    let (pushed, _, _) = ok(env.orca_unwind(&home, WAD / 2));
+    println!("pushed by 95% of the tolerance: {pushed:?}");
+    assert!(!pushed.blocked, "{pushed:?}");
+    let (h, p) = (honest.sent_home, pushed.sent_home);
+    assert!(p <= h && h - p <= h * near / BPS, "{h} {p}");
 }
 
 #[test]
@@ -1346,7 +1455,7 @@ fn ticks_at_the_pool_s_threshold_are_crossed_exactly_and_smaller_ones_wholly_on_
         let group = env.orca_group(&home.station);
         let value = ok(env.driver_value(&group, 1_000));
         assert!(!value.outside && !env.value(&home).outside);
-        let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 4));
+        let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 16));
         println!("{size:?}: {value:?}, {outcome:?} {received}");
         assert!(!outcome.blocked && received > 0);
         exits.push(value.exit);
@@ -1422,7 +1531,7 @@ fn slivers_on_every_tick_never_make_a_claim_wait_nor_void_the_valuation() {
     println!("{value:?} in {compute} compute units");
     assert!(!value.outside && !env.value(&home).outside);
     let from = env.pool_state().tick;
-    let (outcome, received, compute) = ok(env.orca_unwind(&home, WAD / 4));
+    let (outcome, received, compute) = ok(env.orca_unwind(&home, WAD / 16));
     let n = crossed(from, env.pool_state().tick) as u32;
     println!("served {received}, crossing {n} in {compute}");
     assert!(!outcome.blocked && received > 0);
@@ -1718,11 +1827,9 @@ fn a_claim_whose_own_swap_would_cross_too_many_ticks_is_paid_in_parts() {
             });
         let (got, tries) = serve_in_parts(&mut env, &v, id);
         println!("{slivers} slivers: paid {got} in {tries} tries");
-        if slivers == 0 {
-            assert_eq!(tries, 1);
-        } else {
-            assert!(tries > 1);
-        }
+        // Without them too: the claim is more than one close may sell
+        // without taking the pool further from Pyth's than it may stand.
+        assert!(tries > 1);
         paid.push(got);
     }
     assert!(paid[1] >= paid[0] - paid[0] / 200, "{paid:?}");

@@ -21,7 +21,8 @@
 //! the stations, the vaults) and Orca's driver (final, and listing the
 //! dollar's pool) moved to fresh indices when the devnet's dollar became
 //! Circle's USDC: their first addresses keep the stand-in dollar's
-//! deployment.
+//! deployment. Orca's driver moved once more, to 116, when it began to
+//! refuse a pool standing too far from Pyth's price.
 
 use std::path::Path;
 
@@ -42,13 +43,13 @@ pub const PROGRAM_KEYS: [(&str, u32); 11] = [
     ("shonin_publishing", 112),
     ("shonin_station", 113),
     ("shonin_vault", 114),
-    ("shonin_orca_driver", 115),
+    ("shonin_orca_driver", 116),
 ];
 
 /// Indices no longer used, and never handed out again: the first addresses
 /// of the programs that moved (publishing, the stations, the vaults, Orca's
-/// driver) and the stand-in dollar's mint.
-pub const RETIRED: [u32; 5] = [100, 103, 104, 108, 110];
+/// driver, twice) and the stand-in dollar's mint.
+pub const RETIRED: [u32; 6] = [100, 103, 104, 108, 110, 115];
 
 /// The testnet market's own account on devnet: not a program and never a
 /// role, so its key opens nothing of the platform's.
@@ -113,12 +114,16 @@ mod tests {
             "shonin_vault",
             "shonin_orca_driver",
         ];
-        for (k, name) in moved.iter().enumerate() {
+        for (k, name) in moved.iter().take(3).enumerate() {
             assert_eq!(index(name), MARKET + 1 + k as u32, "{name}");
         }
+        // Orca's driver is final, so a new driver is a new address: it moved
+        // past its own first move, which is retired.
+        assert_eq!(index("shonin_orca_driver"), MARKET + 5);
+        assert!(RETIRED.contains(&(MARKET + 4)));
         // Every index handed out before the move is at or below the last
         // retired one.
-        let highest_before = *RETIRED.iter().max().unwrap();
+        let highest_before = *RETIRED.iter().filter(|i| **i < MARKET).max().unwrap();
         assert!(MARKET > highest_before);
         assert!(
             PROGRAM_KEYS
