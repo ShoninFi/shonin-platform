@@ -29,7 +29,10 @@ use std::sync::Arc;
 use crate::config::ChainConfig;
 use crate::deployments::Deployments;
 
+mod hypercore;
 mod in_flight;
+
+use hypercore::{HyperCore, HyperCoreFirst};
 
 pub use in_flight::{Landed, Landing, StillWatched, Superseded};
 
@@ -192,6 +195,9 @@ pub struct Client {
     signing: Option<SigningProvider>,
     /// The chain's name, for errors and logs that can't name an endpoint.
     label: String,
+    /// What the `rpc` endpoints have shown of serving HyperCore's reads,
+    /// shared by every connection made over them ([`hypercore`]).
+    hypercore: HyperCore,
 }
 
 /// The nonce after each account's last send this client saw land, and the
@@ -601,7 +607,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// endpoint ranked best by how often and how fast it has answered lately, and
 /// to the next when one refuses (a rate limit included, however it is
 /// worded, and an endpoint saying it no longer has the past state a read
-/// asked for), which also falls in the ranking.
+/// asked for, or that it could not reach what a call reads), which also
+/// falls in the ranking. A call or estimate found to read HyperCore goes
+/// only to the endpoints that serve such reads ([`hypercore`]), as
+/// `hypercore` has them.
 ///
 /// `setting` names the setting the list came from, for an error that can't
 /// name the URL.
@@ -609,6 +618,7 @@ fn rpc_client(
     rpc: &str,
     setting: &str,
     chain_id: Option<u64>,
+    hypercore: Option<&HyperCore>,
 ) -> Result<alloy::rpc::client::RpcClient> {
     let http = http_client()?;
     let urls: Vec<&str> = rpc.split_whitespace().collect();
@@ -624,12 +634,19 @@ fn rpc_client(
             is_local,
         ));
     }
+    let hypercore = hypercore.cloned().unwrap_or_default();
     let mut transports = Vec::with_capacity(urls.len());
-    for configured in urls {
+    for (at, configured) in urls.into_iter().enumerate() {
         transports.push(endpoint_transport(
-            configured, setting, &http, chain_id, chain_id,
+            configured,
+            setting,
+            &http,
+            chain_id,
+            chain_id,
+            Some((hypercore.clone(), at)),
         )?);
     }
+    let each: Arc<[_]> = transports.clone().into();
     // Every method the services use goes to one endpoint at a time, best
     // first, and on to the next when one refuses, so a request fails only
     // when every endpoint has. A method not listed goes to them all at once
@@ -647,8 +664,15 @@ fn rpc_client(
             ),
         transports,
     );
+    // Calls that read HyperCore go first to the endpoints that serve them
+    // (`client::hypercore`), everything else through the failover.
+    let routed = HyperCoreFirst {
+        rest: fallback,
+        each,
+        hypercore,
+    };
     Ok(alloy::rpc::client::ClientBuilder::default()
-        .transport(AskAgainWhenRateLimited { inner: fallback }, false))
+        .transport(AskAgainWhenRateLimited { inner: routed }, false))
 }
 
 /// The HTTP client every endpoint is asked through, each request bounded in
@@ -671,14 +695,17 @@ fn parse_endpoint(url: &str, setting: &str) -> Result<alloy::transports::http::r
 }
 
 /// The connection to one endpoint of a list: its URL kept out of its
-/// errors, its own trouble (a rate limit, missing history) an error rather
-/// than an answer, and, once the chain's id is known, held to that chain.
+/// errors, its own trouble (a rate limit, missing history, a failure to
+/// reach what a call reads) an error rather than an answer, and, once the
+/// chain's id is known, held to that chain. `hypercore` is where what it
+/// shows of serving HyperCore's reads is kept, and its place in the list.
 fn endpoint_transport(
     configured: &str,
     setting: &str,
     http: &alloy::transports::http::reqwest::Client,
     chain_id: Option<u64>,
     counted_chain: Option<u64>,
+    hypercore: Option<(HyperCore, usize)>,
 ) -> Result<
     HeldToChain<
         UrlKeptOut<
@@ -692,7 +719,7 @@ fn endpoint_transport(
     let keep = KeepUrlOut::new(configured, &url).counted_on(counted_chain);
     let inner = alloy::transports::http::Http::with_client(http.clone(), url);
     Ok(HeldToChain {
-        inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner }),
+        inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner, hypercore }),
         chain_id,
         on_it: Default::default(),
         failed_at: Default::default(),
@@ -945,18 +972,35 @@ impl Endpoint {
 struct Endpoints {
     each: Arc<[Endpoint]>,
     preferred: Arc<std::sync::atomic::AtomicUsize>,
+    /// What they have shown of serving HyperCore's reads, on a chain whose
+    /// EVM reads HyperCore ([`hypercore`]).
+    hypercore: Option<HyperCore>,
 }
 
 impl Endpoints {
     /// Each endpoint held to chain `chain_id` when there is one
     /// ([`HeldToChain`]).
-    fn new(list: &str, setting: &str, chain_id: Option<u64>, counted_chain: u64) -> Result<Self> {
+    fn new(
+        list: &str,
+        setting: &str,
+        chain_id: Option<u64>,
+        counted_chain: u64,
+        hypercore: Option<&HyperCore>,
+    ) -> Result<Self> {
         let http = http_client()?;
         let each = list
             .split_whitespace()
-            .map(|configured| {
+            .enumerate()
+            .map(|(at, configured)| {
                 let client = alloy::rpc::client::ClientBuilder::default().transport(
-                    endpoint_transport(configured, setting, &http, chain_id, Some(counted_chain))?,
+                    endpoint_transport(
+                        configured,
+                        setting,
+                        &http,
+                        chain_id,
+                        Some(counted_chain),
+                        hypercore.map(|hypercore| (hypercore.clone(), at)),
+                    )?,
                     false,
                 );
                 Ok(Endpoint {
@@ -975,6 +1019,7 @@ impl Endpoints {
         Ok(Self {
             each: each.into(),
             preferred: Default::default(),
+            hypercore: hypercore.cloned(),
         })
     }
 
@@ -1006,11 +1051,19 @@ impl Endpoints {
         probe: bool,
     ) -> Result<Self> {
         let ask_ids = !(id_known && self.each.len() == 1);
+        // On a chain whose EVM reads HyperCore, each endpoint of a list is
+        // asked a HyperCore read too: one that fails it is marked by its
+        // transport ([`TroubleIsAFailure`]), one that answers is marked here.
+        let hypercore = self
+            .hypercore
+            .clone()
+            .filter(|_| self.each.len() > 1 && hypercore::HYPERCORE_CHAINS.contains(&chain_id));
         let mut asked = tokio::task::JoinSet::new();
         for (at, endpoint) in self.each.iter().enumerate() {
             let provider = endpoint.provider.clone();
+            let hypercore = hypercore.clone();
             asked.spawn(async move {
-                let (id, honours) = tokio::join!(
+                let (id, honours, ()) = tokio::join!(
                     async {
                         if ask_ids {
                             tokio::time::timeout(CHECK_TIMEOUT, provider.get_chain_id())
@@ -1029,6 +1082,17 @@ impl Endpoints {
                                 .flatten()
                         } else {
                             None
+                        }
+                    },
+                    async {
+                        let Some(hypercore) = hypercore else {
+                            return;
+                        };
+                        let read = TransactionRequest::default().with_to(hypercore::PROBE);
+                        if let Ok(Ok(_)) =
+                            tokio::time::timeout(CHECK_TIMEOUT, provider.call(read)).await
+                        {
+                            hypercore.saw(at, true);
                         }
                     }
                 );
@@ -1503,9 +1567,15 @@ const ONE_ENDPOINT_AT_A_TIME: [&str; 22] = [
 ///   safe: the read fails only when none has it. A send is never moved on
 ///   for this, and a refusal about the request itself (a revert, a bad
 ///   argument) stays the answer it is.
+///
+/// - to a read, an endpoint saying it could not reach what the call needs
+///   (its node, or the HyperCore node behind a precompile read): another
+///   endpoint may reach it. One naming a HyperCore precompile is noted in
+///   `hypercore`, with the endpoint's place in the list.
 #[derive(Clone)]
 struct TroubleIsAFailure<S> {
     inner: S,
+    hypercore: Option<(HyperCore, usize)>,
 }
 
 /// The reads an endpoint may answer by saying it no longer has the state
@@ -1549,6 +1619,12 @@ where
         let reads_only = request
             .method_names()
             .all(|method| READS_OF_THE_PAST.contains(&method));
+        let targets = if reads_only && self.hypercore.is_some() {
+            hypercore::targets(&request)
+        } else {
+            Vec::new()
+        };
+        let noted = self.hypercore.clone();
         let answer = self.inner.call(request);
         Box::pin(async move {
             let answer = answer.await?;
@@ -1569,6 +1645,19 @@ where
             {
                 return Err(alloy::transports::TransportErrorKind::custom_str(&format!(
                     "{MISSING_STATE}: {}",
+                    error.message
+                )));
+            }
+            if reads_only
+                && let Some(error) = refusals()
+                    .find(|error| hypercore::is_forwarding_failure(error.code, &error.message))
+            {
+                if let Some((hypercore, at)) = &noted {
+                    hypercore.failed_forwarding(*at, &targets, &error.message);
+                }
+                return Err(alloy::transports::TransportErrorKind::custom_str(&format!(
+                    "{}: {}",
+                    hypercore::UNREACHED,
                     error.message
                 )));
             }
@@ -1672,7 +1761,7 @@ impl Client {
         // The chain id is asked for first, on a provider that signs nothing,
         // so a provider that signs is made for that id alone.
         let asking: DynProvider = ProviderBuilder::default()
-            .connect_client(rpc_client(rpc_url, "rpc", None)?)
+            .connect_client(rpc_client(rpc_url, "rpc", None, None)?)
             .erased();
 
         // Measured by the clock, not by the pauses between tries: a node
@@ -1697,13 +1786,20 @@ impl Client {
         // on every chain.
         // A lone endpoint is the one that just answered the chain id.
         let several = rpc_url.split_whitespace().count() > 1;
-        let endpoints = Endpoints::new(rpc_url, "rpc", several.then_some(chain_id), chain_id)?
-            .checked(chain_id, &config.label, "rpc", true, true)
-            .await?;
+        let hypercore = HyperCore::default();
+        let endpoints = Endpoints::new(
+            rpc_url,
+            "rpc",
+            several.then_some(chain_id),
+            chain_id,
+            Some(&hypercore),
+        )?
+        .checked(chain_id, &config.label, "rpc", true, true)
+        .await?;
 
         // From here every endpoint of the list is held to this chain,
         // whether or not it answered just now.
-        let rpc = rpc_client(rpc_url, "rpc", Some(chain_id))?;
+        let rpc = rpc_client(rpc_url, "rpc", Some(chain_id), Some(&hypercore))?;
         let asking: DynProvider = ProviderBuilder::default()
             .connect_client(rpc.clone())
             .erased();
@@ -1755,9 +1851,9 @@ impl Client {
         {
             Some(list) => (
                 ProviderBuilder::default()
-                    .connect_client(rpc_client(list, "logs_rpc", Some(chain_id))?)
+                    .connect_client(rpc_client(list, "logs_rpc", Some(chain_id), None)?)
                     .erased(),
-                Endpoints::new(list, "logs_rpc", Some(chain_id), chain_id)?
+                Endpoints::new(list, "logs_rpc", Some(chain_id), chain_id, None)?
                     .checked(chain_id, &config.label, "logs_rpc", false, false)
                     .await?,
             ),
@@ -1781,6 +1877,7 @@ impl Client {
             endpoints,
             signing: signing_provider,
             label: config.label.clone(),
+            hypercore,
         })
     }
 
@@ -1896,6 +1993,22 @@ impl Client {
             .iter()
             .map(|endpoint| endpoint.provider.clone())
             .collect()
+    }
+
+    /// The order to ask the `rpc` endpoints in (by their place in
+    /// [`Client::each_endpoint`]) for a call to any of `targets`, when one
+    /// is known to read HyperCore: those shown to serve HyperCore's reads
+    /// first, then those not known, leaving out one that failed them lately
+    /// ([`hypercore`]). `None` when no target is known to read HyperCore, or
+    /// no endpoint is left to ask: any endpoint will do.
+    pub fn hypercore_order(
+        &self,
+        targets: impl IntoIterator<Item = Address>,
+    ) -> Option<Vec<usize>> {
+        if !targets.into_iter().any(|to| self.hypercore.touches(to)) {
+            return None;
+        }
+        Some(self.hypercore.order(self.endpoints.each.len())).filter(|order| !order.is_empty())
     }
 
     /// Read a contract, without sending anything.
@@ -2245,7 +2358,12 @@ impl Client {
     pub fn signing_provider(&self, signer: PrivateKeySigner) -> Result<DynProvider> {
         Ok(ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
-            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?)
+            .connect_client(rpc_client(
+                &self.rpc_url,
+                "rpc",
+                Some(self.chain_id),
+                Some(&self.hypercore),
+            )?)
             .erased())
     }
 
@@ -2689,7 +2807,12 @@ impl Client {
         let address = signer.address();
         let signing = signing_builder(self.chain_id)
             .wallet(EthereumWallet::from(signer.clone()))
-            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?);
+            .connect_client(rpc_client(
+                &self.rpc_url,
+                "rpc",
+                Some(self.chain_id),
+                Some(&self.hypercore),
+            )?);
         // The key's turn to send is the one every client made from this
         // one takes for this key, as its nonce floor is.
         let sending = self
@@ -3893,7 +4016,8 @@ mod tests {
                 .build()
                 .unwrap();
             let chain = 9_876_544_000 + case;
-            let mut transport = endpoint_transport(&url, "rpc", &http, None, Some(chain)).unwrap();
+            let mut transport =
+                endpoint_transport(&url, "rpc", &http, None, Some(chain), None).unwrap();
             let request: SerializedRequest =
                 Request::new("eth_sendRawTransaction", 1u64.into(), ("0x1234",))
                     .try_into()
@@ -3936,8 +4060,15 @@ mod tests {
             ).as_bytes()).await.unwrap();
         });
         let chain = 9_876_543_210;
-        let mut transport =
-            endpoint_transport(&url, "rpc", &http_client().unwrap(), None, Some(chain)).unwrap();
+        let mut transport = endpoint_transport(
+            &url,
+            "rpc",
+            &http_client().unwrap(),
+            None,
+            Some(chain),
+            None,
+        )
+        .unwrap();
         let packet = || {
             let request: SerializedRequest = Request::new("eth_call", 1u64.into(), ())
                 .try_into()

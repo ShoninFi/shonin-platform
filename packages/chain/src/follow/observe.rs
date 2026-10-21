@@ -211,13 +211,23 @@ fn ran_at(answer: &Answer, block: &Header) -> bool {
 
 impl Follower {
     /// Observe `plan` at `at`: from the endpoint that answered last, then
-    /// the others in turn, each alone for the whole observation.
+    /// the others in turn, each alone for the whole observation. A plan
+    /// that reads a contract known to read HyperCore is observed only on
+    /// the endpoints that serve HyperCore's reads, in their order
+    /// ([`crate::Client::hypercore_order`]).
     pub async fn observe(&mut self, plan: &Plan, at: At) -> Result<Observed> {
         plan.check()?;
         let count = self.endpoints.len();
+        let order = self
+            .client
+            .hypercore_order(plan.reads.iter().map(|read| read.target))
+            .unwrap_or_else(|| {
+                (0..count)
+                    .map(|step| (self.preferred + step) % count)
+                    .collect()
+            });
         let mut failures = Vec::new();
-        for step in 0..count {
-            let endpoint = (self.preferred + step) % count;
+        for endpoint in order {
             match self.observe_on(endpoint, plan, at).await {
                 Ok(observed) => {
                     self.preferred = endpoint;

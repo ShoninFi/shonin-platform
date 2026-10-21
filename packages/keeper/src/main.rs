@@ -3764,12 +3764,22 @@ async fn runs_at_block_time(endpoint: &alloy::providers::DynProvider, now: u64) 
 /// its place in the list. Each is asked once (see [`runs_at_block_time`]),
 /// and asked again only while that couldn't be found out, or after a
 /// simulation through it failed. None when no endpoint is known to: the
-/// simulation's verdict would then be the head's, not the landing's.
+/// simulation's verdict would then be the head's, not the landing's. A
+/// vault whose calls read HyperCore is simulated only through the endpoints
+/// that serve those reads (see [`Client::hypercore_order`]).
 async fn endpoint_for_block_time(
     client: &Client,
+    vault: Address,
     now: u64,
 ) -> Option<(usize, alloy::providers::DynProvider)> {
-    for (at, endpoint) in client.each_endpoint().into_iter().enumerate() {
+    let each = client.each_endpoint();
+    let order = client
+        .hypercore_order([vault])
+        .unwrap_or_else(|| (0..each.len()).collect());
+    for at in order {
+        let Some(endpoint) = each.get(at).cloned() else {
+            continue;
+        };
         let key = (client.rpc_url.clone(), at);
         let known = RUNS_AT_BLOCK_TIME
             .lock()
@@ -3844,7 +3854,7 @@ async fn simulated_valuation(
 ) -> Option<Outcome> {
     let (on_time, late) = landing_times(now, timers.slotWindow, block_interval);
     let call = || IVault::recordValuationCall {};
-    let Some((at, endpoint)) = endpoint_for_block_time(client, now).await else {
+    let Some((at, endpoint)) = endpoint_for_block_time(client, vault, now).await else {
         tracing::debug!(%vault, "no endpoint is known to run a call at the time it is given; the valuation's estimate judges it");
         return Some(send_outcome(client, keeper, vault, call(), "value").await);
     };

@@ -83,6 +83,13 @@ native_usd = 0.0
 # the head's state (measured October 2026). The client sends no read pinned to
 # a past block to an endpoint it finds doing that, and asks one it couldn't
 # check only after those it found honouring the block.
+#
+# A call that reads HyperCore through a read precompile (a valuation's
+# price) needs an endpoint whose node can forward it, and drpc's has been
+# seen to fail every one (October 2026) while answering everything else.
+# The client asks each endpoint a precompile read when it connects, and
+# sends a call found to read HyperCore only to those that serve it, in this
+# order; Hyperliquid's own limits the rate, so the cheap reads stay on drpc.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
 rpc = "https://hyperliquid-testnet.drpc.org https://rpc.hyperliquid-testnet.xyz/evm https://rpcs.chain.link/hyperevm/testnet"
