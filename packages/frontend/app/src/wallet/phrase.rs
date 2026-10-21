@@ -11,6 +11,9 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::coins_bip39::English;
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner};
 
+/// The public label the probe signer's secret is derived from.
+const PROBE_SIGNER: &[u8] = b"shonin: l1 data fee probe signer, holds nothing";
+
 /// A key held in memory.
 #[derive(Clone)]
 pub struct LocalKey {
@@ -52,6 +55,18 @@ impl LocalKey {
             .build()
             .map_err(|_| BadPhrase)?;
         Ok(Self { signer })
+    }
+
+    /// The key that signs the L1 data fee probe: never the person's, so
+    /// the bytes handed to the endpoint are never a send the person signed.
+    /// Its secret is the keccak of a public label, so anyone can derive it;
+    /// it holds nothing, so whatever it signs is sent, if anyone ever sends
+    /// it, from its own address and never spends the person's funds.
+    pub(crate) fn probe_signer() -> Self {
+        let secret = alloy_primitives::keccak256(PROBE_SIGNER);
+        let signer = PrivateKeySigner::from_bytes(&secret)
+            .expect("the probe label's keccak is a valid secp256k1 secret");
+        Self { signer }
     }
 
     pub fn address(&self) -> Address {

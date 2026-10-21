@@ -1164,12 +1164,21 @@ fn pay_body(
                             .running
                             .signal_cloned()
                             .map(|running| match running {
-                                Some(running) => running.step.signal_cloned().boxed_local(),
+                                Some(running) => {
+                                    let sender = running.sender.clone();
+                                    running
+                                        .step
+                                        .signal_cloned()
+                                        .map(move |step| step.map(|step| (step, sender.clone())))
+                                        .boxed_local()
+                                }
                                 None => futures_signals::signal::always(None).boxed_local(),
                             })
                             .flatten()
                             .map(move |step| match step {
-                                Some(Step::Failed(error)) => Some(parts::failed(&error, &names)),
+                                Some((Step::Failed(error), sender)) => {
+                                    Some(parts::failed(&error, &names.sent_by(&sender)))
+                                }
                                 _ => None,
                             }),
                     )
@@ -1450,6 +1459,7 @@ pub fn submitting_states() -> Vec<(String, View)> {
     let draft = Draft::new();
     let names = Rc::new(Names {
         wallet: "MetaMask".to_string(),
+        keeps_activity: true,
         chain: "Base".to_string(),
         chain_id: 84_532,
         symbol: "USDC".to_string(),
@@ -2259,6 +2269,7 @@ mod tests {
     fn metamask() -> Rc<Names> {
         Rc::new(Names {
             wallet: "MetaMask".to_string(),
+            keeps_activity: true,
             chain: "Base".to_string(),
             chain_id: 84_532,
             symbol: "USDC".to_string(),

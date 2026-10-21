@@ -228,6 +228,18 @@ pub fn card_shows(step: Option<&Step>) -> CardShows {
     }
 }
 
+/// Whether a flow that ended at `last` changed what is on the chain, or may
+/// have: done, or stopped after money may have moved. Pages then read the
+/// chain again and let go of what was typed for it, so a send that may
+/// have gone through is never offered again as typed.
+pub fn ended_changed(last: Option<&Step>) -> bool {
+    match last {
+        Some(Step::Done(_)) => true,
+        Some(Step::Failed(error)) => error.may_have_moved(),
+        _ => false,
+    }
+}
+
 /// What a card shows for the flow `slot` holds, if any.
 pub fn card_shows_slot(slot: &Mutable<Option<SolRunning>>) -> CardShows {
     match slot.get_cloned() {
@@ -426,7 +438,9 @@ pub fn start(vault: Pubkey, action: SolAction, running: &SolRunning) {
                 }
             }
         };
-        if outcome.is_some() {
+        // What changed (or may have) is on the chain now: pages read it
+        // again.
+        if outcome.is_some() || ended_changed(running.step.lock_ref().as_ref()) {
             session.changed.replace_with(|n| *n + 1);
         }
     });
@@ -539,5 +553,32 @@ mod tests {
         assert_eq!(card_shows_slot(&card.slot), CardShows::StatusAndAction);
         assert!(start_from(&card, vault, SolAction::CollectUnits, cluster()));
         session.disconnect();
+    }
+
+    #[test]
+    fn a_flow_that_ended_with_money_that_may_have_moved_counts_as_a_change_so_typed_amounts_are_let_go()
+     {
+        let signature = Sig([3; 64]);
+        let why = "the cluster stopped answering".to_string();
+        for error in [
+            SolError::Landed {
+                signature,
+                why: why.clone(),
+            },
+            SolError::Pending { signature, why },
+            SolError::Stuck { signature },
+        ] {
+            assert!(
+                ended_changed(Some(&Step::Failed(error.clone()))),
+                "{error:?}"
+            );
+        }
+        assert!(ended_changed(Some(&Step::Done(Outcome::Changed {
+            signature
+        }))));
+        // Nothing moved: what was typed stays for another try.
+        assert!(!ended_changed(Some(&Step::Failed(SolError::Altered))));
+        assert!(!ended_changed(Some(&Step::Checking)));
+        assert!(!ended_changed(None));
     }
 }

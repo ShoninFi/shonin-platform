@@ -42,12 +42,31 @@ pub enum TxError {
     WouldRevert { reason: Revert },
     /// Mined, and reverted: nothing moved but the network fee.
     Reverted { hash: B256, reason: Option<Revert> },
-    /// Another transaction took its place (sped up or cancelled in the
-    /// wallet).
+    /// Another transaction used its nonce (sped up or cancelled in the
+    /// wallet, or, for a send signed in the page, possibly an earlier try
+    /// of the same action from this tab or another).
     Replaced { hash: B256 },
     /// Sent, and the network we read through never saw it while the app
     /// watched. Another node may have it, so it may still land.
     Dropped { hash: B256 },
+    /// Signed in the page and sent through the endpoint the app reads,
+    /// which then showed, for a while, its hash unknown and its nonce
+    /// unused. A node behind that endpoint may still hold it, but the page
+    /// signs the next send at that same nonce while the chain shows it
+    /// unused, so at most one of the two can land.
+    NotTaken { hash: B256 },
+    /// This transaction was signed in the page and sent, but another one
+    /// the page signed at the same nonce (`hash`: an earlier or later try,
+    /// of this action or another) was mined instead: this one can't go
+    /// through. `refused`: whether the chain refused that other one
+    /// (nothing moved but its fee), or `None` when its receipt's outcome
+    /// can't be read. Never this action's own outcome.
+    OtherTryMined { hash: B256, refused: Option<bool> },
+    /// The browser's storage, where the page keeps track of what a wallet
+    /// in the page sends, couldn't be read or written: nothing was sent,
+    /// since a reload or another tab couldn't see the send and could send
+    /// past it.
+    StorageNeeded,
     /// Sent, known to the network, and still not mined after a long wait.
     Stuck { hash: B256 },
     /// The digest the app would ask for doesn't match the one the vault
@@ -81,10 +100,22 @@ pub enum TxError {
         request: Option<U256>,
         then: Option<Box<TxError>>,
     },
+    /// The vault's simulation refused a deposit, for want of an allowance or
+    /// for no reason given, while the endpoint reported a block before the
+    /// one its approval was mined in: the approval isn't visible there yet.
+    /// Nothing was sent; trying again shortly uses it.
+    NotCaughtUp,
     /// The deposit stopped before it was sent, or was refused when mined
-    /// (`then`), after its approval of `amount` to the vault was mined: the
-    /// approval stands, and depositing the same amount again uses it.
-    ApprovalStands { amount: U256, then: Box<TxError> },
+    /// (`then`), after its approval of `amount` to the vault was mined (in
+    /// `block`): the approval stands, and depositing again uses it. `sent`:
+    /// this try sent the approval (otherwise an earlier try did, and its fee
+    /// isn't this try's).
+    ApprovalStands {
+        amount: U256,
+        block: u64,
+        sent: bool,
+        then: Box<TxError>,
+    },
 }
 
 /// A contract's reason for refusing, as far as it can be read.
@@ -132,6 +163,16 @@ impl Revert {
             Self::Unknown
         } else {
             Self::Message(trimmed.to_string())
+        }
+    }
+
+    /// Whether it may be for want of an allowance: no reason given, or a
+    /// token's message about its allowance.
+    pub fn may_be_allowance(&self) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Message(message) => message.to_ascii_lowercase().contains("allowance"),
+            Self::Vault(_) => false,
         }
     }
 
@@ -188,6 +229,9 @@ const VAULT_ERRORS: [([u8; 4], &str); 14] = [
 pub struct Context<'a> {
     /// "MetaMask", "your recovery phrase".
     pub wallet: &'a str,
+    /// Whether the wallet that sent keeps its own list of what it sent:
+    /// decided by its kind ([`crate::wallet::Sender`]), never by its name.
+    pub keeps_activity: bool,
     /// The vault's chain: "Hyperliquid".
     pub chain: &'a str,
     /// The chain the wallet is on, if known: "Base".
@@ -213,7 +257,11 @@ impl TxError {
     /// Whether a transaction may have been sent, so the page must not say
     /// "Nothing was sent".
     pub fn after_send(&self) -> bool {
-        self.may_have_moved() || matches!(self, Self::Reverted { .. } | Self::ApprovalStands { .. })
+        self.may_have_moved()
+            || matches!(
+                self,
+                Self::Reverted { .. } | Self::ApprovalStands { .. } | Self::OtherTryMined { .. }
+            )
     }
 
     /// Whether money may have moved (or may still move): the page must not
@@ -223,7 +271,14 @@ impl TxError {
     pub fn may_have_moved(&self) -> bool {
         matches!(
             self,
-            Self::Landed { .. } | Self::Replaced { .. } | Self::Dropped { .. } | Self::Stuck { .. }
+            Self::Landed { .. }
+                | Self::OtherTryMined {
+                    refused: None | Some(false),
+                    ..
+                }
+                | Self::Replaced { .. }
+                | Self::Dropped { .. }
+                | Self::Stuck { .. }
         )
     }
 
@@ -233,6 +288,8 @@ impl TxError {
             Self::Reverted { hash, .. }
             | Self::Replaced { hash }
             | Self::Dropped { hash }
+            | Self::NotTaken { hash }
+            | Self::OtherTryMined { hash, .. }
             | Self::Stuck { hash }
             | Self::Landed { hash, .. } => Some(*hash),
             Self::ApprovalStands { then, .. } => then.hash(),
@@ -255,14 +312,24 @@ impl TxError {
             Self::NotConnected => "no wallet is connected".to_string(),
             Self::Locked => "your wallet is locked".to_string(),
             Self::AlreadyAsking => format!("{wallet} was already asking something else"),
-            Self::InsufficientGas { .. } => format!(
-                "your wallet needs a little {} on {} for its network fee",
-                context.native, context.chain
-            ),
+            Self::InsufficientGas { need, have } => match fee_shortfall(*need, *have, context) {
+                Some(amounts) => format!("its network fee needs {amounts}"),
+                None => format!(
+                    "your wallet needs a little {} on {} for its network fee",
+                    context.native, context.chain
+                ),
+            },
             Self::WouldRevert { .. } => "the chain wouldn’t take it just now".to_string(),
             Self::Reverted { .. } => "the chain refused it when it was mined".to_string(),
             Self::Replaced { .. } | Self::Dropped { .. } | Self::Stuck { .. } => {
                 "it hasn’t been seen mined".to_string()
+            }
+            Self::NotTaken { .. } => "the network didn’t show it taken".to_string(),
+            Self::OtherTryMined { .. } => {
+                "another try from this page was mined at its place".to_string()
+            }
+            Self::StorageNeeded => {
+                "this browser’s storage, needed to keep track of it, couldn’t be used".to_string()
             }
             _ => "the network didn’t answer".to_string(),
         }
@@ -333,12 +400,18 @@ impl TxError {
                     format::shares(*have, Rounding::Down)
                 ),
             ),
-            Self::InsufficientGas { .. } => alert(
+            Self::InsufficientGas { need, have } => alert(
                 "Not enough for the network fee",
-                format!(
-                    "Your wallet needs a little {} on {} to pay the network fee. Nothing was sent.",
-                    context.native, context.chain
-                ),
+                match fee_shortfall(*need, *have, context) {
+                    Some(amounts) => format!(
+                        "The network fee needs {amounts}. Add {} to your wallet and try again. Nothing was sent.",
+                        context.native
+                    ),
+                    None => format!(
+                        "Your wallet needs a little {} on {} to pay the network fee. Nothing was sent.",
+                        context.native, context.chain
+                    ),
+                },
             ),
             Self::BelowMinimum { minimum } => alert(
                 "Below the minimum",
@@ -366,22 +439,61 @@ impl TxError {
                         .unwrap_or_else(|| "The chain didn't accept it.".to_string())
                 ),
             ),
-            Self::Replaced { .. } => alert(
+            Self::Replaced { .. } if context.keeps_activity => alert(
                 "Your wallet replaced this transaction",
                 format!(
-                    "{wallet} sent another transaction in its place. Check your wallet's activity before trying again."
+                    "{wallet} sent another transaction in its place. Check your wallet's activity before doing anything again."
                 ),
             ),
+            Self::Replaced { .. } => alert(
+                "Another transaction used this nonce",
+                format!(
+                    "Another transaction from this address used this one's nonce. It may be an earlier try of this same action, from this tab or another. Check your address on the {} explorer before doing anything again.",
+                    context.chain
+                ),
+            ),
+            Self::NotTaken { .. } => alert(
+                "Not sent, as far as the network shows",
+                "The network this app reads didn't show this transaction taken. It's safe to try again: a new try takes this one's place, so at most one of them goes through."
+                    .to_string(),
+            ),
+            Self::StorageNeeded => alert(
+                "This browser's storage is needed",
+                "This browser's storage is needed to keep track of what this wallet sends, and it couldn't be used just now, so nothing was sent. Allow this site to keep data (a private window or a full browser may not), or use another browser."
+                    .to_string(),
+            ),
+            Self::OtherTryMined { refused, .. } => {
+                let (title, how) = match refused {
+                    Some(false) => (
+                        "Another try from this page went through",
+                        " and went through",
+                    ),
+                    Some(true) => (
+                        "Another try from this page was refused",
+                        ", and the chain refused it: nothing moved except its network fee",
+                    ),
+                    None => ("Another try from this page was mined", ""),
+                };
+                alert(
+                    title,
+                    format!(
+                        "This transaction was sent, but another one this page signed at the same place (an earlier or later try, of this action or another) was mined instead{how}. This one can't go through. Check your address on the {} explorer before doing anything again.",
+                        context.chain
+                    ),
+                )
+            }
             Self::Stuck { .. } => alert(
                 "Still waiting to be mined",
                 format!(
-                    "The network has your transaction but hasn't mined it yet. It may still go through: check {wallet}'s activity before sending anything again."
+                    "The network has your transaction but hasn't mined it yet. It may still go through: {}.",
+                    look_before_sending_again(wallet, context.keeps_activity, context.chain)
                 ),
             ),
             Self::Dropped { .. } => alert(
                 "Not seen by the network yet",
                 format!(
-                    "The network this app reads hasn't seen your transaction. It may still go through: check {wallet}'s activity before sending anything again."
+                    "The network this app reads hasn't seen your transaction. It may still go through: {}.",
+                    look_before_sending_again(wallet, context.keeps_activity, context.chain)
                 ),
             ),
             Self::StatementMismatch => alert(
@@ -422,19 +534,45 @@ impl TxError {
                 format!("{why}. Check your connection and try again."),
             ),
             Self::Wallet(why) => alert("Your wallet refused it", format!("{wallet} said: {why}")),
-            Self::ApprovalStands { amount, then } => {
+            Self::NotCaughtUp => alert(
+                "The network hasn't caught up yet",
+                "The network this app reads hasn't caught up with your approval yet, so it can't check the deposit. Try again in a moment. Nothing was sent."
+                    .to_string(),
+            ),
+            Self::ApprovalStands {
+                amount, sent, then, ..
+            } => {
                 let words = then.words(context);
-                // The inner words say nothing moved; the approval did.
-                let reason = [
-                    "Nothing was sent.",
-                    "No money moved and no request was made.",
-                    "No money moved.",
-                ]
-                .iter()
-                .find_map(|said| words.text.strip_suffix(said))
-                .map(|text| format!("{text}The deposit wasn't sent."))
-                .unwrap_or(words.text);
-                let amount = format::dollars_exact(*amount, context.decimals);
+                let amount_words = format::dollars_exact(*amount, context.decimals);
+                // The wallet left the account that approved: the stop is said
+                // as it is, and the approval as that account's, not the one
+                // now connected.
+                if matches!(**then, Self::AccountChanged | Self::NotConnected) {
+                    return Words {
+                        text: format!(
+                            "{} The approval of {amount_words} to the vault from the account that started this went through and stands: depositing {amount_words} from that account again uses it.",
+                            words.text
+                        ),
+                        ..words
+                    };
+                }
+                // The inner words say nothing moved; the approval did. Two
+                // fees only when this try sent the approval too.
+                let both = sent
+                    .then(|| refused_after_approval(&words.text, "deposit"))
+                    .flatten();
+                let reason = both.unwrap_or_else(|| {
+                    [
+                        "Nothing was sent.",
+                        "No money moved and no request was made.",
+                        "No money moved.",
+                    ]
+                    .iter()
+                    .find_map(|said| words.text.strip_suffix(said))
+                    .map(|text| format!("{text}The deposit wasn't sent."))
+                    .unwrap_or(words.text)
+                });
+                let amount = amount_words;
                 // Its own title: the approval went, so no title of a step
                 // that sent nothing stands above it.
                 alert(
@@ -468,6 +606,51 @@ impl TxError {
     }
 }
 
+/// Where to look for a transaction that may still go through before
+/// sending anything again, as the end of a sentence: the activity a browser
+/// wallet keeps of what it sent (`keeps_activity`), or, for a wallet that
+/// signs in the page and keeps no such list (the recovery-phrase and
+/// development wallets), the address on the chain's explorer, or waiting.
+pub fn look_before_sending_again(wallet: &str, keeps_activity: bool, chain: &str) -> String {
+    if keeps_activity {
+        format!("check the activity in {wallet} before sending anything again")
+    } else {
+        format!(
+            "check your address on the {chain} explorer, or wait, before sending anything again"
+        )
+    }
+}
+
+/// The words of a step refused when it was mined (`step`: "deposit"),
+/// after its approval was mined, when `text` is those of the refusal: two
+/// transactions were mined, so two network fees were paid, not one.
+pub(crate) fn refused_after_approval(text: &str, step: &str) -> Option<String> {
+    text.strip_suffix("Nothing moved except the network fee.")
+        .map(|reason| {
+            format!(
+                "{reason}No money moved. Two network fees were paid: one for the approval and one for the refused {step}."
+            )
+        })
+}
+
+/// The decimals of an EVM chain's coin, which pays the network fee.
+const NATIVE_DECIMALS: u8 = 18;
+
+/// The fee needed and the coin held, in the chain's coin: "up to 0.0009218
+/// ETH on Base, and your wallet holds 0.0009 ETH". `None` when the amounts
+/// aren't known (a wallet that only said its funds were short).
+fn fee_shortfall(need: U256, have: U256, context: &Context<'_>) -> Option<String> {
+    if need.is_zero() || have >= need {
+        return None;
+    }
+    Some(format!(
+        "up to {} on {}, and your wallet holds {}",
+        format::token_exact(need, NATIVE_DECIMALS, context.native),
+        context.chain,
+        format::token_exact(have, NATIVE_DECIMALS, context.native),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,11 +658,231 @@ mod tests {
     fn context() -> Context<'static> {
         Context {
             wallet: "MetaMask",
+            keeps_activity: true,
             chain: "Hyperliquid",
             wallet_chain: Some("Base"),
             symbol: "USDC",
             decimals: 6,
             native: "HYPE",
+        }
+    }
+
+    #[test]
+    fn a_transaction_not_seen_from_a_wallet_in_the_page_points_to_the_explorer_not_a_wallets_activity()
+     {
+        let hash = B256::repeat_byte(7);
+        for wallet in [crate::wallet::PHRASE_WALLET, crate::wallet::DEV_WALLET] {
+            let context = Context {
+                wallet,
+                keeps_activity: false,
+                ..context()
+            };
+            for error in [TxError::Dropped { hash }, TxError::Stuck { hash }] {
+                let words = error.words(&context);
+                assert!(!words.text.contains("activity"), "{}", words.text);
+                assert!(
+                    words.text.contains(
+                        "It may still go through: check your address on the Hyperliquid explorer, or wait, before sending anything again."
+                    ),
+                    "{}",
+                    words.text
+                );
+            }
+        }
+        // A browser wallet keeps its own list of what it sent.
+        let words = TxError::Dropped { hash }.words(&context());
+        assert!(
+            words
+                .text
+                .contains("check the activity in MetaMask before sending anything again"),
+            "{}",
+            words.text
+        );
+    }
+
+    /// Whether the words point to a wallet's activity follows the kind of
+    /// wallet that sent, not its name: a browser wallet announcing the
+    /// phrase wallet's name still keeps its activity.
+    #[test]
+    fn the_activity_list_is_pointed_to_by_the_senders_kind_not_its_name() {
+        let hash = B256::repeat_byte(7);
+        let named_like_the_phrase_wallet = Context {
+            wallet: crate::wallet::PHRASE_WALLET,
+            ..context()
+        };
+        let words = TxError::Dropped { hash }.words(&named_like_the_phrase_wallet);
+        assert!(
+            words.text.contains("check the activity in"),
+            "{}",
+            words.text
+        );
+        let in_the_page = Context {
+            wallet: "MetaMask",
+            keeps_activity: false,
+            ..context()
+        };
+        let words = TxError::Dropped { hash }.words(&in_the_page);
+        assert!(!words.text.contains("activity"), "{}", words.text);
+    }
+
+    /// A transaction from the phrase wallet replaced at its nonce was
+    /// replaced by another transaction from the same address sent from
+    /// elsewhere: the words point to the explorer, never to an activity
+    /// list, and never say the phrase wallet sent it.
+    #[test]
+    fn a_replaced_transaction_from_a_wallet_in_the_page_points_to_the_explorer() {
+        let context = Context {
+            wallet: crate::wallet::PHRASE_WALLET,
+            keeps_activity: false,
+            ..context()
+        };
+        let words = TxError::Replaced {
+            hash: B256::repeat_byte(7),
+        }
+        .words(&context);
+        assert!(!words.text.contains("activity"), "{}", words.text);
+        assert!(
+            !words.text.contains(crate::wallet::PHRASE_WALLET),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("used this one's nonce"),
+            "{}",
+            words.text
+        );
+        assert!(
+            words
+                .text
+                .contains("an earlier try of this same action, from this tab or another"),
+            "{}",
+            words.text
+        );
+        assert!(
+            words
+                .text
+                .contains("Hyperliquid explorer before doing anything again"),
+            "{}",
+            words.text
+        );
+        assert!(
+            !words.text.contains("try again") && !words.text.contains("trying again"),
+            "{}",
+            words.text
+        );
+        assert!(
+            TxError::Replaced {
+                hash: B256::repeat_byte(7)
+            }
+            .may_have_moved()
+        );
+    }
+
+    /// A send the endpoint showed as never taken is said safe to try again,
+    /// since a new try takes its place, and never "nothing moved": a node
+    /// behind the endpoint may still hold it.
+    #[test]
+    fn a_transaction_not_shown_taken_is_said_safe_to_try_again_without_claiming_nothing_moved() {
+        let error = TxError::NotTaken {
+            hash: B256::repeat_byte(7),
+        };
+        assert!(!error.may_have_moved());
+        let words = error.words(&context());
+        assert!(words.text.contains("safe to try again"), "{}", words.text);
+        assert!(words.text.contains("at most one"), "{}", words.text);
+        assert!(!words.text.contains("Nothing moved"), "{}", words.text);
+    }
+
+    /// Another try of the page's mined at this one's nonce is said as that
+    /// other try, with its link, never as this action's outcome: this one
+    /// was sent and can't go through, and the person checks the explorer.
+    /// Only one the chain refused is said to have moved nothing.
+    #[test]
+    fn another_try_mined_at_the_nonce_is_never_said_as_this_actions_outcome() {
+        for refused in [Some(false), Some(true), None] {
+            let error = TxError::OtherTryMined {
+                hash: B256::repeat_byte(7),
+                refused,
+            };
+            assert_eq!(error.may_have_moved(), refused != Some(true));
+            assert!(error.after_send());
+            assert_eq!(error.hash(), Some(B256::repeat_byte(7)));
+            let words = error.words(&context());
+            assert!(
+                words.title.starts_with("Another try from this page"),
+                "{}",
+                words.title
+            );
+            assert!(
+                words.text.contains("This transaction was sent"),
+                "{}",
+                words.text
+            );
+            assert!(
+                words.text.contains("This one can't go through"),
+                "{}",
+                words.text
+            );
+            assert!(
+                words
+                    .text
+                    .contains("Hyperliquid explorer before doing anything again"),
+                "{}",
+                words.text
+            );
+            assert!(
+                !words.text.to_lowercase().contains("nothing new was sent"),
+                "{}",
+                words.text
+            );
+            assert!(!words.title.contains("Your"), "{}", words.title);
+            assert_eq!(
+                words.text.contains("the chain refused it"),
+                refused == Some(true),
+                "{}",
+                words.text
+            );
+        }
+    }
+
+    /// A send stopped because storage couldn't be used is said plainly:
+    /// storage is needed to keep track of what the wallet sends, and
+    /// nothing was sent.
+    #[test]
+    fn a_send_stopped_for_want_of_storage_says_storage_is_needed_and_nothing_was_sent() {
+        let error = TxError::StorageNeeded;
+        assert!(!error.may_have_moved() && !error.after_send());
+        let words = error.words(&context());
+        assert!(
+            words
+                .text
+                .contains("storage is needed to keep track of what this wallet sends"),
+            "{}",
+            words.text
+        );
+        assert!(words.text.contains("nothing was sent"), "{}", words.text);
+    }
+
+    #[test]
+    fn an_approval_mined_before_the_wallet_left_its_account_is_said_as_that_accounts() {
+        for left in [TxError::AccountChanged, TxError::NotConnected] {
+            let alone = left.words(&context());
+            let words = TxError::ApprovalStands {
+                amount: U256::from(1_000_000_000u64),
+                block: 101,
+                sent: true,
+                then: Box::new(left),
+            }
+            .words(&context());
+            assert_eq!(words.title, alone.title);
+            assert!(words.text.starts_with(&alone.text), "{}", words.text);
+            assert!(
+                words.text.ends_with(
+                    "The approval of $1,000.00 to the vault from the account that started this went through and stands: depositing $1,000.00 from that account again uses it."
+                ),
+                "{}",
+                words.text
+            );
         }
     }
 
@@ -599,6 +1002,108 @@ mod tests {
     }
 
     #[test]
+    fn a_deposit_refused_when_mined_after_its_approval_says_both_network_fees_were_paid() {
+        let error = TxError::ApprovalStands {
+            amount: U256::from(1_000_000_000u64),
+            block: 101,
+            sent: true,
+            then: Box::new(TxError::Reverted {
+                hash: B256::repeat_byte(7),
+                reason: None,
+            }),
+        };
+        let words = error.words(&context());
+        assert!(
+            !words.text.contains("except the network fee"),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains(
+                "No money moved. Two network fees were paid: one for the approval and one for the refused deposit."
+            ),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("Your approval of $1,000.00"),
+            "{}",
+            words.text
+        );
+        // Refused before it was sent: one fee, the approval's.
+        let words = TxError::ApprovalStands {
+            amount: U256::from(1_000_000_000u64),
+            block: 101,
+            sent: true,
+            then: Box::new(TxError::WouldRevert {
+                reason: Revert::Unknown,
+            }),
+        }
+        .words(&context());
+        assert!(!words.text.contains("Two network fees"), "{}", words.text);
+        assert!(
+            words.text.contains("The deposit wasn't sent."),
+            "{}",
+            words.text
+        );
+    }
+
+    #[test]
+    fn a_deposit_refused_when_mined_on_an_earlier_tries_approval_says_only_its_own_fee() {
+        let words = TxError::ApprovalStands {
+            amount: U256::from(1_000_000_000u64),
+            block: 101,
+            sent: false,
+            then: Box::new(TxError::Reverted {
+                hash: B256::repeat_byte(7),
+                reason: None,
+            }),
+        }
+        .words(&context());
+        assert!(!words.text.contains("Two network fees"), "{}", words.text);
+        assert!(
+            words.text.contains("Nothing moved except the network fee."),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("Your approval of $1,000.00"),
+            "{}",
+            words.text
+        );
+    }
+
+    #[test]
+    fn a_deposit_refused_on_a_node_behind_its_approval_says_the_network_hasnt_caught_up_and_the_approval_stands()
+     {
+        let words = TxError::ApprovalStands {
+            amount: U256::from(1_000_000_000u64),
+            block: 101,
+            sent: false,
+            then: Box::new(TxError::NotCaughtUp),
+        }
+        .words(&context());
+        assert!(
+            words
+                .text
+                .contains("hasn't caught up with your approval yet"),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("Try again in a moment."),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("without asking for it again"),
+            "{}",
+            words.text
+        );
+        assert!(!words.text.contains("Nothing was sent."), "{}", words.text);
+    }
+
+    #[test]
     fn the_second_step_not_sent_is_said_as_why_with_the_wallets_and_chains_names() {
         assert_eq!(
             TxError::Rejected.unsent_words(&context()),
@@ -614,11 +1119,19 @@ mod tests {
         );
         assert_eq!(
             TxError::InsufficientGas {
-                need: U256::from(2u8),
-                have: U256::from(1u8)
+                need: U256::ZERO,
+                have: U256::ZERO
             }
             .unsent_words(&context()),
             "your wallet needs a little HYPE on Hyperliquid for its network fee"
+        );
+        assert_eq!(
+            TxError::InsufficientGas {
+                need: U256::from(921_800_000_000_000u64),
+                have: U256::from(900_000_000_000_000u64)
+            }
+            .unsent_words(&context()),
+            "its network fee needs up to 0.0009218 HYPE on Hyperliquid, and your wallet holds 0.0009 HYPE"
         );
     }
 

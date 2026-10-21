@@ -27,6 +27,8 @@ use crate::wallet::{Network, networks};
 #[derive(Clone, Debug)]
 pub struct Names {
     pub wallet: String,
+    /// Whether the wallet keeps its own list of what it sent, by its kind.
+    pub keeps_activity: bool,
     pub chain: String,
     pub chain_id: u64,
     pub symbol: String,
@@ -36,18 +38,24 @@ pub struct Names {
 
 impl Names {
     pub fn of(network: &Network) -> Self {
-        let wallet = crate::wallet::get().wallet_name.get_cloned();
+        let sender = crate::wallet::get().sender();
         Self {
-            wallet: if wallet.is_empty() {
-                "your wallet".to_string()
-            } else {
-                wallet
-            },
+            wallet: sender.name,
+            keeps_activity: sender.keeps_activity,
             chain: network.label.clone(),
             chain_id: network.chain_id,
             symbol: network.asset_symbol.clone(),
             decimals: network.asset_decimals,
             native: network.coin().to_string(),
+        }
+    }
+
+    /// These names, with the wallet that sent for a flow.
+    pub fn sent_by(&self, sender: &crate::wallet::Sender) -> Self {
+        Self {
+            wallet: sender.name.clone(),
+            keeps_activity: sender.keeps_activity,
+            ..self.clone()
         }
     }
 
@@ -69,6 +77,7 @@ impl Names {
             .map(networks::chain_name);
         let words = error.words(&Context {
             wallet: &self.wallet,
+            keeps_activity: self.keeps_activity,
             chain: &self.chain,
             wallet_chain: on.as_deref(),
             symbol: &self.symbol,
@@ -324,6 +333,7 @@ fn announce(step: &Option<Step>, names: &Names) -> String {
 /// A flow's status in place: the step drawn in the body, and one polite
 /// live region whose words change with it (never removed and re-added).
 pub fn status(running: &Running, names: Rc<Names>) -> El {
+    let names = Rc::new(names.sent_by(&running.sender));
     let live_names = names.clone();
     let cancel = running.cancel.clone();
     el("div")
@@ -614,6 +624,7 @@ mod tests {
     fn an_approval_says_exactly_what_it_lets_be_taken_and_the_fee_is_named_in_usdc() {
         let names = Names {
             wallet: "MetaMask".to_string(),
+            keeps_activity: true,
             chain: "Base".to_string(),
             chain_id: 84_532,
             symbol: "USDC".to_string(),

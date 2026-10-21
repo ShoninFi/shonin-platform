@@ -288,26 +288,35 @@ fn top_view(top: &Top) -> View {
                 "Total value",
                 dollars_from_cents(*value_cents),
                 format!(
-                    "{positions} {}, at today’s share prices",
+                    "{positions} {}, at each one’s last share price",
                     if *positions == 1 { "agent" } else { "agents" }
                 ),
             ));
-            if let Some(paid) = paid_cents.filter(|_| *positions > 0) {
+            // A cost not known for every agent leaves the totals unknown,
+            // said so rather than left out.
+            if *positions > 0 {
+                let (paid, gain) = paid_and_gain(*value_cents, *paid_cents);
+                let known = paid_cents.is_some();
                 tiles = tiles
                     .child(tile_stat(
                         "Paid in",
-                        dollars_from_cents(paid),
-                        "into these agents".to_string(),
+                        paid,
+                        if known {
+                            "into these agents"
+                        } else {
+                            "not known yet for every agent"
+                        }
+                        .to_string(),
                     ))
                     .child(tile_stat(
                         "Gain",
-                        match gain_percent(*value_cents, paid) {
-                            Some(percent) => {
-                                format!("{} · {percent}", signed_cents(*value_cents, paid))
-                            }
-                            None => signed_cents(*value_cents, paid),
-                        },
-                        "since you joined, after fees".to_string(),
+                        gain,
+                        if known {
+                            "since you joined, after fees"
+                        } else {
+                            "once every agent’s cost is known"
+                        }
+                        .to_string(),
                     ));
             }
             if *booked > 0 {
@@ -773,6 +782,38 @@ fn signed_cents(value: u128, paid: u128) -> String {
     }
 }
 
+/// A cost (or gain) the API doesn't know yet, as rows and the total say it.
+const UNKNOWN: &str = "Unknown";
+
+/// What a position was paid in, and its gain, as a row shows them. A cost
+/// the API doesn't know yet (the vault's history not read through) is said
+/// as unknown: never as nothing paid, nor the whole value as gain.
+fn paid_and_gain(value_cents: u128, paid_cents: Option<u128>) -> (String, String) {
+    match paid_cents {
+        None => (UNKNOWN.to_string(), UNKNOWN.to_string()),
+        Some(paid) => {
+            let amount = signed_cents(value_cents, paid);
+            let gain = match gain_percent(value_cents, paid) {
+                Some(percent) => format!("{amount} · {percent}"),
+                None => amount,
+            };
+            (dollars_from_cents(paid), gain)
+        }
+    }
+}
+
+/// When the share price a value is figured at was set: the vault's last
+/// valuation, or none before its first.
+fn priced_at(figures: &VaultFigures) -> String {
+    match &figures.last {
+        Some(last) => format!(
+            "at the share price of {}",
+            crate::components::exit::utc(last.time)
+        ),
+        None => "at the starting share price".to_string(),
+    }
+}
+
 /// Gain as a share of what was paid in: "+4.2%".
 fn gain_percent(value: u128, paid: u128) -> Option<String> {
     (paid > 0).then(|| crate::format::ret((value as f64 - paid as f64) / paid as f64))
@@ -821,16 +862,7 @@ fn positions_cards(rows: &[&Row]) -> View {
                 .child(el("dt").class("sh-label").text(label))
                 .child(el("dd").class("sh-num").text(value))
         };
-        let gain = row
-            .paid_cents
-            .map(|paid| {
-                let amount = signed_cents(row.value_cents, paid);
-                match gain_percent(row.value_cents, paid) {
-                    Some(percent) => format!("{amount} · {percent}"),
-                    None => amount,
-                }
-            })
-            .unwrap_or_else(|| "—".to_string());
+        let (paid_in, gain) = paid_and_gain(row.value_cents, row.paid_cents);
         let slug = row.vault.slug.clone();
         let deposit = {
             let slug = slug.clone();
@@ -896,12 +928,10 @@ fn positions_cards(rows: &[&Row]) -> View {
                             .unwrap_or_else(|| "—".to_string()),
                     )),
             )
-            .child(View::from(row.paid_cents.map(|paid| {
-                el("p")
-                    .class("sh-poscard__paid sh-muted")
-                    .text(format!("Paid in {}", dollars_from_cents(paid)))
-                    .into()
-            })))
+            .child(el("p").class("sh-poscard__paid sh-muted").text(format!(
+                "Valued {}. Paid in: {paid_in}",
+                priced_at(&row.figures)
+            )))
             .child(
                 el("div")
                     .class("sh-poscard__actions")
@@ -986,32 +1016,24 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
                 el("td")
                     .attr("data-label", "Value")
                     .class("sh-r sh-num")
-                    .text(dollars_from_cents(row.value_cents)),
+                    .text(dollars_from_cents(row.value_cents))
+                    .child(
+                        el("span")
+                            .class("sh-portfolio__chain sh-muted")
+                            .text(priced_at(&row.figures)),
+                    ),
             )
             .child(
                 el("td")
                     .attr("data-label", "Paid in")
                     .class("sh-r sh-num")
-                    .text(
-                        row.paid_cents
-                            .map(dollars_from_cents)
-                            .unwrap_or_else(|| "—".to_string()),
-                    ),
+                    .text(paid_and_gain(row.value_cents, row.paid_cents).0),
             )
             .child(
                 el("td")
                     .attr("data-label", "Gain")
                     .class("sh-r sh-num")
-                    .text(
-                        row.paid_cents
-                            .map(|paid| match gain_percent(row.value_cents, paid) {
-                                Some(percent) => {
-                                    format!("{} · {percent}", signed_cents(row.value_cents, paid))
-                                }
-                                None => signed_cents(row.value_cents, paid),
-                            })
-                            .unwrap_or_else(|| "—".to_string()),
-                    ),
+                    .text(paid_and_gain(row.value_cents, row.paid_cents).1),
             )
             .child(el("td").attr("data-label", "Status").child(status))
             .child(
@@ -1069,7 +1091,7 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
                                         .class("sh-r sh-num")
                                         .text(
                                             paid.map(dollars_from_cents)
-                                                .unwrap_or_else(|| "—".to_string()),
+                                                .unwrap_or_else(|| UNKNOWN.to_string()),
                                         ),
                                 )
                                 .child(
@@ -1078,7 +1100,7 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
                                         .class("sh-r sh-num")
                                         .text(
                                             paid.map(|paid| signed_cents(total, paid))
-                                                .unwrap_or_else(|| "—".to_string()),
+                                                .unwrap_or_else(|| UNKNOWN.to_string()),
                                         ),
                                 )
                                 .child(
@@ -1548,7 +1570,10 @@ fn status(current: &Running, network: &Rc<Network>) -> View {
             None,
             current.step.signal_cloned().map(move |step| {
                 let session = crate::wallet::get();
-                let wallet = session.wallet_name.get_cloned();
+                // The wallet that sent for this flow, not whichever is
+                // connected now.
+                let sender = shown.sender().unwrap_or_else(|| session.sender());
+                let wallet = sender.name.clone();
                 let dismiss = |label: &'static str| {
                     let shown = shown.clone();
                     on_click(
@@ -1565,7 +1590,10 @@ fn status(current: &Running, network: &Rc<Network>) -> View {
                         .into(),
                     Step::Sent { unseen: true, .. } => el("p")
                         .attr("aria-live", "polite")
-                        .text(format!("Sent. Not seen by the network yet; it may still go through. Check {wallet}’s activity before sending anything again."))
+                        .text(format!(
+                            "Sent. Not seen by the network yet; it may still go through. {}.",
+                            crate::format::sentence(&crate::tx::error::look_before_sending_again(&wallet, sender.keeps_activity, &network.label))
+                        ))
                         .into(),
                     Step::Sent { .. } | Step::Requested(_) | Step::Priced { .. } => {
                         el("p").attr("aria-live", "polite").text("Sent. Waiting for the network…").into()
@@ -1583,7 +1611,7 @@ fn status(current: &Running, network: &Rc<Network>) -> View {
                     Step::Failed(error) => {
                         let words = error_words(
                             &error,
-                            &wallet,
+                            &sender,
                             &network.label,
                             session.wallet_chain().map(networks::chain_name).as_deref(),
                             &network.asset_symbol,
@@ -1977,6 +2005,68 @@ mod tests {
                 booked: 1,
                 paid_cents: Some(9_000)
             }
+        );
+    }
+
+    #[test]
+    fn a_cost_not_known_yet_is_said_unknown_never_as_nothing_paid_or_the_whole_value_as_gain() {
+        let (paid, gain) = paid_and_gain(148_000, None);
+        assert_eq!(paid, "Unknown");
+        assert_eq!(gain, "Unknown");
+        let (paid, gain) = paid_and_gain(148_000, Some(140_000));
+        assert_eq!(paid, "$1,400.00");
+        assert!(gain.starts_with("+$80.00"), "{gain}");
+        // Known to be zero (shares given, not bought) is still a figure.
+        assert_eq!(paid_and_gain(148_000, Some(0)).0, "$0.00");
+    }
+
+    #[test]
+    fn the_top_paid_in_and_gain_tiles_say_unknown_when_any_cost_is_unknown() {
+        let unknown = top_view(&Top::Totals {
+            value_cents: 148_000,
+            positions: 2,
+            booked: 0,
+            paid_cents: None,
+        })
+        .html();
+        assert!(unknown.contains("Paid in"), "{unknown}");
+        assert!(unknown.contains("Gain"), "{unknown}");
+        assert_eq!(unknown.matches("Unknown").count(), 2, "{unknown}");
+        let known = top_view(&Top::Totals {
+            value_cents: 148_000,
+            positions: 2,
+            booked: 0,
+            paid_cents: Some(140_000),
+        })
+        .html();
+        assert!(known.contains("$1,400.00"), "{known}");
+        assert!(known.contains("+$80.00"), "{known}");
+        assert!(!known.contains("Unknown"), "{known}");
+    }
+
+    #[test]
+    fn a_value_is_said_with_the_time_of_the_share_price_it_is_figured_at() {
+        let mut figures = VaultFigures {
+            state: State::Open,
+            fees: Default::default(),
+            timers: Default::default(),
+            cash: U256::ZERO,
+            total_supply: U256::ZERO,
+            minimum_deposit: U256::ZERO,
+            last: None,
+            ready_to_close: false,
+        };
+        assert_eq!(priced_at(&figures), "at the starting share price");
+        figures.last = Some(crate::tx::read::Priced {
+            index: U256::from(1u8),
+            time: 1_792_000_000,
+            valuation: figures.basis(),
+        });
+        let said = priced_at(&figures);
+        assert!(said.starts_with("at the share price of "), "{said}");
+        assert!(
+            said.contains(&crate::components::exit::utc(1_792_000_000)),
+            "{said}"
         );
     }
 

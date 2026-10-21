@@ -521,6 +521,7 @@ mod author {
                 hash,
                 Receipt {
                     hash,
+                    from: Some(request.from),
                     success,
                     block,
                     logs,
@@ -533,6 +534,7 @@ mod author {
     fn context() -> Context<'static> {
         Context {
             wallet: "MetaMask",
+            keeps_activity: true,
             chain: "Base",
             wallet_chain: None,
             symbol: "USDC",
@@ -1184,6 +1186,7 @@ mod depositor {
                 hash,
                 Receipt {
                     hash,
+                    from: Some(request.from),
                     success: true,
                     block,
                     logs,

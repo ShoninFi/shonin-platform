@@ -99,6 +99,13 @@ pub fn known(chain_id: u64) -> Option<&'static Known> {
     KNOWN.iter().find(|known| known.chain_id == chain_id)
 }
 
+/// Whether a chain is built on the OP stack, which charges each transaction
+/// an L1 data fee on top of its gas, read from its GasPriceOracle: Base and
+/// Base Sepolia. The local chains are plain nodes with no such fee.
+pub fn charges_l1_fee(chain_id: u64) -> bool {
+    matches!(chain_id, 8453 | 84532)
+}
+
 /// The coin that pays the network fee on a chain: ETH unless known otherwise.
 pub fn coin(chain_id: u64) -> Coin {
     known(chain_id).map(|known| known.coin).unwrap_or(ETH)

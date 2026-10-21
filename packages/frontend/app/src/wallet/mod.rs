@@ -20,9 +20,27 @@ pub mod recent;
 pub mod rpc;
 pub mod run;
 pub mod session;
+pub mod signed;
 pub mod solana;
 
 pub use machine::{Connection, WalletId};
+
+/// The recovery-phrase wallet's name, as lines say it.
+pub const PHRASE_WALLET: &str = "your recovery phrase wallet";
+/// The development wallet's name, as lines say it.
+pub const DEV_WALLET: &str = "the development wallet";
+
+/// The wallet that sent a transaction, as its words need it: its name, and
+/// whether it keeps its own list of what it sent, decided by its kind (a
+/// browser wallet does; the recovery-phrase and development wallets sign in
+/// the page and keep none), never by its name, which a browser wallet
+/// announces itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sender {
+    pub name: String,
+    pub keeps_activity: bool,
+}
+
 pub use network::Network;
 pub use run::{Action, Running, VaultRef};
 pub use session::{Session, SessionSigner, WalletOption, get};

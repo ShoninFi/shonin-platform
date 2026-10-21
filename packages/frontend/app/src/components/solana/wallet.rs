@@ -120,8 +120,8 @@ fn name_of(id: &SolWalletId) -> String {
     match id {
         SolWalletId::Standard(name) => name.clone(),
         SolWalletId::Legacy => "Phantom".to_string(),
-        SolWalletId::Phrase => "your recovery phrase wallet".to_string(),
-        SolWalletId::Dev => "the development wallet".to_string(),
+        SolWalletId::Phrase => crate::wallet::PHRASE_WALLET.to_string(),
+        SolWalletId::Dev => crate::wallet::DEV_WALLET.to_string(),
     }
 }
 

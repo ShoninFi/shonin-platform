@@ -70,6 +70,10 @@ pub enum Action {
 pub struct Running {
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
+    /// The wallet connected when the flow started, which signs and sends
+    /// for it (a disconnect or an account change cancels it): its words
+    /// name that wallet, not whichever is connected when they are drawn.
+    pub sender: crate::wallet::Sender,
 }
 
 impl Running {
@@ -77,6 +81,7 @@ impl Running {
         Self {
             step: Mutable::new(None),
             cancel: Cancel::new(),
+            sender: crate::wallet::get().sender(),
         }
     }
 

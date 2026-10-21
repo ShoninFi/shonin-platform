@@ -172,7 +172,7 @@ impl SolSession {
             return Err(BadPhrase);
         }
         let key = SolKey::from_phrase(phrase, 0)?;
-        self.connect_key(SolWalletId::Phrase, key, "your recovery phrase wallet");
+        self.connect_key(SolWalletId::Phrase, key, crate::wallet::PHRASE_WALLET);
         Ok(())
     }
 
@@ -190,7 +190,7 @@ impl SolSession {
     pub fn connect_dev(&self) -> bool {
         match self.dev_key() {
             Some(key) => {
-                self.connect_key(SolWalletId::Dev, key, "the development wallet");
+                self.connect_key(SolWalletId::Dev, key, crate::wallet::DEV_WALLET);
                 true
             }
             None => false,
