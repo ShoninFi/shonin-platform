@@ -380,6 +380,9 @@ pub struct Demo<'a> {
     pub take_on: u64,
     /// How long the agent has to put the money to work once it is priced.
     pub work_within: std::time::Duration,
+    /// Once at work, ask all of the deposit back so a claim is booked and
+    /// paid, then put half in again (Solana only).
+    pub claim: bool,
 }
 
 /// A demonstration that pays its own way: a fresh vault for one agent,

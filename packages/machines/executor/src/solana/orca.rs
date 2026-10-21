@@ -24,16 +24,18 @@
 //! to make, and the key pays, billed to the tank like its other sends.
 //!
 //! The agent hears `changed` after each call that landed, and `price` when a
-//! listed pool's price has moved, looked at every few seconds.
+//! listed pool's price has moved, looked at every few seconds, as well as
+//! once when it starts and whenever the vault's cash grows.
 
 use std::time::Duration;
 
 use alloy::primitives::U256;
 use anyhow::{Context, Result, anyhow, bail};
 use chain::solana::orca::{self as venue, Change, Holdings, PoolNow, Position, TOKEN, asset_is_a};
-use chain::solana::programs::anchor_lang::AnchorDeserialize;
+use chain::solana::programs::anchor_lang::{AccountDeserialize, AnchorDeserialize};
 use chain::solana::programs::driver::{self as driver_iface, Valuation};
 use chain::solana::programs::station::state::{Pinned, Station};
+use chain::solana::programs::vault::state::Vault;
 use chain::solana::{Instruction, Pubkey, Signer, SolanaClient};
 use hyperliquid::agent::Outcome;
 use strategy_sdk::Decimal;
@@ -982,35 +984,54 @@ fn account_state(
     })
 }
 
-/// Tell the agent when a listed pool's price moves: every pool looked at
-/// every [`PRICE_EVERY`], and a move since the last look said as a `price`
-/// event. Ends when the agent is gone.
-pub async fn watch_prices(client: SolanaClient, events: UnboundedSender<Vec<u8>>) {
-    let mut seen: Vec<Option<u128>> = vec![None; venue::POOLS.len()];
-    let addresses: Vec<Pubkey> = venue::POOLS.iter().map(|listed| listed.address).collect();
+/// Tell the agent when to look at its account: every pool and the vault
+/// looked at every [`PRICE_EVERY`], in one read, and a pool's price said as
+/// a `price` event when it has moved since the last look, at the first look
+/// of each start, and when the vault's cash has grown. Ends when the agent
+/// is gone.
+///
+/// The agent takes no step before it is woken, and a pool held at the
+/// oracle's price may not move for hours: without the first look an agent
+/// started on a quiet pool would never put its vault's money to work, nor,
+/// without the cash, a deposit priced after it started.
+pub async fn watch_prices(client: SolanaClient, vault: Pubkey, events: UnboundedSender<Vec<u8>>) {
+    let mut looks = Looks::new(venue::POOLS.len());
+    let mut addresses: Vec<Pubkey> = venue::POOLS.iter().map(|listed| listed.address).collect();
+    addresses.push(vault);
     let mut unread = crate::Throttle::default();
     loop {
         match client.rpc.accounts(&addresses).await {
             Ok(found) => {
-                for (p, (address, account)) in addresses.iter().zip(found).enumerate() {
-                    let Some(state) = account
-                        .as_ref()
-                        .and_then(|account| venue::read_pool(address, account).ok())
-                    else {
+                let (pools, rest) = found.split_at(venue::POOLS.len());
+                let prices: Vec<Option<u128>> = addresses
+                    .iter()
+                    .zip(pools)
+                    .map(|(address, account)| {
+                        let account = account.as_ref()?;
+                        Some(venue::read_pool(address, account).ok()?.sqrt_price)
+                    })
+                    .collect();
+                let held = rest.first().and_then(|account| {
+                    let account = account.as_ref()?;
+                    let vault = Vault::try_deserialize(&mut &account.data[..]).ok()?;
+                    Some(VaultNow {
+                        halted: vault.halted_at != 0,
+                        cash: vault.cash,
+                    })
+                });
+                for p in looks.look(&prices, held) {
+                    let Some(sqrt_price) = prices[p] else {
                         continue;
                     };
-                    let moved = seen[p].is_some_and(|before| before != state.sqrt_price);
-                    seen[p] = Some(state.sqrt_price);
-                    if moved
-                        && let Ok(price) = price_decimal(venue::price_of_sqrt(state.sqrt_price))
-                    {
-                        let event = AccountEvent::Price {
-                            pool: venue::pool_name(p),
-                            price,
-                        };
-                        if events.send(strategy_sdk::to_payload(&event)).is_err() {
-                            return;
-                        }
+                    let Ok(price) = price_decimal(venue::price_of_sqrt(sqrt_price)) else {
+                        continue;
+                    };
+                    let event = AccountEvent::Price {
+                        pool: venue::pool_name(p),
+                        price,
+                    };
+                    if events.send(strategy_sdk::to_payload(&event)).is_err() {
+                        return;
                     }
                 }
             }
@@ -1024,6 +1045,67 @@ pub async fn watch_prices(client: SolanaClient, events: UnboundedSender<Vec<u8>>
             }
         }
         tokio::time::sleep(PRICE_EVERY).await;
+    }
+}
+
+/// What a look reads of the vault.
+#[derive(Clone, Copy, Debug)]
+struct VaultNow {
+    halted: bool,
+    cash: u64,
+}
+
+/// What the looks at the pools and the vault have seen so far in one start
+/// of the agent.
+struct Looks {
+    seen: Vec<Option<u128>>,
+    started: bool,
+    cash: Option<u64>,
+}
+
+impl Looks {
+    fn new(pools: usize) -> Self {
+        Self {
+            seen: vec![None; pools],
+            started: false,
+            cash: None,
+        }
+    }
+
+    /// The pools to say the price of after a look that read each pool's
+    /// square-root price (where it could) and the vault (where it could).
+    ///
+    /// A pool that moved is always said. Every pool read is said once the
+    /// vault is first read open, which starts the agent; a vault read halted
+    /// starts nothing here, since its halt notice wakes the agent, and must
+    /// come before any ordinary step. Every pool read is said again when the
+    /// vault's cash has grown since the last look.
+    fn look(&mut self, prices: &[Option<u128>], vault: Option<VaultNow>) -> Vec<usize> {
+        let mut said: Vec<usize> = Vec::new();
+        for (p, now) in prices.iter().enumerate() {
+            let Some(now) = *now else {
+                continue;
+            };
+            if self.seen[p].is_some_and(|before| before != now) {
+                said.push(p);
+            }
+            self.seen[p] = Some(now);
+        }
+        let read: Vec<usize> = (0..prices.len()).filter(|p| prices[*p].is_some()).collect();
+        if let Some(vault) = vault {
+            let start = !self.started && !vault.halted;
+            if !self.started && (vault.halted || !read.is_empty()) {
+                self.started = true;
+            }
+            let grew = self.cash.is_some_and(|before| vault.cash > before);
+            self.cash = Some(vault.cash);
+            if start || grew {
+                said.extend(read);
+            }
+        }
+        said.sort_unstable();
+        said.dedup();
+        said
     }
 }
 
@@ -1734,5 +1816,58 @@ mod tests {
         assert!(token_changes(&bare, &keys).is_err());
         let beyond = serde_json::json!({"meta": {"preTokenBalances": [balance(9, "1")], "postTokenBalances": []}});
         assert!(token_changes(&beyond, &keys).is_err());
+    }
+
+    fn vault_open(cash: u64) -> Option<VaultNow> {
+        Some(VaultNow {
+            halted: false,
+            cash,
+        })
+    }
+
+    #[test]
+    fn an_agent_started_on_a_pool_that_never_moves_is_woken_once_to_look() {
+        let mut looks = Looks::new(1);
+        assert_eq!(
+            looks.look(&[Some(7)], vault_open(0)),
+            vec![0],
+            "the agent takes no step before a wake, so a still pool would leave it idle for good"
+        );
+        // Still pool, same cash: nothing more.
+        assert!(looks.look(&[Some(7)], vault_open(0)).is_empty());
+        assert!(looks.look(&[Some(7)], vault_open(0)).is_empty());
+        // A move is said, as before.
+        assert_eq!(looks.look(&[Some(8)], vault_open(0)), vec![0]);
+    }
+
+    #[test]
+    fn a_deposit_priced_after_the_start_wakes_the_agent_and_cash_leaving_does_not() {
+        let mut looks = Looks::new(1);
+        assert_eq!(looks.look(&[Some(7)], vault_open(0)), vec![0]);
+        assert_eq!(looks.look(&[Some(7)], vault_open(10_000_000)), vec![0]);
+        assert!(looks.look(&[Some(7)], vault_open(10_000_000)).is_empty());
+        assert!(looks.look(&[Some(7)], vault_open(2_000_000)).is_empty());
+    }
+
+    #[test]
+    fn a_vault_read_halted_at_the_first_look_is_left_to_its_halt_notice() {
+        let mut looks = Looks::new(1);
+        let halted = Some(VaultNow {
+            halted: true,
+            cash: 5,
+        });
+        assert!(looks.look(&[Some(7)], halted).is_empty());
+        assert!(looks.look(&[Some(7)], halted).is_empty());
+        // A move is still said.
+        assert_eq!(looks.look(&[Some(9)], halted), vec![0]);
+    }
+
+    #[test]
+    fn the_first_wake_waits_for_the_vault_and_a_pool_to_be_read() {
+        let mut looks = Looks::new(1);
+        assert!(looks.look(&[Some(7)], None).is_empty());
+        assert!(looks.look(&[None], vault_open(0)).is_empty());
+        assert_eq!(looks.look(&[Some(7)], vault_open(0)), vec![0]);
+        assert!(looks.look(&[Some(7)], vault_open(0)).is_empty());
     }
 }

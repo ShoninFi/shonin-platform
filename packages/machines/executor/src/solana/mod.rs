@@ -932,6 +932,7 @@ impl Cluster {
             let _prices = orca.then(|| {
                 AbortOnDrop(tokio::spawn(orca::watch_prices(
                     self.client.clone(),
+                    vault,
                     shared.account_events.sender(),
                 )))
             });

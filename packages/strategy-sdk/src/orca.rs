@@ -94,7 +94,9 @@ pub enum Receipt {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccountEvent {
-    /// A pool's price moved since the last look.
+    /// A pool's price: when it has moved since the last look, once when the
+    /// agent starts, and when the vault's cash has grown (a deposit priced),
+    /// so an agent on a pool that doesn't move still takes a look.
     Price { pool: String, price: Decimal },
     /// A station call through the driver landed.
     Changed,

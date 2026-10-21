@@ -379,6 +379,10 @@ enum Command {
         /// How long the agent has to put the money to work once priced.
         #[arg(long, default_value_t = 30)]
         work_minutes: u64,
+        /// Once the money is at work, ask it all back so a claim is booked
+        /// and paid, then put half in again (Solana only).
+        #[arg(long)]
+        claim: bool,
     },
     /// Whether a vault pays its own way, read from the chain alone: its
     /// value, share price, tank, allowances and their daily cost, fees owed,
@@ -1012,6 +1016,7 @@ async fn main() -> Result<()> {
             tank_days,
             take_on_seconds,
             work_minutes,
+            claim,
         }) if target.key.kind == ChainKind::Solana => {
             let served = target.serve_solana().await?;
             let api = api.trim_end_matches('/').to_string();
@@ -1030,6 +1035,7 @@ async fn main() -> Result<()> {
                     tank_days,
                     take_on: take_on_seconds,
                     work_within: std::time::Duration::from_secs(work_minutes * 60),
+                    claim,
                 },
             )
             .await
@@ -1043,7 +1049,11 @@ async fn main() -> Result<()> {
             tank_days,
             take_on_seconds,
             work_minutes,
+            claim,
         }) => {
+            if claim {
+                bail!("--claim is for a Solana demo; an EVM demo is left running as it is");
+            }
             let client = target.connect().await?;
             let deployments = target.wait_for_deployments(&client).await?;
             let api = api.trim_end_matches('/').to_string();
@@ -1064,6 +1074,7 @@ async fn main() -> Result<()> {
                     tank_days,
                     take_on: take_on_seconds,
                     work_within: std::time::Duration::from_secs(work_minutes * 60),
+                    claim: false,
                 },
             )
             .await

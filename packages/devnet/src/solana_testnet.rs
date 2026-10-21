@@ -148,7 +148,10 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
     let author = seed.client.role(Role::Author)?;
     let fee = seed.platform.publishing_config(seed.client).await?.fee;
     let factory = seed.platform.factory(seed.client).await?;
-    seed.have(author, fee + factory.terms.minimum_tank).await?;
+    // A strategy whose vault a demo activated and that holds no deposit yet
+    // (a demo stopped after activation) is taken up where it stopped.
+    let mut resumed = false;
+    let mut deposited_before = false;
     let strategy = match demo.strategy {
         Some(id) => {
             if seed.platform.strategy(seed.client, id).await?.is_none() {
@@ -156,10 +159,21 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
             }
             let v = seed.platform.vault_accounts(id);
             if seed.client.account(&v.vault).await?.is_some() {
-                bail!(
-                    "strategy {id} already has its vault ({}): a demo runs on a fresh one, so publish again (--agent) or pass a strategy published with --publish-only",
-                    v.vault
-                );
+                let requests = seed
+                    .platform
+                    .vault(seed.client, &v.vault)
+                    .await?
+                    .request_count;
+                if requests > 1 {
+                    bail!(
+                        "strategy {id} already has its vault ({}) with deposits: a demo runs on a fresh one, so publish again (--agent) or pass a strategy published with --publish-only",
+                        v.vault
+                    );
+                }
+                // One request is the demo's own deposit, made before it stopped.
+                deposited_before = requests == 1;
+                tracing::info!(vault = %v.vault, deposited_before, "its vault is activated by a demo that stopped: the demo carries on from there");
+                resumed = true;
             }
             id
         }
@@ -167,6 +181,7 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
             let agents = agents_dir(demo.agents)?;
             let (project, moved) = project_for(&agents, demo.agent)?;
             let project = moved.as_deref().unwrap_or(&project);
+            seed.have(author, fee + factory.terms.minimum_tank).await?;
             seed.say_who_the_author_is(author).await?;
             tracing::info!(project = %project.display(), "publishing on Solana, for a fresh vault");
             let published = seed.publish(demo.api, project, author).await?;
@@ -177,8 +192,15 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
         }
     };
     let slug = shared::Strategy::slug_for(Chain::Solana, strategy);
-    let v = seed.activate(strategy, author).await?;
-    tracing::info!(slug, vault = %v.vault, "activated at the modest allowances");
+    let v = if resumed {
+        seed.platform.vault_accounts(strategy)
+    } else {
+        // A fresh strategy pays its fee before; the minimum tank still due.
+        seed.have(author, factory.terms.minimum_tank).await?;
+        let v = seed.activate(strategy, author).await?;
+        tracing::info!(slug, vault = %v.vault, "activated at the modest allowances");
+        v
+    };
 
     let daily = seed
         .platform
@@ -224,18 +246,20 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
 
     let viewer = seed.client.role(Role::Viewer)?;
     let amount = demo.deposit_dollars * 1_000_000;
-    seed.have(viewer, amount).await?;
-    seed.deposit(&v, viewer, amount).await?;
-    tracing::info!(
-        slug,
-        dollars = demo.deposit_dollars,
-        "a depositor asked to put money in"
-    );
+    if !deposited_before {
+        seed.have(viewer, amount).await?;
+        seed.deposit(&v, viewer, amount).await?;
+        tracing::info!(
+            slug,
+            dollars = demo.deposit_dollars,
+            "a depositor asked to put money in"
+        );
+    }
     seed.wait_taken_on(&v, &slug, demo.take_on).await?;
     let shares = seed.wait_for_shares(&v, &viewer.pubkey()).await?;
     tracing::info!(slug, shares, "the deposit was priced at a later valuation");
     if !seed.at_work(&v, amount, demo.work_within, false).await? {
-        let quoted = if seed.has_stand_in_venue().await? {
+        let quoted = if matches!(seed.judged_by(&v).await?, AtWork::StandIn(_)) {
             let perp = seed.perp().await?;
             format!(
                 " The stand-in venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002.",
@@ -249,6 +273,20 @@ pub async fn demo(served: &SolanaServed, demo: &crate::seed::Demo<'_>) -> Result
             "the agent of {slug} ({}) has not put the money to work within {} min.{quoted} Its log on the executor says why. The vault is left as it is.",
             v.vault,
             demo.work_within.as_secs() / 60,
+        );
+    }
+    if demo.claim {
+        // All of it asked back while it is at work, so a claim is booked and
+        // paid; then half of it in again, so the vault keeps a depositor.
+        seed.claim_back(&v, viewer, shares, &slug).await?;
+        let again = amount / 2;
+        seed.deposit(&v, viewer, again).await?;
+        let shares = seed.wait_for_shares(&v, &viewer.pubkey()).await?;
+        tracing::info!(
+            slug,
+            dollars = again as f64 / 1e6,
+            shares,
+            "and the depositor put half of it in again, so the vault keeps a depositor"
         );
     }
     println!("vault {}", v.vault);
@@ -580,10 +618,24 @@ impl<'a> Seed<'a> {
         Ok(())
     }
 
-    /// Whether the agent has put the money to work within `within`: the
-    /// vault's cash is under nine tenths of `deposited` and, at the stand-in
-    /// venue, its station holds a position there. With `nudge`, the seed
-    /// posts the stand-in venue's prices as its operator every
+    /// How the demo tells whether `v`'s agent is at work, by the drivers its
+    /// station pins (see [`AtWork::of`]).
+    async fn judged_by(&self, v: &VaultAccounts) -> Result<AtWork> {
+        let station = self.platform.station(self.client, &v.station).await?;
+        let pinned: Vec<(Pubkey, [u8; 32], Pubkey)> = station
+            .drivers
+            .iter()
+            .map(|driver| (driver.program, driver.name, driver.authority))
+            .collect();
+        Ok(AtWork::of(&pinned, self.has_stand_in_venue().await?))
+    }
+
+    /// Whether the agent has put the money to work within `within`, judged
+    /// as [`AtWork`] says by the venue its station pins: the vault's cash
+    /// under nine tenths of `deposited` and a position at the stand-in
+    /// venue; a position holding liquidity at Orca, or the cash under nine
+    /// tenths; or, at any other venue, the cash alone. With `nudge`, the
+    /// seed posts the stand-in venue's prices as its operator every
     /// [`NUDGE_EVERY`] meanwhile.
     async fn at_work(
         &self,
@@ -592,20 +644,7 @@ impl<'a> Seed<'a> {
         within: Duration,
         nudge: bool,
     ) -> Result<bool> {
-        // At the stand-in venue, the station's account there; a public
-        // cluster's venues are read through the vault's cash alone.
-        let authority = if self.has_stand_in_venue().await? {
-            let station = self.platform.station(self.client, &v.station).await?;
-            Some(
-                station
-                    .drivers
-                    .first()
-                    .map(|driver| driver.authority)
-                    .context("the station has no driver")?,
-            )
-        } else {
-            None
-        };
+        let judged = self.judged_by(v).await?;
         let mut nudged: Option<tokio::time::Instant> = None;
         let until = tokio::time::Instant::now() + within;
         while tokio::time::Instant::now() < until {
@@ -619,19 +658,32 @@ impl<'a> Seed<'a> {
                 }
                 nudged = Some(tokio::time::Instant::now());
             }
-            let held = match &authority {
-                Some(authority) => self
-                    .platform
-                    .margin_account(self.client, authority)
-                    .await?
-                    .is_some_and(|account| {
-                        account.size_in(&name(crate::solana::SPOT)) != 0
-                            || account.size_in(&name(crate::solana::PERP)) != 0
-                    }),
-                None => true,
-            };
             let cash = self.platform.vault(self.client, &v.vault).await?.cash;
-            if held && u128::from(cash) * 10 < u128::from(deposited) * 9 {
+            let cash_left = u128::from(cash) * 10 < u128::from(deposited) * 9;
+            let at_work = match &judged {
+                AtWork::StandIn(authority) => {
+                    cash_left
+                        && self
+                            .platform
+                            .margin_account(self.client, authority)
+                            .await?
+                            .is_some_and(|account| {
+                                account.size_in(&name(crate::solana::SPOT)) != 0
+                                    || account.size_in(&name(crate::solana::PERP)) != 0
+                            })
+                }
+                AtWork::Orca(authority) => {
+                    cash_left
+                        || chain::solana::orca::Holdings::read(self.client, authority)
+                            .await?
+                            .slots
+                            .iter()
+                            .flatten()
+                            .any(|held| held.state.liquidity != 0)
+                }
+                AtWork::Cash => cash_left,
+            };
+            if at_work {
                 tracing::info!(vault = %v.vault, cash, "the agent has put the money to work");
                 return Ok(true);
             }
@@ -657,6 +709,28 @@ impl<'a> Seed<'a> {
                 "the agent never put a tenth of the vault to work within {WAIT_SECONDS} s, so a withdrawal would be paid from cash and no claim booked"
             );
         }
+        self.claim_back(v, leaver, shares, slug).await?;
+
+        let author = self.client.role(Role::Author)?;
+        self.deposit(v, author, STAYING_DEPOSIT).await?;
+        self.wait_for_shares(v, &author.pubkey()).await?;
+        tracing::info!(
+            slug,
+            "and its author put a little in, so the vault keeps a depositor"
+        );
+        Ok(())
+    }
+
+    /// `who` asks back `shares`: the request is priced at the next
+    /// valuation, booked as a claim when the vault's cash can't pay it, and
+    /// the claim paid by the keeper. Read back from the cluster.
+    async fn claim_back(
+        &self,
+        v: &VaultAccounts,
+        leaver: &Keypair,
+        shares: u128,
+        slug: &str,
+    ) -> Result<()> {
         let to = self.platform.dollars(&leaver.pubkey());
         let before = self.client.token_balance(&to).await?;
         let ix = self.platform.ix_request_redeem(
@@ -734,15 +808,47 @@ impl<'a> Seed<'a> {
             received,
             "and the claim was paid, in the dollar's base units, as the cluster records it"
         );
-
-        let author = self.client.role(Role::Author)?;
-        self.deposit(v, author, STAYING_DEPOSIT).await?;
-        self.wait_for_shares(v, &author.pubkey()).await?;
-        tracing::info!(
-            slug,
-            "and its author put a little in, so the vault keeps a depositor"
-        );
         Ok(())
+    }
+}
+
+/// How the demo tells whether a vault's agent has put its money to work,
+/// by the driver its station pins: the venue the agent trades, never one
+/// the cluster merely still has accounts of. A public cluster can keep an
+/// old stand-in venue's accounts long after its vaults moved to real venues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtWork {
+    /// A position at the stand-in venue, through the station's account
+    /// there, and the vault's cash gone down.
+    StandIn(Pubkey),
+    /// A position holding liquidity at Orca, held by the station's account
+    /// there, or the vault's cash gone down.
+    Orca(Pubkey),
+    /// The vault's cash gone down: a venue the demo doesn't read.
+    Cash,
+}
+
+impl AtWork {
+    /// From the station's pinned drivers, as (program, name, the station's
+    /// account at the venue), and whether the cluster has the stand-in
+    /// venue. A driver pinned as Orca's is read at Orca; the stand-in
+    /// driver is read at the stand-in venue only where that venue is.
+    fn of(pinned: &[(Pubkey, [u8; 32], Pubkey)], stand_in_here: bool) -> Self {
+        if let Some((_, _, authority)) = pinned
+            .iter()
+            .find(|(_, name, _)| *name == chain::solana::orca::NAME)
+        {
+            return Self::Orca(*authority);
+        }
+        if stand_in_here
+            && let Some((_, _, authority)) = pinned.iter().find(|(program, name, _)| {
+                *program == chain::solana::programs::local_driver::ID
+                    && *name == chain::solana::programs::local_driver::NAME
+            })
+        {
+            return Self::StandIn(*authority);
+        }
+        Self::Cash
     }
 }
 
@@ -776,5 +882,27 @@ mod tests {
         assert!(moved.is_none());
         assert!(project_for(&root, "nobody").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_orca_vault_is_judged_at_orca_even_where_the_stand_in_venue_s_accounts_remain() {
+        use chain::solana::programs::local_driver;
+        let (orca, stand_in) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let orca_driver = (Pubkey::new_unique(), chain::solana::orca::NAME, orca);
+        let local = (local_driver::ID, local_driver::NAME, stand_in);
+        assert_eq!(AtWork::of(&[orca_driver], true), AtWork::Orca(orca));
+        assert_eq!(AtWork::of(&[orca_driver], false), AtWork::Orca(orca));
+        assert_eq!(AtWork::of(&[local, orca_driver], true), AtWork::Orca(orca));
+        // A stand-in vault where the stand-in venue is; nowhere else.
+        assert_eq!(AtWork::of(&[local], true), AtWork::StandIn(stand_in));
+        assert_eq!(AtWork::of(&[local], false), AtWork::Cash);
+        // Another venue, or none: the cash alone.
+        let other = (
+            Pubkey::new_unique(),
+            name("hyperliquid"),
+            Pubkey::new_unique(),
+        );
+        assert_eq!(AtWork::of(&[other], true), AtWork::Cash);
+        assert_eq!(AtWork::of(&[], true), AtWork::Cash);
     }
 }
