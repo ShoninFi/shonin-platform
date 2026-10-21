@@ -69,6 +69,11 @@ mod listed {
         theta: 15_000_000_000_000,
     }];
     pub const MAX_AGE: u64 = 120;
+    /// Orca's fee here is 0.04% and arbitrage keeps the pool within about
+    /// that of the market; Pyth's price, up to [`MAX_AGE`] old, trails it
+    /// by about a tenth of a percent in a minute or two of SOL's usual
+    /// moves. A quarter of a percent leaves both room.
+    pub const NEAR_BPS: u64 = 25;
 }
 
 #[cfg(all(feature = "devnet", not(feature = "mainnet")))]
@@ -92,6 +97,10 @@ mod listed {
         theta: 460_000_000,
     }];
     pub const MAX_AGE: u64 = 900;
+    /// The testnet's market account brings the pool back to Pyth's price
+    /// once it strays a quarter of a percent, and Pyth's price here may be
+    /// a quarter of an hour old: half a percent leaves both room.
+    pub const NEAR_BPS: u64 = 50;
 }
 
 #[cfg(not(any(feature = "devnet", feature = "mainnet")))]
@@ -109,6 +118,10 @@ mod listed {
         theta: 10_000_000_000,
     }];
     pub const MAX_AGE: u64 = 900;
+    /// The tests' pool is thin: a station's own sale there moves it by
+    /// about a percent. A percent, the tests' usual band and a tenth of the
+    /// widest a station may have.
+    pub const NEAR_BPS: u64 = 100;
 }
 
 /// The pools' settings account.
@@ -119,6 +132,13 @@ pub const DOLLAR_MINT: Pubkey = listed::DOLLAR_MINT;
 pub const POOLS: &[Pool] = listed::POOLS;
 /// How old, in seconds, a price may be and still count.
 pub const MAX_AGE: u64 = listed::MAX_AGE;
+/// How far, in basis points of price, the selling pool's price (and that of
+/// any pool where the station holds liquidity) may stand from Pyth's for
+/// anything to be valued or a claim closed: far tighter than a station's
+/// band, which is room for the station's own sale, so that a pool pushed in
+/// the transaction that values or closes moves neither by more than this.
+/// A band narrower than this bounds the pool by the band instead.
+pub const NEAR_BPS: u64 = listed::NEAR_BPS;
 
 /// The two mints in the order a pool keeps them: token A sorts first.
 pub fn mints() -> (Pubkey, Pubkey) {
@@ -168,6 +188,13 @@ mod tests {
         let shard = 0u16.to_le_bytes();
         let derived = Pubkey::find_program_address(&[&shard, &FEED_ID], &push_oracle).0;
         assert_eq!(derived, PRICE_ACCOUNT);
+    }
+
+    #[test]
+    fn the_pool_may_stand_from_pyth_s_price_by_a_few_tenths_of_a_percent_at_most() {
+        #[cfg(any(feature = "devnet", feature = "mainnet"))]
+        assert!((10..=50).contains(&NEAR_BPS));
+        assert!(NEAR_BPS <= shonin_station::state::MAX_EXIT_BAND_BPS as u64 / 10);
     }
 
     #[test]

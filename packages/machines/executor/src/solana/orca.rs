@@ -197,11 +197,13 @@ fn fit_oracle(holdings: &Holdings, band_bps: u16, now: u64) -> Option<u128> {
     oracle_units(&price).filter(|price| *price > 0)
 }
 
-/// Pyth's price and the square-root prices at the edges of the band around
-/// it (see [`venue::band_roots`]), when Pyth's price is fit and the pool's
-/// own stands between those edges. Every call that puts the station's money
-/// into the pool is refused otherwise, so it never trades at a price the
-/// station's own valuation wouldn't take.
+/// Pyth's price and the square-root prices just inside where the driver
+/// lets the pool stand from it (see [`venue::near_roots`]), when Pyth's
+/// price is fit and the pool's own stands between those edges. Every call
+/// that puts the station's money into the pool is refused otherwise, so it
+/// never trades at a price the station's own valuation wouldn't take, and
+/// a trade stopping at those edges leaves the station's valuation
+/// available.
 fn priced(seen: &Seen, pool: &PoolNow) -> std::result::Result<(u128, (u128, u128)), Failed> {
     let Some(oracle) = fit_oracle(seen.holdings, seen.band_bps, seen.now) else {
         return refused(
@@ -219,7 +221,7 @@ fn priced(seen: &Seen, pool: &PoolNow) -> std::result::Result<(u128, (u128, u128
     let (low, high) = (roots.0.min(roots.1), roots.0.max(roots.1));
     if !(low..=high).contains(&pool.state.sqrt_price) {
         return refused(
-            "the pool's price is not within the exit band of the oracle's: nothing is sent into the pool until it is",
+            "the pool's price is further from the oracle's than the driver values at: nothing is sent into the pool until it is",
         );
     }
     Ok((oracle, roots))
@@ -1520,8 +1522,8 @@ mod tests {
     fn trades_refuse_the_drivers_exact_boundaries_and_limits_stay_inside() {
         let half = half();
         let oracle = price(150);
-        let raw = venue::band_roots(oracle, 100);
-        let (low, high) = (raw.0.min(raw.1) + 1, raw.0.max(raw.1));
+        let raw = venue::near_roots(oracle, 100);
+        let (low, high) = (raw.0.min(raw.1), raw.0.max(raw.1));
         for root in [low - 1, low, high, high + 1] {
             let mut h = holdings(&half, 150, 150, SOL);
             h.pools[0].state.sqrt_price = root;

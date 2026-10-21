@@ -17,7 +17,8 @@
 //! are paired (see [`sell`]), so the sale works with no more liquidity than
 //! the pool has anywhere on its way and fetches no more than Orca's swap
 //! would, the stayers keeping any difference. Past as many exact crossings
-//! as a sale may make, what is left is valued at the band's limit.
+//! as a sale may make, what is left is valued at the band's limit, if the
+//! rest of the way holds the depth to take it.
 //!
 //! The stayers' part, valued again after a leaver's close, adds up. The
 //! close moved the price from `p0` to `p1` and withdrew the leaver's part of
@@ -78,10 +79,13 @@ const FEE_ONE: u128 = 1_000_000;
 pub const CLOSE_CROSSINGS: u32 = 7;
 
 /// The most ticks at least the threshold a valuation's sale may cross:
-/// about 4,000 units each on a valuation's 30,000 to 55,000. From a pool at
-/// the top of the widest band a station may be created with (10%) to the
-/// sale's limit at its bottom is about 32 spacings of 64 ticks; this covers
-/// that with room.
+/// about 4,000 units each on a valuation's 30,000 to 55,000. From a pool
+/// near Pyth's price to the sale's limit at the bottom of the widest band a
+/// station may be created with (10%) is about 16 spacings of 64 ticks, all
+/// crossed exactly; at a spacing of 4 it is about 260, more than any
+/// valuation affords. Past these, what is left is valued at the band's
+/// limit only where the rest of the way is shown to hold the depth to take
+/// it (see [`sell`]), and the valuation is outside otherwise.
 pub const VALUE_CROSSINGS: u32 = 40;
 
 /// The most initialized ticks of any size Orca's swap in one close may
@@ -265,8 +269,13 @@ fn limit_tick(price: u128, tick: i32, limit: u128, a_to_b: bool, spacing: i32) -
 /// sold and pays less for it.
 ///
 /// With `tail`, what a sale stopped by `crossings` leaves unsold is valued
-/// at the limit, the worst price inside the band, less the pool's fee: never
-/// more than selling it inside the band would fetch.
+/// at the limit, the worst price inside the band, less the pool's fee, when
+/// a sale of it from the stop through the least liquidity on the rest of the
+/// way to the limit (every exact tick's change applied, the deepest fall of
+/// the small ones and the station's own taken off) takes all of it: then
+/// Orca's swap, through at least that liquidity everywhere, takes it too,
+/// at prices no worse than the limit. Otherwise it is left unsold, and the
+/// sale did not take everything.
 #[allow(clippy::too_many_arguments)]
 pub fn sell(
     pool: &Whirlpool,
@@ -298,14 +307,12 @@ pub fn sell(
     let highest = *starts.iter().max().unwrap() + span;
     // The ticks crossed exactly, as many as may be and the one past them;
     // and the deepest fall of the small ones' running sum.
-    let mut exact: Vec<(i32, i128)> = Vec::new();
+    let mut every: Vec<(i32, i128)> = Vec::new();
     let (mut running, mut deepest): (i128, i128) = (0, 0);
     for &(at, net) in &path.ticks {
         let own_tick = own.iter().any(|o| o.tick_lower == at || o.tick_upper == at);
         if own_tick || net.unsigned_abs() >= theta {
-            if exact.len() <= crossings as usize {
-                exact.push((at, net));
-            }
+            every.push((at, net));
         } else {
             let change = if a_to_b { -net } else { net };
             running = running.saturating_add(change);
@@ -313,6 +320,7 @@ pub fn sell(
         }
     }
     let removed = deepest.saturating_neg();
+    let exact = &every[..every.len().min(crossings as usize + 1)];
     // The pool's liquidity as the exact ticks change it; the sale works with
     // that less the deepest fall, never below nothing.
     let mut liquidity = pool.liquidity as i128;
@@ -374,8 +382,29 @@ pub fn sell(
     }
     let mut sold = amount - remaining;
     if tail && stop.is_some() && remaining > 0 {
-        proceeds = proceeds.saturating_add(at_limit(remaining, fee_rate, limit, a_to_b));
-        sold = amount;
+        // Valued at the limit only if the rest of the way holds the depth to
+        // take it: sold from where the sale stopped through the least
+        // liquidity it meets from there to the limit, never more than
+        // Orca's at any price on the way, it must sell all of it.
+        let working = |liquidity: i128, tick: i32| {
+            (liquidity.saturating_sub(removed).max(0) as u128).saturating_sub(own_at(own, tick))
+        };
+        let mut least = working(liquidity, tick);
+        for &(found, net) in &every[crossings as usize..] {
+            if a_to_b {
+                liquidity -= net;
+                tick = found - 1;
+            } else {
+                liquidity += net;
+                tick = found;
+            }
+            least = least.min(working(liquidity, tick));
+        }
+        let rest = step(remaining, fee_rate, least, price, limit, a_to_b)?;
+        if rest.consumed >= remaining {
+            proceeds = proceeds.saturating_add(at_limit(remaining, fee_rate, limit, a_to_b));
+            sold = amount;
+        }
     }
     Ok(Sale {
         sold,
@@ -545,4 +574,90 @@ fn next_price_from_b(price: u128, liquidity: u128, amount: u64) -> Result<u128> 
 
 fn math_error(_: MathError) -> Error {
     error!(crate::DriverError::Overflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::prelude::Pubkey;
+
+    const SPACING: i32 = 4;
+    const TOP: i32 = 340;
+    const THETA: u128 = 1_000_000_000;
+
+    /// A pool at a spacing of 4, its price at `TOP`, with `base` liquidity
+    /// reaching past the band and `count` ticks of `net` each below the
+    /// price, a spacing apart, each taking `net` off as the price falls.
+    fn pool_and_path(base: u128, count: i32, net: u128) -> (Whirlpool, Path) {
+        let pool = Whirlpool {
+            config: Pubkey::default(),
+            tick_spacing: SPACING as u16,
+            fee_tier_index: SPACING as u16,
+            fee_rate: 400,
+            protocol_fee_rate: 1_300,
+            liquidity: base + count as u128 * net,
+            sqrt_price: math::sqrt_price_at(TOP).unwrap() + 1,
+            tick_current: TOP,
+            mint_a: Pubkey::default(),
+            vault_a: Pubkey::default(),
+            fee_growth_global_a: 0,
+            mint_b: Pubkey::default(),
+            vault_b: Pubkey::default(),
+            fee_growth_global_b: 0,
+        };
+        let ticks = (1..=count)
+            .map(|k| (TOP - 4 - (k - 1) * SPACING, net as i128))
+            .collect();
+        (pool, Path { ticks })
+    }
+
+    /// Selling A at a 10% band: half of it off Pyth's (here the pool's)
+    /// square-root price.
+    fn sale(pool: &Whirlpool, path: &Path, amount: u64) -> Sale {
+        let limit = pool.sqrt_price / 20_000 * 19_000 + 1;
+        // The arrays reach past the limit.
+        assert!(math::sqrt_price_at(-704).unwrap() < limit);
+        sell(
+            pool,
+            &[0, -352, -704],
+            path,
+            THETA,
+            &[],
+            amount,
+            true,
+            limit,
+            VALUE_CROSSINGS,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sol_left_past_a_valuation_s_crossings_with_no_depth_on_the_rest_of_the_band_is_unsold() {
+        // At a spacing of 4 a 10% band holds far more exact ticks than a
+        // valuation crosses; past them the pool holds nothing.
+        let (pool, path) = pool_and_path(0, VALUE_CROSSINGS as i32 + 1, 1_000_000_000_000);
+        let amount = 2_000_000_000_000;
+        let sold = sale(&pool, &path, amount);
+        assert!(sold.stop.is_some(), "{sold:?}");
+        assert!(
+            sold.sold < amount,
+            "valued past where any sale reaches: {sold:?}"
+        );
+    }
+
+    #[test]
+    fn sol_left_past_a_valuation_s_crossings_is_valued_at_the_limit_where_the_rest_holds_the_depth()
+    {
+        let (pool, path) = pool_and_path(
+            100_000_000_000_000,
+            VALUE_CROSSINGS as i32 + 1,
+            1_000_000_000_000,
+        );
+        let amount = 2_000_000_000_000;
+        let sold = sale(&pool, &path, amount);
+        assert!(sold.stop.is_some(), "{sold:?}");
+        assert_eq!(sold.sold, amount, "{sold:?}");
+        assert!(sold.proceeds > 0);
+    }
 }

@@ -44,27 +44,32 @@
 //! and all the SOL sold in the first pool, worked out step by step as Orca's
 //! swap works it out through everyone else's liquidity, no further than
 //! half the band from Pyth's square-root price, which the given tick arrays
-//! must reach. Less a small
+//! must reach. The pool's own price is where that sale starts, and anyone
+//! can push it for a transaction: so nothing is valued or closed with the
+//! selling pool, or a pool holding the station's liquidity, as far as
+//! [`network::NEAR_BPS`] from Pyth's price (or the band, if narrower), and
+//! a push in the transaction that values moves `exit` by no more than that;
+//! the band is room for the sale's own way through the pool. Less a small
 //! allowance (twice Orca's share of the pool's fee, and a millionth) for
 //! what a leaver's sale leaks to Orca where the stayers' own liquidity takes
 //! part of it. So a leaver's part never fetches less than its share of
 //! `exit` (selling part of it, through more liquidity, does better than
 //! selling all), and what it fetches and what the stayers keep add up to it:
 //! the station pays the leaver no more than came home and the stayers keep
-//! their part. `exit` may be above `mark` when a pool sits above Pyth inside
-//! the band. `outside` when Pyth's price can't be read, is not fully
+//! their part. `exit` may be above `mark` when a pool sits a little above
+//! Pyth's price. `outside` when Pyth's price can't be read, is not fully
 //! verified, is older than allowed or less certain than the band, when the
-//! selling pool or a pool where the station has liquidity is at or past
-//! where a close's sale may go, or when that sale can't take all the SOL
-//! before it gets there: nobody is paid at a value no sale inside the band
-//! reaches. A sale crosses exactly only ticks changing the liquidity by at
-//! least the listed pool's fixed threshold (real capital at the price,
-//! never read from the pool's state), and no more than so many of them: a
-//! valuation's as many as cover the widest band a station may have
-//! ([`sale::VALUE_CROSSINGS`]), a close's as many as one close can afford
-//! ([`sale::CLOSE_CROSSINGS`]); what is left unsold there is valued at the
-//! band's limit, the worst price inside the band, and is never outside for
-//! that alone. Smaller ticks, which anyone can place for a position's rent,
+//! selling pool or a pool where the station has liquidity is that far from
+//! Pyth's price, or when that sale can't take all the SOL before the band's
+//! limit: nobody is paid at a value no sale inside the band reaches. A sale
+//! crosses exactly only ticks changing the liquidity by at least the listed
+//! pool's fixed threshold (real capital at the price, never read from the
+//! pool's state), and no more than so many of them: a valuation's as many
+//! as it affords ([`sale::VALUE_CROSSINGS`]), a close's as many as one close
+//! can afford ([`sale::CLOSE_CROSSINGS`]); what is left unsold there is
+//! valued at the band's limit, the worst price inside the band, where the
+//! rest of the way is shown to hold the depth to take it, and is outside
+//! otherwise. Smaller ticks, which anyone can place for a position's rent,
 //! are paired so that the sale never fetches more than Orca's swap would
 //! (see [`sale::sell`]). A claim's close whose own swap would cross more
 //! initialized ticks of any size than one close affords
@@ -88,7 +93,13 @@
 //! the decreases freed and `f` of the rest of the authority's SOL (the fees
 //! collected included), a lamport less for each instruction that paid it
 //! (should Orca round a unit differently), never past half the band from
-//! Pyth's square-root price. A close that would leave no position with
+//! Pyth's square-root price. A push before a claim's close moves what the
+//! leaver is paid by no more than [`network::NEAR_BPS`] too, as the close is
+//! refused with the pool any further. A claim's close leaving anything is
+//! refused, as outside, also when its sale, worked out through less
+//! liquidity than Orca's swap will find, would take the pool that far: the
+//! stayers' part is valued after it, and the vault may serve a part, the
+//! pool coming back between. A close that would leave no position with
 //! liquidity and under a dollar of wrapped SOL sells all of it instead, so
 //! what remains is nothing of worth both before and after: the station keeps
 //! the stayers' part of the proceeds, counted. At the full band the swap is
@@ -741,15 +752,32 @@ pub mod logic {
             Ok((asset, dollars))
         }
 
-        /// The square-root prices the band reaches either side of Pyth's,
-        /// as a close's sale limit is worked out: a pool at or past either
-        /// can't be closed through inside the band.
-        fn band_roots(&self, band_bps: u16) -> (u128, u128) {
-            let band = band_bps as u64;
+        /// How far, in basis points of price, a pool may stand from Pyth's
+        /// for anything to be valued or closed inside `band_bps`: no further
+        /// than [`network::NEAR_BPS`], nor than the band.
+        fn near_bps(band_bps: u16) -> u64 {
+            (band_bps as u64).min(network::NEAR_BPS)
+        }
+
+        /// The square-root prices `bps` of price either side of Pyth's, each
+        /// rounded towards Pyth's: below, its root times `1 - t / 2` (a
+        /// price `(1 - t / 2)^2`, above `1 - t`), and a unit more; above, its
+        /// root times `1 + t / 2 - t^2 / 8` (a price `1 + t - t^3 / 8 + t^4 /
+        /// 64`, below `1 + t`). A pool at or past either is too far from
+        /// Pyth's to be valued or closed through.
+        fn near_roots(&self, bps: u64) -> (u128, u128) {
+            let whole = 8 * BPS * BPS;
             (
-                self.scaled_root(2 * BPS - band, 2 * BPS).saturating_add(1),
-                self.scaled_root(2 * BPS + band, 2 * BPS),
+                self.scaled_root(2 * BPS - bps, 2 * BPS).saturating_add(1),
+                self.scaled_root(whole + 4 * BPS * bps - bps * bps, whole),
             )
+        }
+
+        /// Whether the square-root price `root` is at or past either of
+        /// [`Self::near_roots`] for `band_bps`.
+        fn far(&self, root: u128, band_bps: u16) -> bool {
+            let (low, high) = self.near_roots(Self::near_bps(band_bps));
+            root <= low || root >= high
         }
 
         /// Whether the station holds anything of worth at Orca: a position
@@ -770,8 +798,12 @@ pub mod logic {
 
         /// Whether the prices put the holdings beyond the band: Pyth's
         /// price unreadable or unfit, or the selling pool or a pool holding
-        /// liquidity priced at or past the band's reach from it (where a
-        /// close's sale could not go).
+        /// liquidity priced at or past [`network::NEAR_BPS`] from it (or the
+        /// band, if narrower). A sale is worked out from the pool's own
+        /// price, which anyone can push for a transaction; held this near
+        /// Pyth's, a push in the transaction that values or closes moves
+        /// what the sale fetches by no more than that, while the band stays
+        /// room for the sale's own way through the pool.
         fn prices_outside(&self, band_bps: u16) -> bool {
             let Some(price) = &self.price else {
                 return true;
@@ -779,15 +811,13 @@ pub mod logic {
             if !price.fit(self.now, network::MAX_AGE, band_bps) {
                 return true;
             }
-            let (low, high) = self.band_roots(band_bps);
             (0..self.pools.len()).any(|p| {
                 let holds = p == 0
                     || self
                         .held
                         .iter()
                         .any(|h| h.pool == p && h.position.liquidity > 0);
-                let price = self.pools[p].sqrt_price;
-                holds && (price <= low || price >= high)
+                holds && self.far(self.pools[p].sqrt_price, band_bps)
             })
         }
 
@@ -803,8 +833,9 @@ pub mod logic {
         /// no sale inside the band reaches. At the full band, a stopped
         /// station's last resort, nothing is outside, the sale goes as far
         /// as the given arrays reach, and what it can't take there counts
-        /// for nothing. A pool pushed inside the band may lift `exit` above
-        /// `mark`.
+        /// for nothing. A pool pushed up, no further than
+        /// [`network::NEAR_BPS`] from Pyth's price, may lift `exit` above
+        /// `mark` by about that.
         pub fn valuation(&self, band_bps: u16) -> Result<Valuation> {
             Ok(self.assess(band_bps, Asked::Value)?.0)
         }
@@ -1110,10 +1141,12 @@ pub mod logic {
             let edges = if band >= BPS {
                 None
             } else {
-                // Past the band's own roots on both sides (the root of a
-                // price moved by `b` moves by less than `b`), so the
-                // minimums are never more than a withdrawal inside the band
-                // pays.
+                // Pyth's root moved by the whole band either way: about
+                // twice as far as the band's own roots (the root of a price
+                // moved by `b` moves by about `b / 2`), so the minimums are
+                // never more than a withdrawal inside the band pays. The
+                // plan runs in the instruction that prepared it, so the
+                // pool can't move between.
                 Some((
                     self.scaled_root(BPS + band, BPS),
                     self.scaled_root(BPS - band, BPS),
@@ -1248,7 +1281,14 @@ pub mod logic {
                             sale::CLOSE_CROSSINGS,
                             false,
                         )?;
-                        if theirs.sold < sale {
+                        // Nor, leaving anything, may it take the pool
+                        // further from Pyth's than a valuation may find it:
+                        // the stayers' part is valued after it. A claim too
+                        // large for that is refused this try (the vault may
+                        // serve a part). Orca's swap, through more liquidity
+                        // than worked out here, ends nearer than this sale.
+                        let far = !full && !sell_all && self.far(theirs.end, band_bps);
+                        if theirs.sold < sale || far {
                             return Ok(Plan {
                                 outside: true,
                                 ..Plan::default()
