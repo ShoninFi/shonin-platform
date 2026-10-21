@@ -7,7 +7,9 @@
 //! registers what it made, with the reviewer's go-ahead and its own signature.
 //!
 //! The queue is public and first come, first served, one job in flight per
-//! author. A job ends ready, refused or failed, and shows nothing more than
+//! author. A job put back to ask again later, because the reviewer or its
+//! chain's node did not answer, keeps its place (see [`next_to_take`]).
+//! A job ends ready, refused or failed, and shows nothing more than
 //! that: no build log is ever kept.
 //!
 //! An upload is anyone's, naming any wallet, until it is paid for, so what
@@ -593,6 +595,12 @@ struct Entry {
     reviewer_away: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     not_before: Option<time::PrimitiveDateTime>,
+    /// Whether that wait is for the job's own chain, whose node did not
+    /// answer, rather than for the reviewer, which every chain shares (see
+    /// [`next_to_take`]). A queue written before this was kept says nothing,
+    /// and its waits are taken as the reviewer's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    waits_on_its_chain: bool,
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -2018,6 +2026,7 @@ async fn upload(
             attempts: 0,
             reviewer_away: 0,
             not_before: None,
+            waits_on_its_chain: false,
         });
         written_down(&service, &mut queue, &id, before).await?;
         tracing::info!(
@@ -2076,6 +2085,7 @@ async fn upload(
         attempts: 0,
         reviewer_away: 0,
         not_before: None,
+        waits_on_its_chain: false,
     });
     let forgot = bound_unpaid(&mut queue, author, now());
     written_down(&service, &mut queue, &id, before).await?;
@@ -2877,6 +2887,72 @@ fn placed(jobs: &[Entry]) -> Vec<Job> {
 
 // The queue ------------------------------------------------------------------
 
+/// Where in `jobs` the next job to take is, if one may be taken `at` this
+/// time. Jobs are taken in the queue's order, the order their uploads came
+/// in, which is the order of the positions the queue shows. A job put back
+/// to ask again later keeps its place:
+///
+/// - put back because the reviewer gave no verdict, it holds back every job
+///   behind it that was also put back for the reviewer, on any chain, until
+///   its own wait ends: the reviewer is one machine for every chain, so a
+///   job that met it away never asks it again ahead of one that met it away
+///   earlier. A job behind it that has not yet asked may ask meanwhile (so
+///   trouble the reviewer has with one chain alone holds no other chain),
+///   and once it has met the reviewer away it waits its turn as well.
+/// - put back because its chain's node did not answer, it holds back the
+///   jobs behind it on its own chain only.
+///
+/// The exceptions, where a later job is taken first: an author has one job
+/// in flight at a time (`busy`), so their next job waits for it and the
+/// jobs behind go ahead; and a job on a chain not connected waits for it
+/// without holding anyone (`connected`).
+fn next_to_take(
+    jobs: &[Entry],
+    busy: &[Wallet],
+    connected: impl Fn(Chain) -> bool,
+    at: time::PrimitiveDateTime,
+) -> Option<usize> {
+    let mut reviewer_held = false;
+    let mut chains_held: Vec<Chain> = Vec::new();
+    for (index, entry) in jobs.iter().enumerate() {
+        if !matches!(entry.job.state, JobState::Queued { .. })
+            || busy.contains(&entry.author)
+            || !connected(entry.job.chain)
+        {
+            continue;
+        }
+        let waits_on_the_reviewer = entry.not_before.is_some() && !entry.waits_on_its_chain;
+        if entry.not_before.is_some_and(|not_before| not_before > at) {
+            if entry.waits_on_its_chain {
+                chains_held.push(entry.job.chain);
+            } else {
+                reviewer_held = true;
+            }
+            continue;
+        }
+        if chains_held.contains(&entry.job.chain) || (reviewer_held && waits_on_the_reviewer) {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// The reviewer gave a verdict, so it is back: every job put back to wait
+/// for it may ask again now, each in its turn (see [`next_to_take`]), rather
+/// than at the end of a wait that grew while it was away.
+async fn reviewer_back(service: &Service) {
+    let mut queue = service.queue.lock().await;
+    for entry in &mut queue.jobs {
+        if matches!(entry.job.state, JobState::Queued { .. })
+            && entry.not_before.is_some()
+            && !entry.waits_on_its_chain
+        {
+            entry.not_before = Some(now());
+        }
+    }
+}
+
 /// Forget the uploads never paid for, then take the oldest paid job, have it
 /// reviewed, and build it.
 async fn take_one(service: &Arc<Service>) -> Result<()> {
@@ -2918,18 +2994,12 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
             .filter(|entry| service.connected_to(entry.job.chain))
             .map(|entry| entry.author)
             .collect();
-        // A job on a chain not yet connected waits for it, and one put back
-        // while the reviewer was away waits its turn to ask again.
         let at = now();
-        let next = queue.jobs.iter_mut().find(|entry| {
-            matches!(entry.job.state, JobState::Queued { .. })
-                && !busy.contains(&entry.author)
-                && service.connected_to(entry.job.chain)
-                && entry.not_before.is_none_or(|not_before| not_before <= at)
-        });
+        let next = next_to_take(&queue.jobs, &busy, |chain| service.connected_to(chain), at);
         // Counted before it starts, and written down with the state it is
         // given next, so a restart knows how often it was taken.
-        next.map(|entry| {
+        next.map(|at| {
+            let entry = &mut queue.jobs[at];
             entry.attempts += 1;
             entry.clone()
         })
@@ -2970,6 +3040,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
                     }
                     waiting.reviewer_away += 1;
                     waiting.not_before = Some(now() + wait);
+                    waiting.waits_on_its_chain = false;
                     tracing::warn!(
                         id = entry.job.id,
                         error = format!("{error:#}"),
@@ -3002,6 +3073,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
                 let wait = waiting_for_the_reviewer(waiting.reviewer_away);
                 waiting.reviewer_away += 1;
                 waiting.not_before = Some(now() + wait);
+                waiting.waits_on_its_chain = true;
                 tracing::warn!(
                     id = entry.job.id,
                     error = format!("{error:#}"),
@@ -3077,6 +3149,7 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
     let answer: ReviewAnswer = serde_json::from_slice(&body).map_err(|error| {
         Requeue::ReviewerAway(format!("the reviewer's answer was not a verdict: {error}"))
     })?;
+    reviewer_back(service).await;
     let Some(clearance) = answer.clearance.clone() else {
         tracing::info!(id = entry.job.id, "the reviewer refused it");
         return Ok((JobState::Refused, None));
@@ -4344,6 +4417,7 @@ mod tests {
             attempts: 0,
             reviewer_away: 0,
             not_before: None,
+            waits_on_its_chain: false,
         }
     }
 
@@ -4671,5 +4745,167 @@ mod tests {
         ));
         let paid = vec![an_entry(author, "sha256:01", JobState::Reviewing)];
         assert!(!again(&paid, Chain::Base, author, "sha256:01", false));
+    }
+
+    /// A paid job on `chain`, by `author`, numbered `id`: put back to wait
+    /// until `until`, for the reviewer or for its chain, if given.
+    fn queued(
+        id: &str,
+        author: Address,
+        chain: Chain,
+        wait: Option<(time::PrimitiveDateTime, bool)>,
+    ) -> Entry {
+        let mut entry = an_entry(author, "sha256:00", JobState::Queued { position: 0 });
+        entry.job.id = id.to_string();
+        entry.job.chain = chain;
+        if let Some((until, on_its_chain)) = wait {
+            entry.not_before = Some(until);
+            entry.waits_on_its_chain = on_its_chain;
+            entry.reviewer_away = 1;
+        }
+        entry
+    }
+
+    fn taken<'a>(
+        jobs: &'a [Entry],
+        busy: &[Wallet],
+        at: time::PrimitiveDateTime,
+    ) -> Option<&'a str> {
+        next_to_take(jobs, busy, |_| true, at).map(|index| &*jobs[index].job.id)
+    }
+
+    /// Three jobs on three chains met the reviewer away as it started, and
+    /// waited longer each time they asked; a fourth, queued later, met it
+    /// away fewer times and so had the shortest wait. However the waits fall,
+    /// the jobs are taken in the queue's order: none that met the reviewer
+    /// away asks it again ahead of one queued before it.
+    #[test]
+    fn jobs_put_back_for_the_reviewer_are_taken_in_queue_order_whatever_their_waits() {
+        let start = now();
+        let s = time::Duration::seconds;
+        let author = |byte| Address::repeat_byte(byte);
+        let mut jobs = vec![
+            queued("1", author(1), Chain::Base, Some((start + s(160), false))),
+            queued(
+                "2",
+                author(2),
+                Chain::Robinhood,
+                Some((start + s(163), false)),
+            ),
+            queued(
+                "3",
+                author(3),
+                Chain::Hyperliquid,
+                Some((start + s(158), false)),
+            ),
+            queued("4", author(4), Chain::Base, Some((start + s(40), false))),
+        ];
+        // The latest job's wait ends first, then the third's: neither goes.
+        assert_eq!(taken(&jobs, &[], start + s(41)), None);
+        assert_eq!(taken(&jobs, &[], start + s(159)), None);
+        // The first's ends: it goes, and the rest wait their turn.
+        assert_eq!(taken(&jobs, &[], start + s(160)), Some("1"));
+        jobs.remove(0);
+        assert_eq!(taken(&jobs, &[], start + s(161)), None);
+        assert_eq!(taken(&jobs, &[], start + s(163)), Some("2"));
+        jobs.remove(0);
+        assert_eq!(taken(&jobs, &[], start + s(163)), Some("3"));
+        jobs.remove(0);
+        assert_eq!(taken(&jobs, &[], start + s(163)), Some("4"));
+    }
+
+    /// Once the reviewer has given a verdict it is back, and every job put
+    /// back for it may ask at once, in the queue's order, rather than at the
+    /// end of a wait that grew while it was away.
+    #[tokio::test]
+    async fn once_the_reviewer_gives_a_verdict_the_jobs_waiting_for_it_go_in_queue_order_at_once() {
+        let dir =
+            std::env::temp_dir().join(format!("builder-reviewer-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = a_service(&dir, None);
+        let later = now() + time::Duration::seconds(600);
+        let mut on_its_chain = queued("3", Address::repeat_byte(3), Chain::Hyperliquid, None);
+        on_its_chain.not_before = Some(later);
+        on_its_chain.waits_on_its_chain = true;
+        service.queue.lock().await.jobs = vec![
+            queued(
+                "1",
+                Address::repeat_byte(1),
+                Chain::Base,
+                Some((later, false)),
+            ),
+            queued(
+                "2",
+                Address::repeat_byte(2),
+                Chain::Robinhood,
+                Some((later, false)),
+            ),
+            on_its_chain,
+        ];
+        reviewer_back(&service).await;
+        let jobs = service.queue.lock().await.jobs.clone();
+        assert_eq!(taken(&jobs, &[], now()), Some("1"));
+        assert_eq!(taken(&jobs[1..], &[], now()), Some("2"));
+        // A wait for its own chain's node is not the reviewer's to end.
+        assert_eq!(taken(&jobs[2..], &[], now()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that has not yet asked the reviewer may ask while jobs ahead of
+    /// it wait for it, so trouble the reviewer has with one chain alone
+    /// holds no other chain's jobs.
+    #[test]
+    fn a_job_that_has_not_yet_met_the_reviewer_away_may_ask_while_earlier_ones_wait() {
+        let start = now();
+        let jobs = vec![
+            queued(
+                "1",
+                Address::repeat_byte(1),
+                Chain::Base,
+                Some((start + time::Duration::seconds(600), false)),
+            ),
+            queued("2", Address::repeat_byte(2), Chain::Robinhood, None),
+        ];
+        assert_eq!(taken(&jobs, &[], start), Some("2"));
+    }
+
+    /// A job waiting because its chain's node did not answer holds back the
+    /// jobs behind it on its own chain, and no other chain's.
+    #[test]
+    fn a_job_waiting_on_its_chain_s_node_holds_back_only_its_own_chain() {
+        let start = now();
+        let jobs = vec![
+            queued(
+                "1",
+                Address::repeat_byte(1),
+                Chain::Base,
+                Some((start + time::Duration::seconds(60), true)),
+            ),
+            queued("2", Address::repeat_byte(2), Chain::Base, None),
+            queued("3", Address::repeat_byte(3), Chain::Robinhood, None),
+        ];
+        assert_eq!(taken(&jobs, &[], start), Some("3"));
+        assert_eq!(taken(&jobs[..2], &[], start), None);
+    }
+
+    /// The stated exceptions to the queue's order: an author's next job
+    /// waits while one of theirs is in flight, and a job on a chain not
+    /// connected waits for it; neither holds the jobs behind.
+    #[test]
+    fn only_an_author_s_job_in_flight_or_a_chain_not_connected_lets_a_later_job_go_first() {
+        let busy_author = Address::repeat_byte(1);
+        let jobs = vec![
+            queued("1", busy_author, Chain::Base, None),
+            queued("2", Address::repeat_byte(2), Chain::Robinhood, None),
+            queued("3", Address::repeat_byte(3), Chain::Base, None),
+        ];
+        let at = now();
+        assert_eq!(taken(&jobs, &[], at), Some("1"));
+        assert_eq!(taken(&jobs, &[busy_author.into()], at), Some("2"));
+        let index = next_to_take(&jobs, &[], |chain| chain != Chain::Base, at);
+        assert_eq!(index.map(|index| &*jobs[index].job.id), Some("2"));
+        let index = next_to_take(&jobs[..1], &[], |chain| chain != Chain::Base, at);
+        assert_eq!(index, None);
     }
 }
