@@ -411,6 +411,15 @@ async fn put_linking(
 
 // A run's own steps ---------------------------------------------------------
 
+/// USDC sent to an address on HyperEVM by [`Funder::send_dollars`].
+pub struct DollarsSent {
+    /// The dollars first sent home from the funder's HyperCore balance, if
+    /// its HyperEVM balance was short.
+    pub from_core: Option<f64>,
+    /// The HyperEVM transfer's hash.
+    pub hash: String,
+}
+
 /// The funder, as an account on HyperCore and on HyperEVM.
 pub struct Funder {
     core: HyperCore,
@@ -438,10 +447,6 @@ impl Funder {
         to: Address,
         dollars: f64,
     ) -> Result<()> {
-        let me = self.signer.address();
-        // Through the client's own connection: an endpoint's URL may carry
-        // a key, and an error must never name it.
-        let provider = client.signing_provider(self.signer.clone())?;
         let wanted = U256::from((dollars * 1e6).round() as u64);
         // Someone who already holds it is given nothing more.
         if client
@@ -451,9 +456,33 @@ impl Funder {
         {
             return Ok(());
         }
+        let sent = self.send_dollars(client, to, wanted).await?;
+        tracing::info!(%to, dollars, tx = %sent.hash, "USDC on HyperEVM");
+        Ok(())
+    }
+
+    /// Send `amount` of USDC (in its six-decimal units) to `to` on HyperEVM
+    /// from the funder: from its own HyperEVM balance if that holds it, and
+    /// otherwise sent home from its HyperCore spot balance first (the perp
+    /// side topping the spot side up if it is short).
+    pub async fn send_dollars(
+        &self,
+        client: &Client,
+        to: Address,
+        amount: U256,
+    ) -> Result<DollarsSent> {
+        let me = self.signer.address();
+        // Through the client's own connection: an endpoint's URL may carry
+        // a key, and an error must never name it.
+        let provider = client.signing_provider(self.signer.clone())?;
+        let dollars = u64::try_from(amount)
+            .map_err(|_| anyhow!("{amount} is more USDC than HyperCore holds"))?
+            as f64
+            / 1e6;
         let held = || client.read(USDC, IERC20::balanceOfCall { account: me });
         let before = held().await?;
-        if before < wanted {
+        let mut from_core = None;
+        if before < amount {
             let usdc = self.api.spot_token("USDC").await?;
             let spot = self.api.spot_balance(me, "USDC").await?;
             let short = dollars - spot;
@@ -469,7 +498,7 @@ impl Funder {
                 .context("sending the funder's USDC home to HyperEVM")?;
             let mut landed = false;
             for _ in 0..60 {
-                if held().await? >= before + wanted {
+                if held().await? >= before + amount {
                     landed = true;
                     break;
                 }
@@ -478,13 +507,14 @@ impl Funder {
             if !landed {
                 bail!("the funder's USDC never reached HyperEVM");
             }
+            from_core = Some(dollars);
         }
         let receipt = provider
             .send_transaction(
                 alloy::rpc::types::TransactionRequest::default()
                     .to(USDC)
                     .input(
-                        IERC20::transferCall { to, value: wanted }
+                        IERC20::transferCall { to, value: amount }
                             .abi_encode()
                             .into(),
                     ),
@@ -495,8 +525,10 @@ impl Funder {
         if !receipt.status() {
             bail!("the USDC transfer to {to} reverted");
         }
-        tracing::info!(%to, dollars, tx = %receipt.transaction_hash, "USDC on HyperEVM");
-        Ok(())
+        Ok(DollarsSent {
+            from_core,
+            hash: format!("{:#x}", receipt.transaction_hash),
+        })
     }
 
     /// Fund a station's HyperCore account directly, as far as it isn't

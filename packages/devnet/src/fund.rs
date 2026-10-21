@@ -477,6 +477,27 @@ async fn prepare_hyperevm<P: Provider>(
         let target = funding.target(key, *role).unwrap_or(U256::ZERO);
         is_more_than_dust(*need, target)
     });
+    hype_from_hypercore(funding, &core, api, provider, from, missing, needed).await
+}
+
+/// Bring `missing` HYPE across to the funder on HyperEVM from HyperCore:
+/// what its HyperCore spot balance lacks is bought first, at no more than
+/// the funding file's `max_price` a HYPE and no more than its `max_per_run`
+/// in one run (refused rather than paid over). A purchase under the venue's
+/// smallest order is rounded up to it if `needed`, the extra staying on
+/// HyperCore for later runs, and otherwise left as dust. Waits until the
+/// HYPE lands on HyperEVM.
+pub(crate) async fn hype_from_hypercore<P: Provider>(
+    funding: &Funding,
+    core: &HyperCore,
+    api: &Api,
+    provider: &P,
+    from: Address,
+    missing: f64,
+    needed: bool,
+) -> Result<()> {
+    let settings = &funding.hyperliquid;
+    let held = provider.get_balance(from).await?;
     let hype = api.spot_token("HYPE").await?;
     let pair = hype
         .usdc_pair
@@ -497,13 +518,13 @@ async fn prepare_hyperevm<P: Provider>(
         match hype_purchase(wanted_on_core, ask, hype.sz_decimals, needed) {
             Purchase::Size(size) => to_buy = size,
             Purchase::Dust { worth } => println!(
-                "  funder: the roles are short only dust (${worth:.2} of HYPE, under the venue's ${MIN_ORDER_USD} smallest order): left as it is"
+                "  funder: short only dust (${worth:.2} of HYPE, under the venue's ${MIN_ORDER_USD} smallest order): left as it is"
             ),
         }
     }
     if to_buy > settings.max_per_run {
         bail!(
-            "the roles need {to_buy} HYPE, over the {} a run may buy: raise max_per_run in the funding file, or run it again",
+            "buying {to_buy} HYPE is over the {} a run may buy: raise max_per_run in the funding file, or run it again",
             settings.max_per_run
         );
     }

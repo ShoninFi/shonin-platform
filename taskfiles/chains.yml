@@ -194,7 +194,7 @@ tasks:
         {{if .TRADE_MINUTES}}--trade-minutes {{.TRADE_MINUTES}}{{end}}
 
   fund-wallet:
-    desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the chain's dollar where anyone may mint it (the Robinhood Chain testnet's USDG, by the funder; Circle's USDC comes from its faucet alone), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
+    desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the chain's dollar where anyone may mint it (the Robinhood Chain testnet's USDG, by the funder; Circle's USDC comes from its faucet alone), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve. On the Hyperliquid testnet (HyperEVM) the dollars are HyperEVM's USDC sent home from the funder's HyperCore balance, and the HYPE the funder's HyperEVM balance above its reserve can't cover is bought on HyperCore (at no more than the funding file's max_price) and brought across first; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
     requires:
       vars: [ADDRESS]
     cmds:
