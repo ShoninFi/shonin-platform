@@ -215,7 +215,9 @@ fn parts(loaded: &Loaded) -> (Vec<&Row>, Vec<&ClaimRow>, Vec<&ClaimRow>, Vec<&Ro
 }
 
 /// What the Solana wallet's reading adds to the page's totals. What was
-/// paid in isn't read on Solana, so the totals leave it out.
+/// paid in isn't read on Solana, so it is unknown (`None`): while the
+/// Solana wallet holds shares, the totals' paid-in and gain show as not
+/// known, while its value is added in.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn summary_of(loaded: &Loaded) -> Summary {
     let (positions, open_claims, held_claims, extras) = parts(loaded);

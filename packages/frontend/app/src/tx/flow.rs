@@ -16,7 +16,9 @@
 //!   offered for signing; and the network fee is checked against the coin
 //!   the wallet holds.
 //! - An approval is for exactly the amount being deposited, and only when
-//!   the allowance doesn't already cover it.
+//!   the allowance doesn't already cover it, nor an approval of this
+//!   account's seen mined by an earlier try (its receipt is the evidence,
+//!   until the allowance read at a block at or past its own shows it used).
 //! - The statement is signed over the vault's own list read from the chain,
 //!   and only when that list is the one the review showed (otherwise the
 //!   person is asked to review it again, and nothing is signed); the digest
@@ -39,7 +41,9 @@ use chain::bindings::erc20::IERC20;
 use chain::bindings::vault::IVault;
 
 use super::error::{Revert, TxError};
-use super::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
+use super::port::{
+    Clock, Log, Pending, Reader, Receipt, ReceiptSeen, Signer, StatementRequest, TxRequest,
+};
 use super::read::{self, ClaimState, RequestKind, State, Timers};
 
 /// What the wallet is being asked for, for the panel's wallet step.
@@ -193,6 +197,15 @@ pub struct Pace {
     pub poll_millis: u32,
     /// Polls before a transaction the network never knew is called dropped.
     pub dropped_after: u32,
+    /// Polls in a row, for a transaction signed in the page and sent through
+    /// the endpoint the flow reads, of that endpoint showing its hash
+    /// unknown and its nonce unused, before it is said not taken.
+    pub not_taken_after: u32,
+    /// Polls in a row, once a transaction has been unknown on two looks
+    /// running, of the endpoint showing its nonce used, its hash unknown and
+    /// no receipt for it, before it is said replaced: a node a block behind
+    /// can answer a few reads with no receipt for one that landed.
+    pub replaced_after: u32,
     /// Polls after the price before the app sends the second step itself.
     pub finish_after: u32,
     /// Polls the app's own second step is watched for once sent: briefly,
@@ -206,6 +219,8 @@ impl Pace {
     pub const LIVE: Self = Self {
         poll_millis: 1_000,
         dropped_after: 180,
+        not_taken_after: 60,
+        replaced_after: 5,
         finish_after: 8,
         finish_watch: 60,
         give_up_after: 30 * 60,
@@ -213,6 +228,8 @@ impl Pace {
     pub const FAST: Self = Self {
         poll_millis: 0,
         dropped_after: 5,
+        not_taken_after: 3,
+        replaced_after: 2,
         finish_after: 2,
         finish_watch: 8,
         give_up_after: 200,
@@ -327,7 +344,8 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
 
     /// Hand a transaction to the wallet: simulate (`eth_estimateGas`, so a
     /// send that would revert is refused before the wallet is asked), check
-    /// the network fee against the coin held, [`Self::guard`] again, then
+    /// the network fee against the coin held (unless the signer checks it
+    /// where it signs, [`Signer::checks_fee`]), [`Self::guard`] again, then
     /// ask the wallet. Its hash, once the wallet has handed it on.
     pub(crate) async fn send(
         &self,
@@ -345,11 +363,13 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         let gas = self.reader.estimate_gas(&request).await?;
         // Headroom: the state can move a little between now and the block.
         let gas = gas.saturating_add(gas / 4).saturating_add(10_000);
-        let price = self.reader.gas_price().await?;
-        let need = U256::from(gas).saturating_mul(price);
-        let have = self.reader.native_balance(self.account).await?;
-        if have < need {
-            return Err(TxError::InsufficientGas { need, have });
+        if !self.signer.checks_fee() {
+            let price = self.reader.gas_price().await?;
+            let need = U256::from(gas).saturating_mul(price);
+            let have = self.reader.native_balance(self.account).await?;
+            if have < need {
+                return Err(TxError::InsufficientGas { need, have });
+            }
         }
         request.gas = Some(gas);
 
@@ -364,19 +384,56 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
     /// wallet may have sent it through another), so that is said as "not
     /// seen yet" and watched to the end; and a read that fails is one more
     /// look, never the end of a transaction that may still land.
+    ///
+    /// A transaction signed in the page and sent through the endpoint the
+    /// flow reads ([`Signer::sent_nonce`]) is known by its nonce from the
+    /// start: once that endpoint shows, for [`Pace::not_taken_after`] polls
+    /// in a row, its hash unknown (no receipt, not pending) and its nonce
+    /// unused at "pending" and at "latest", it is said not taken
+    /// ([`TxError::NotTaken`]): the page signs the next send at that same
+    /// nonce while the chain shows it unused, so at most one of them lands.
+    ///
+    /// Replaced is said only after [`Pace::replaced_after`] polls in a row
+    /// each showing the nonce used, the hash unknown and no receipt; any
+    /// other look starts the count again. On each of those polls the
+    /// receipts of the page's other tries at that nonce
+    /// ([`Signer::other_tries`]) are looked for as often as this one's, and a
+    /// poll whose look fails, or whose tries differ from the poll before,
+    /// starts the count again. One found mined is what used the nonce: it is
+    /// said as another try from this page, gone through, refused, or mined
+    /// with an outcome that can't be read ([`TxError::OtherTryMined`]), never
+    /// as this one's outcome. None found: [`TxError::Replaced`].
     pub(crate) async fn mined(&self, hash: B256, prompt: &Prompt) -> Result<Receipt, TxError> {
-        let mut known: Option<u64> = None;
+        let signed_at = self.signer.sent_nonce(hash);
+        let mut known: Option<u64> = signed_at;
         let mut unknown_polls = 0u32;
+        let mut replaced_polls = 0u32;
+        let mut replaced_tries: Vec<B256> = Vec::new();
+        let mut unused_polls = 0u32;
         let mut unseen = false;
         for _ in 0..self.pace.give_up_after {
-            if let Ok(Some(receipt)) = self.reader.receipt(hash).await {
+            let receipt = self.reader.receipt(hash).await;
+            if let Ok(Some(receipt)) = receipt {
                 self.reached(receipt.block).await;
                 return Ok(receipt);
             }
-            match self.reader.pending(hash).await {
+            let pending = self.reader.pending(hash).await;
+            let unused = match (signed_at, &receipt, &pending) {
+                (Some(nonce), Ok(None), Ok(Pending::Unknown)) => {
+                    self.nonce_unused(nonce).await
+                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
+                }
+                _ => false,
+            };
+            unused_polls = if unused { unused_polls + 1 } else { 0 };
+            if unused_polls >= self.pace.not_taken_after.max(1) {
+                return Err(TxError::NotTaken { hash });
+            }
+            match pending {
                 Ok(Pending::Known { nonce }) => {
                     known = Some(nonce);
                     unknown_polls = 0;
+                    replaced_polls = 0;
                     if unseen {
                         unseen = false;
                         self.step(Step::Sent {
@@ -388,19 +445,47 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 }
                 Ok(Pending::Unknown) => {
                     unknown_polls += 1;
-                    // Known once, gone now on two looks running, and its
-                    // nonce used by another: never while the endpoint has
-                    // any receipt for it, even one whose block isn't sealed
-                    // yet (a chain confirming ahead of its blocks counts it
-                    // in the nonce already), asked twice, since a pool of
-                    // nodes can answer one read from a node that hasn't had
-                    // it yet.
-                    if let Some(nonce) = known
-                        && unknown_polls >= 2
-                        && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
-                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
-                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
-                    {
+                    // Unknown on two looks running, its nonce used, and no
+                    // receipt for it, even one whose block isn't sealed yet
+                    // (a chain confirming ahead of its blocks counts it in
+                    // the nonce already), asked twice, since a pool of nodes
+                    // can answer one read from a node that hasn't had it
+                    // yet.
+                    let used = match known {
+                        Some(nonce) => {
+                            unknown_polls >= 2
+                                && matches!(receipt, Ok(None))
+                                && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
+                                && matches!(self.reader.receipt_seen(hash).await, Ok(false))
+                                && matches!(self.reader.receipt_seen(hash).await, Ok(false))
+                        }
+                        None => false,
+                    };
+                    // The page's other tries at the nonce, on the same
+                    // evidence.
+                    let tries = self.signer.other_tries(hash);
+                    let used = used
+                        && match self.other_try_mined(&tries).await {
+                            Ok(None) => true,
+                            Ok(Some((other, seen))) => {
+                                return Err(TxError::OtherTryMined {
+                                    hash: other,
+                                    refused: match seen {
+                                        ReceiptSeen::Reverted => Some(true),
+                                        ReceiptSeen::Succeeded => Some(false),
+                                        ReceiptSeen::Absent | ReceiptSeen::StatusUnread => None,
+                                    },
+                                });
+                            }
+                            Err(_) => false,
+                        };
+                    replaced_polls = match used {
+                        true if replaced_polls > 0 && tries == replaced_tries => replaced_polls + 1,
+                        true => 1,
+                        false => 0,
+                    };
+                    replaced_tries = tries;
+                    if replaced_polls >= self.pace.replaced_after.max(1) {
                         return Err(TxError::Replaced { hash });
                     }
                     if unknown_polls > self.pace.dropped_after && !unseen {
@@ -412,7 +497,7 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                         });
                     }
                 }
-                Err(_) => {}
+                Err(_) => replaced_polls = 0,
             }
             self.clock.sleep(self.pace.poll_millis).await;
         }
@@ -423,6 +508,31 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         } else {
             Err(TxError::Dropped { hash })
         }
+    }
+
+    /// One of `tries` with a receipt, and what that receipt shows. Each
+    /// one's receipt is looked for twice, as the followed send's is on each
+    /// poll; a lookup that fails says nothing.
+    async fn other_try_mined(
+        &self,
+        tries: &[B256],
+    ) -> Result<Option<(B256, ReceiptSeen)>, TxError> {
+        for &other in tries {
+            for _ in 0..2 {
+                let seen = self.reader.receipt_seen_as(other).await?;
+                if seen != ReceiptSeen::Absent {
+                    return Ok(Some((other, seen)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the endpoint shows `nonce` unused by the flow's account, at
+    /// "pending" and at "latest". A read that fails shows it used.
+    async fn nonce_unused(&self, nonce: u64) -> bool {
+        matches!(self.reader.pending_nonce(self.account).await, Ok(pending) if pending <= nonce)
+            && matches!(self.reader.mined_nonce(self.account).await, Ok(latest) if latest <= nonce)
     }
 
     /// Wait, briefly, until the endpoint's latest block is at least `block`,
@@ -439,6 +549,27 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 }
                 _ => return,
             }
+        }
+    }
+
+    /// Wait, briefly, until the endpoint's latest block is at least
+    /// `block`: the block it reported then, or that it stayed behind, or
+    /// that it can't say (no block number, or no answer).
+    async fn head_against(&self, block: u64) -> Reached {
+        let mut behind = false;
+        for _ in 0..self.pace.dropped_after.clamp(1, 30) {
+            match self.reader.block_number().await {
+                Ok(Some(latest)) if latest >= block => return Reached::At(latest),
+                Ok(Some(_)) => behind = true,
+                Ok(None) => return Reached::CantSay,
+                Err(_) => {}
+            }
+            self.clock.sleep(self.pace.poll_millis).await;
+        }
+        if behind {
+            Reached::Behind
+        } else {
+            Reached::CantSay
         }
     }
 
@@ -499,6 +630,55 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
     amount: U256,
     shown: &str,
 ) -> Result<Outcome, TxError> {
+    deposit_after(ctx, amount, shown, None).await
+}
+
+/// Where the endpoint said it is, against a block it was asked to reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reached {
+    /// At or past it: this is the block it reported.
+    At(u64),
+    /// It kept reporting a block before it.
+    Behind,
+    /// It reported no block number, or didn't answer.
+    CantSay,
+}
+
+/// Why a known approval couldn't be checked against the allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unchecked {
+    /// The endpoint reported a block before the approval's.
+    Behind,
+    /// The endpoint couldn't say where it is, or couldn't read at the block
+    /// it reported.
+    CantSay,
+}
+
+/// An approval to the vault seen mined for this account: its amount and
+/// the block it was mined in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Approval {
+    pub amount: U256,
+    pub block: u64,
+}
+
+/// [`deposit`], after an approval (`known`) to the vault was seen mined for
+/// this account by an earlier deposit that then stopped
+/// ([`TxError::ApprovalStands`]). Its receipt is evidence that the allowance
+/// stands as of its block: when it covers the amount, a second approval is
+/// asked for only once the allowance read at a block the endpoint reported,
+/// at or past the approval's, shows it short (it was used since). A short
+/// read at the latest block proves nothing (a node of the endpoint may lag
+/// behind the one that reported the block), nor does an endpoint that hasn't
+/// reached the block, can't say where it is, or errs reading at it: the
+/// deposit goes ahead on the approval, and the vault's simulation still
+/// checks it before the wallet is asked.
+pub async fn deposit_after<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    amount: U256,
+    shown: &str,
+    known: Option<Approval>,
+) -> Result<Outcome, TxError> {
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
     if amount.is_zero() {
@@ -518,6 +698,12 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
         return Err(TxError::InsufficientBalance { have });
     }
 
+    // The list the review showed is the vault's, whether or not a statement
+    // for it is on record: the person confirms only what they were shown.
+    let restricted = read::restricted_text(ctx.reader, ctx.vault).await?;
+    if restricted != shown {
+        return Err(TxError::ListChanged { now: restricted });
+    }
     // The statement, over the vault's own list, only if it isn't recorded
     // for the list as it stands.
     let statement = if read::has_statement(ctx.reader, ctx.vault, ctx.account).await? {
@@ -526,20 +712,59 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
         sign_statement(ctx, shown).await?
     };
 
-    // Exactly the amount, and only if needed.
-    let allowed = read::allowance(ctx.reader, ctx.asset, ctx.account, ctx.vault).await?;
-    let approving = allowed < amount;
-    if approving {
-        ctx.transact(
-            Prompt::Approve { amount },
-            ctx.asset,
-            IERC20::approveCall {
-                spender: ctx.vault,
-                value: amount,
+    // Exactly the amount, and only if needed: not when an approval seen
+    // mined covers it, unless the allowance read at a block at or past the
+    // approval's shows it short.
+    let known = known.filter(|known| known.amount >= amount);
+    let mut allowed = read::allowance(ctx.reader, ctx.asset, ctx.account, ctx.vault).await?;
+    // Only a read at a block the endpoint reported, at or past the known
+    // approval's, showing it short is evidence it was used.
+    let mut unchecked = None;
+    // The read at the latest block was short while the one at the reported
+    // block covers: the endpoint's latest state lags behind its head.
+    let mut latest_lags = false;
+    if let Some(known) = known
+        && allowed < amount
+    {
+        match ctx.head_against(known.block).await {
+            Reached::At(block) => {
+                match read::allowance_at(ctx.reader, ctx.asset, ctx.account, ctx.vault, block).await
+                {
+                    Ok(at) => {
+                        latest_lags = at >= amount;
+                        allowed = at;
+                    }
+                    // No answer at that block is no evidence either way.
+                    Err(_) => unchecked = Some(Unchecked::CantSay),
+                }
             }
-            .abi_encode(),
-        )
-        .await?;
+            Reached::Behind => unchecked = Some(Unchecked::Behind),
+            Reached::CantSay => unchecked = Some(Unchecked::CantSay),
+        }
+    }
+    let approving = allowed < amount && unchecked.is_none();
+    // The approval that stands if the deposit then stops: this try's, or
+    // the one known, at its own amount.
+    let mut stands = known.filter(|_| !approving);
+    if approving {
+        let receipt = ctx
+            .transact(
+                Prompt::Approve { amount },
+                ctx.asset,
+                IERC20::approveCall {
+                    spender: ctx.vault,
+                    value: amount,
+                }
+                .abi_encode(),
+            )
+            .await?;
+        // The approval is the flow's account's only when its receipt says
+        // that account sent it: one sent from any other account (or a
+        // receipt that doesn't say) isn't kept as this account's.
+        stands = (receipt.from == Some(ctx.account)).then_some(Approval {
+            amount,
+            block: receipt.block,
+        });
     }
 
     let receipt = ctx
@@ -556,18 +781,42 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
         .await
         .map_err(|then| {
             // The approval was mined and the deposit stopped before it was
-            // sent: the approval stands, and depositing again uses it. Not
-            // said when the wallet left the account that approved: the
-            // approval is that account's, and the one now connected would
-            // be asked for its own.
+            // sent: the approval stands, and depositing again uses it. When
+            // the wallet left the account that approved, the approval is
+            // still that account's: one this try sent is carried with the
+            // stop so it is remembered for that account, and one known from
+            // an earlier try stays remembered as it was.
             let left = matches!(then, TxError::AccountChanged | TxError::NotConnected);
-            if approving && !then.may_have_moved() && !left {
-                TxError::ApprovalStands {
-                    amount,
+            match stands {
+                Some(approval) if left && approving => TxError::ApprovalStands {
+                    amount: approval.amount,
+                    block: approval.block,
+                    sent: true,
                     then: Box::new(then),
+                },
+                Some(approval) if !then.may_have_moved() && !left => {
+                    // Refused, for want of an allowance or for no reason
+                    // given, by an endpoint that reported a block before the
+                    // approval's, or whose latest state read the allowance
+                    // short while its reported block has it: it can't see
+                    // the approval yet. Any other refusal, or one from an
+                    // endpoint that can't say where it is, is the vault's
+                    // own.
+                    let behind = unchecked == Some(Unchecked::Behind) || latest_lags;
+                    let then = match then {
+                        TxError::WouldRevert { reason } if behind && reason.may_be_allowance() => {
+                            TxError::NotCaughtUp
+                        }
+                        then => then,
+                    };
+                    TxError::ApprovalStands {
+                        amount: approval.amount,
+                        block: approval.block,
+                        sent: approving,
+                        then: Box::new(then),
+                    }
                 }
-            } else {
-                then
+                _ => then,
             }
         })?;
     follow(ctx, &receipt, RequestKind::Deposit, amount, &figures.timers).await

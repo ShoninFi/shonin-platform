@@ -799,6 +799,7 @@ impl Signer for SimWallet {
             hash,
             Receipt {
                 hash,
+                from: Some(request.from),
                 success,
                 block,
                 logs,
@@ -1050,6 +1051,7 @@ fn an_account_switched_after_the_approval_stops_the_payment_before_it_is_sent() 
     assert!(world.sim.borrow().submissions.is_empty());
     let words = error.words(&crate::tx::error::Context {
         wallet: "MetaMask",
+        keeps_activity: true,
         chain: "Base",
         wallet_chain: None,
         symbol: "USDC",

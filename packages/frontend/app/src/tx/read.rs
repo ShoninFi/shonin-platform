@@ -257,6 +257,23 @@ pub async fn allowance<R: Reader>(
     read(reader, asset, IERC20::allowanceCall { owner, spender }).await
 }
 
+/// The allowance as of block `block`: an error from a node that doesn't
+/// have that block yet.
+pub async fn allowance_at<R: Reader>(
+    reader: &R,
+    asset: Address,
+    owner: Address,
+    spender: Address,
+    block: u64,
+) -> Result<U256, TxError> {
+    let call = IERC20::allowanceCall { owner, spender };
+    let answer = reader
+        .call_at(asset, Bytes::from(call.abi_encode()), block)
+        .await?;
+    IERC20::allowanceCall::abi_decode_returns(&answer)
+        .map_err(|_| TxError::Network("the chain answered in an unexpected shape".to_string()))
+}
+
 /// The vault's restricted list as it writes it (`SANCTIONED,US`): what the
 /// deposit statement is signed over, and what the deposit's review shows.
 pub async fn restricted_text<R: Reader>(reader: &R, vault: Address) -> Result<String, TxError> {

@@ -591,6 +591,7 @@ impl Signer for SimWallet {
             hash,
             Receipt {
                 hash,
+                from: Some(request.from),
                 success,
                 block,
                 logs,
@@ -603,6 +604,7 @@ impl Signer for SimWallet {
 fn context() -> Context<'static> {
     Context {
         wallet: "MetaMask",
+        keeps_activity: true,
         chain: "Base",
         wallet_chain: None,
         symbol: "USDC",

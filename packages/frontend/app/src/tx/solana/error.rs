@@ -407,6 +407,7 @@ mod tests {
     fn a_rejection_says_nothing_was_sent_and_is_not_an_alert() {
         let context = Context {
             wallet: "Phantom",
+            keeps_activity: true,
             chain: "Solana devnet",
             wallet_chain: None,
             symbol: "USDC",
@@ -428,6 +429,7 @@ mod tests {
     fn what_may_have_landed_or_may_still_is_never_said_as_nothing_sent_nor_offered_again() {
         let context = Context {
             wallet: "Phantom",
+            keeps_activity: true,
             chain: "Solana devnet",
             wallet_chain: None,
             symbol: "USDC",

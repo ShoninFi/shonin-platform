@@ -109,7 +109,10 @@ fn devnet_at(decimals: u8, mint: u8, block: u64, as_of: [u32; 6]) -> String {
 fn said(error: &TxError) -> String {
     let words = app::components::exit::error_words(
         error,
-        "MetaMask",
+        &app::wallet::Sender {
+            name: "MetaMask".to_string(),
+            keeps_activity: true,
+        },
         "Base Sepolia",
         None,
         "USDC",

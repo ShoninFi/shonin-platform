@@ -1300,6 +1300,7 @@ pub fn sol_error_words(error: &SolError, network: Option<&SolNetwork>) -> Words 
         } else {
             &wallet
         },
+        keeps_activity: session.is_browser(),
         chain: &chain,
         wallet_chain: None,
         symbol: &symbol,

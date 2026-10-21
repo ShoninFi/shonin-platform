@@ -108,6 +108,18 @@ struct Chain {
     /// The endpoint refuses to simulate a deposit request, for no reason it
     /// gives (as one that hasn't seen a just-mined approval yet would).
     refuses_deposit: bool,
+    /// The reason it gives when it refuses one.
+    deposit_refusal: Revert,
+    /// The endpoint answers every allowance read from a node that hasn't
+    /// seen any approval yet.
+    allowance_lags: bool,
+    /// How many blocks behind the chain the endpoint says its latest block
+    /// is; `None`: it can't say.
+    blocks_behind: Option<u64>,
+    /// Every read at a given block fails (the node asked lacks the block).
+    reads_at_block_fail: bool,
+    /// The wallet checks the network fee itself where it signs.
+    wallet_checks_fee: bool,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -174,6 +186,11 @@ impl World {
             receipt_looks: 0,
             request_looks: 0,
             refuses_deposit: false,
+            deposit_refusal: Revert::Unknown,
+            allowance_lags: false,
+            blocks_behind: None,
+            reads_at_block_fail: false,
+            wallet_checks_fee: false,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -368,6 +385,9 @@ impl Chain {
                 }
                 IERC20::allowanceCall::SELECTOR => {
                     let call = IERC20::allowanceCall::abi_decode(data).unwrap();
+                    if self.allowance_lags {
+                        return ok(U256::ZERO);
+                    }
                     ok(self
                         .allowance
                         .get(&(call.owner, call.spender))
@@ -685,6 +705,7 @@ impl Chain {
             hash,
             Receipt {
                 hash,
+                from: Some(request.from),
                 success,
                 block,
                 logs,
@@ -699,6 +720,19 @@ impl Reader for SimReader {
     }
     async fn call(&self, to: Address, data: Bytes) -> Result<Bytes, TxError> {
         self.0.borrow_mut().call(to, &data)
+    }
+    /// A read at a block the chain has reached is answered by a node that
+    /// has it, so a lagging allowance read doesn't apply; past the chain's
+    /// block, or on a node without the block, it fails.
+    async fn call_at(&self, to: Address, data: Bytes, block: u64) -> Result<Bytes, TxError> {
+        let mut sim = self.0.borrow_mut();
+        if block > sim.block || sim.reads_at_block_fail {
+            return Err(TxError::Network("header not found".to_string()));
+        }
+        let lags = std::mem::replace(&mut sim.allowance_lags, false);
+        let answer = sim.call(to, &data);
+        sim.allowance_lags = lags;
+        answer
     }
     async fn native_balance(&self, who: Address) -> Result<U256, TxError> {
         Ok(self
@@ -715,7 +749,7 @@ impl Reader for SimReader {
         if request.data[..4] == IVault::requestDepositCall::SELECTOR {
             if sim.refuses_deposit {
                 return Err(TxError::WouldRevert {
-                    reason: Revert::Unknown,
+                    reason: sim.deposit_refusal.clone(),
                 });
             }
             let call = IVault::requestDepositCall::abi_decode(&request.data).unwrap();
@@ -751,6 +785,12 @@ impl Reader for SimReader {
     }
     async fn chain_time(&self) -> Result<u64, TxError> {
         Ok(self.0.borrow().time)
+    }
+    async fn block_number(&self) -> Result<Option<u64>, TxError> {
+        let sim = self.0.borrow();
+        Ok(sim
+            .blocks_behind
+            .map(|behind| sim.block.saturating_sub(behind)))
     }
     async fn block_time(&self, _block: u64) -> Result<u64, TxError> {
         Ok(self.0.borrow().time)
@@ -792,6 +832,9 @@ impl Signer for SimWallet {
     }
     async fn chain_id(&self) -> Result<u64, TxError> {
         Ok(self.sim.borrow().wallet_chain)
+    }
+    fn checks_fee(&self) -> bool {
+        self.sim.borrow().wallet_checks_fee
     }
     async fn sign_statement(&self, statement: &StatementRequest) -> Result<Bytes, TxError> {
         let mut sim = self.sim.borrow_mut();
@@ -916,14 +959,14 @@ fn a_deposit_refused_after_its_approval_was_mined_says_the_approval_stands_and_r
     let Err(error) = result else {
         panic!("{result:?}");
     };
-    assert_eq!(
-        error,
-        TxError::ApprovalStands {
-            amount: amount(1_000),
-            then: Box::new(TxError::WouldRevert {
-                reason: Revert::Unknown
-            }),
-        }
+    assert!(
+        matches!(
+            &error,
+            TxError::ApprovalStands { amount: approved, sent: true, then, .. }
+                if *approved == amount(1_000)
+                    && **then == TxError::WouldRevert { reason: Revert::Unknown }
+        ),
+        "{error:?}"
     );
     // Only the approval was sent.
     assert_eq!(world.sent_selectors(), vec![IERC20::approveCall::SELECTOR]);
@@ -954,6 +997,294 @@ fn a_deposit_refused_after_its_approval_was_mined_says_the_approval_stands_and_r
             .iter()
             .any(|prompt| matches!(prompt, Prompt::Approve { .. }))
     );
+}
+
+#[test]
+fn trying_again_after_a_mined_approval_never_approves_again_when_the_node_reads_the_allowance_short()
+ {
+    let world = World::new();
+    world.with(|chain| chain.refuses_deposit = true);
+    let (result, _) = deposit(&world, 1_000);
+    let Err(TxError::ApprovalStands {
+        amount: approved,
+        block,
+        ..
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    let approved = flow::Approval {
+        amount: approved,
+        block,
+    };
+    // The next look lands on a node that hasn't seen the approval.
+    world.with(|chain| {
+        chain.refuses_deposit = false;
+        chain.allowance_lags = true;
+    });
+    let shown = world.sim.borrow().restricted_text.clone();
+    let (result, steps) = world.run(move |ctx| {
+        Box::pin(
+            async move { flow::deposit_after(ctx, amount(1_000), &shown, Some(approved)).await },
+        )
+    });
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(
+        !prompts(&steps)
+            .iter()
+            .any(|prompt| matches!(prompt, Prompt::Approve { .. })),
+        "{steps:?}"
+    );
+    assert_eq!(
+        world.sent_selectors(),
+        vec![
+            IERC20::approveCall::SELECTOR,
+            IVault::requestDepositCall::SELECTOR
+        ]
+    );
+}
+
+#[test]
+fn a_mined_approval_smaller_than_the_deposit_is_not_taken_as_covering_it() {
+    let world = World::new();
+    let shown = world.sim.borrow().restricted_text.clone();
+    let (result, steps) = world.run(move |ctx| {
+        Box::pin(async move {
+            let known = flow::Approval {
+                amount: amount(500),
+                block: 100,
+            };
+            flow::deposit_after(ctx, amount(1_000), &shown, Some(known)).await
+        })
+    });
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(prompts(&steps).contains(&Prompt::Approve {
+        amount: amount(1_000)
+    }));
+}
+
+/// A deposit on an approval of $1,000 known mined in the block after the
+/// chain's latest (as an endpoint behind it sees it).
+fn deposit_on_known(world: &World, dollars: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
+    let shown = world.sim.borrow().restricted_text.clone();
+    let block = world.sim.borrow().block + 1;
+    world.run(move |ctx| {
+        Box::pin(async move {
+            let known = flow::Approval {
+                amount: amount(1_000),
+                block,
+            };
+            flow::deposit_after(ctx, amount(dollars), &shown, Some(known)).await
+        })
+    })
+}
+
+/// A deposit on a known approval of $1,000, refused by the vault for
+/// `reason`, through an endpoint whose latest allowance read lags and that
+/// reports its block `behind` the chain's (`None`: it can't say).
+fn refused_on_known(
+    behind: Option<u64>,
+    reason: Revert,
+) -> (Result<Outcome, TxError>, Vec<Step>, World) {
+    let world = World::new();
+    world.with(|chain| {
+        chain.refuses_deposit = true;
+        chain.deposit_refusal = reason;
+        chain.allowance_lags = true;
+        chain.blocks_behind = behind;
+    });
+    let (result, steps) = deposit_on_known(&world, 500);
+    (result, steps, world)
+}
+
+#[test]
+fn a_known_approval_refused_by_a_node_that_reports_a_block_before_its_own_is_said_to_stand_while_the_network_catches_up()
+ {
+    // The endpoint reports a block before the approval's: its short read and
+    // its refusal prove nothing about the approval.
+    let (result, steps, world) = refused_on_known(Some(5), Revert::Unknown);
+    assert!(
+        matches!(
+            &result,
+            Err(TxError::ApprovalStands { amount: approved, sent: false, then, .. })
+                if *approved == amount(1_000) && **then == TxError::NotCaughtUp
+        ),
+        "{result:?}"
+    );
+    assert!(
+        !prompts(&steps)
+            .iter()
+            .any(|prompt| matches!(prompt, Prompt::Approve { .. } | Prompt::Deposit { .. })),
+        "{steps:?}"
+    );
+    assert!(world.sent_selectors().is_empty());
+}
+
+#[test]
+fn a_known_approval_refused_through_an_endpoint_that_cant_say_its_block_is_said_as_the_vaults_refusal_and_stands()
+ {
+    // No block number to wait for: after the wait, the vault's refusal is
+    // said as it is, never "not caught up", and the approval stands.
+    let (result, steps, world) = refused_on_known(None, Revert::Unknown);
+    assert!(
+        matches!(
+            &result,
+            Err(TxError::ApprovalStands { amount: approved, sent: false, then, .. })
+                if *approved == amount(1_000)
+                    && **then == TxError::WouldRevert { reason: Revert::Unknown }
+        ),
+        "{result:?}"
+    );
+    assert!(
+        !prompts(&steps)
+            .iter()
+            .any(|prompt| matches!(prompt, Prompt::Approve { .. } | Prompt::Deposit { .. })),
+        "{steps:?}"
+    );
+    assert!(world.sent_selectors().is_empty());
+}
+
+#[test]
+fn a_known_approval_refused_for_a_reason_other_than_its_allowance_is_said_as_that_reason() {
+    // Behind the approval's block, but the vault said why, and it isn't the
+    // allowance: that reason is said.
+    let (result, _, _) = refused_on_known(Some(5), Revert::Vault("TooSmall"));
+    assert!(
+        matches!(
+            &result,
+            Err(TxError::ApprovalStands { sent: false, then, .. })
+                if **then == TxError::WouldRevert { reason: Revert::Vault("TooSmall") }
+        ),
+        "{result:?}"
+    );
+    // A token's message about its allowance is the approval not seen yet.
+    let (result, _, _) = refused_on_known(
+        Some(5),
+        Revert::Message("ERC20: insufficient allowance".to_string()),
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(TxError::ApprovalStands { then, .. }) if **then == TxError::NotCaughtUp
+        ),
+        "{result:?}"
+    );
+}
+
+/// A deposit of $1,000 on a known approval of $1,000 mined in the chain's
+/// latest block, through an endpoint that reports that block.
+fn deposit_on_known_at_head(world: &World) -> (Result<Outcome, TxError>, Vec<Step>) {
+    world.with(|chain| chain.blocks_behind = Some(0));
+    let block = world.sim.borrow().block;
+    let shown = world.sim.borrow().restricted_text.clone();
+    world.run(move |ctx| {
+        Box::pin(async move {
+            let known = flow::Approval {
+                amount: amount(1_000),
+                block,
+            };
+            flow::deposit_after(ctx, amount(1_000), &shown, Some(known)).await
+        })
+    })
+}
+
+#[test]
+fn a_known_approval_read_short_at_a_block_at_or_past_its_own_is_approved_again_and_a_short_latest_read_isnt_evidence()
+ {
+    let approves = |steps: &[Step]| {
+        prompts(steps).contains(&Prompt::Approve {
+            amount: amount(1_000),
+        })
+    };
+    // Read at the block the endpoint reported, at or past the approval's,
+    // the allowance is short: the approval was used since, so it is asked
+    // for again.
+    let world = World::new();
+    let (_, steps) = deposit_on_known_at_head(&world);
+    assert!(approves(&steps), "{steps:?}");
+
+    // The approval stands on the chain; only the read at the latest block
+    // (a node of the endpoint that lags) shows it short: no second approval.
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.allowance.insert((account, vault()), amount(1_000));
+        chain.allowance_lags = true;
+    });
+    let (_, steps) = deposit_on_known_at_head(&world);
+    assert!(!approves(&steps), "{steps:?}");
+    assert_eq!(
+        world.sent_selectors(),
+        vec![IVault::requestDepositCall::SELECTOR]
+    );
+
+    // The node asked at that block doesn't have it: no evidence either way,
+    // so the deposit goes ahead on the approval, still simulated.
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.allowance.insert((account, vault()), amount(1_000));
+        chain.allowance_lags = true;
+        chain.reads_at_block_fail = true;
+    });
+    let (_, steps) = deposit_on_known_at_head(&world);
+    assert!(!approves(&steps), "{steps:?}");
+    assert_eq!(
+        world.sent_selectors(),
+        vec![IVault::requestDepositCall::SELECTOR]
+    );
+}
+
+#[test]
+fn a_known_approval_refused_while_only_the_latest_read_lags_behind_the_reported_block_is_said_not_caught_up()
+ {
+    // At the reported block the approval covers the deposit; the latest
+    // state (the simulation's too) lags behind it and refuses.
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.allowance.insert((account, vault()), amount(1_000));
+        chain.allowance_lags = true;
+        chain.refuses_deposit = true;
+    });
+    let (result, _) = deposit_on_known_at_head(&world);
+    let Err(error) = result else {
+        panic!("{result:?}");
+    };
+    assert!(
+        matches!(
+            &error,
+            TxError::ApprovalStands { sent: false, then, .. } if **then == TxError::NotCaughtUp
+        ),
+        "{error:?}"
+    );
+    assert!(world.sent_selectors().is_empty());
+}
+
+#[test]
+fn a_known_approval_read_covering_and_still_refused_is_said_to_stand_as_the_vaults_refusal() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.allowance.insert((account, vault()), amount(1_000));
+        chain.refuses_deposit = true;
+    });
+    let (result, _) = deposit_on_known(&world, 1_000);
+    assert!(
+        matches!(
+            &result,
+            Err(TxError::ApprovalStands { sent: false, then, .. })
+                if matches!(**then, TxError::WouldRevert { .. })
+        ),
+        "{result:?}"
+    );
+    assert!(world.sent_selectors().is_empty());
 }
 
 #[test]
@@ -1159,6 +1490,28 @@ fn a_second_deposit_needs_no_statement_and_no_approval_when_the_allowance_covers
 }
 
 #[test]
+fn a_list_changed_since_the_review_stops_the_deposit_even_with_a_statement_on_record_for_it() {
+    // The account stated for the vault's list as it is now, elsewhere; this
+    // review showed an older list.
+    let world = World::new();
+    let account = world.account();
+    let hash = keccak256(world.sim.borrow().restricted.abi_encode());
+    world.with(|chain| {
+        chain.statement_of.insert(account, hash);
+        chain.allowance.insert((account, vault()), amount(5_000));
+    });
+    let (result, steps) = deposit_shown(&world, 1_000, "SANCTIONED");
+    assert_eq!(
+        result,
+        Err(TxError::ListChanged {
+            now: "SANCTIONED,US".to_string()
+        })
+    );
+    assert!(prompts(&steps).is_empty(), "{steps:?}");
+    assert!(world.sent_selectors().is_empty());
+}
+
+#[test]
 fn a_statement_signed_for_an_older_list_is_signed_again() {
     let world = World::new();
     let account = world.account();
@@ -1253,6 +1606,22 @@ fn no_coin_for_the_network_fee_is_said_before_the_wallet_is_asked() {
             .any(|p| matches!(p, Prompt::Approve { .. } | Prompt::Deposit { .. }))
     );
     assert!(world.sim.borrow().sent.is_empty());
+}
+
+#[test]
+fn a_wallet_that_checks_the_fee_where_it_signs_is_left_that_check() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.native.insert(account, U256::from(1u8));
+        chain.wallet_checks_fee = true;
+    });
+    let (result, _) = deposit(&world, 1_000);
+    assert!(
+        !matches!(result, Err(TxError::InsufficientGas { .. })),
+        "{result:?}"
+    );
+    assert!(!world.sim.borrow().sent.is_empty());
 }
 
 #[test]
@@ -1583,6 +1952,7 @@ fn a_cancelled_flow_sends_nothing() {
 fn context() -> super::error::Context<'static> {
     super::error::Context {
         wallet: "MetaMask",
+        keeps_activity: true,
         chain: "Base",
         wallet_chain: Some("Hyperliquid"),
         symbol: "USDC",

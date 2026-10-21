@@ -311,17 +311,19 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
         self.guard()?;
         self.step(Step::Signing(prompt.clone()));
         let signed = self.signer.sign(&unsigned, &self.cluster.chain).await?;
-        // A late answer for a flow cancelled meanwhile (or built for an
-        // account the wallet has since left) is never sent on.
-        if self.signer.account() != Some(self.account) {
-            return Err(SolError::AccountChanged);
-        }
-        if self.cancel.is_cancelled() {
-            return Err(SolError::Cancelled);
-        }
         let (signature, expiry) = match signed {
+            // The wallet broadcast it itself: it is out, whatever happened
+            // to the flow or the account meanwhile, so it is followed.
             Signed::Sent(signature) => (signature, blockhash.last_valid + WALLET_SENT_MARGIN),
             Signed::Wire(wire) => {
+                // A late answer for a flow cancelled meanwhile (or built for
+                // an account the wallet has since left) is never sent on.
+                if self.signer.account() != Some(self.account) {
+                    return Err(SolError::AccountChanged);
+                }
+                if self.cancel.is_cancelled() {
+                    return Err(SolError::Cancelled);
+                }
                 let signature = check_signed(&wire, &unsigned, &self.account)?;
                 match self.reader.send(&wire).await {
                     // Whatever the node names, the transaction sent is the
@@ -774,7 +776,26 @@ pub async fn deposit<R: SolReader, S: SolSigner, C: Clock>(
                 nonce,
             )],
         )
-        .await?;
+        .await;
+    let landed = match landed {
+        // Refused before the wallet was asked for want of a statement for
+        // the vault's list: the list changed after it was read. The review
+        // is shown again with the list as it is now, the amount kept.
+        Err(SolError::WouldFail {
+            reason: Reason::Vault("NoStatement"),
+        }) => {
+            let now = restricted(ctx.reader, &ctx.vault).await?;
+            let hash = read::restricted_hash(&now);
+            let vault_now = ctx.load().await?.vault.restricted_hash;
+            if hash != shown || hash != vault_now {
+                return Err(SolError::ListChanged { now });
+            }
+            return Err(SolError::WouldFail {
+                reason: Reason::Vault("NoStatement"),
+            });
+        }
+        landed => landed?,
+    };
     let request = request_at(ctx.reader, &ctx.vault, &at)
         .await
         .map_err(|error| pending(landed.signature, error))?

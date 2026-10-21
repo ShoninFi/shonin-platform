@@ -149,8 +149,15 @@ impl AuthorError {
             ),
             Self::PaymentMismatch => alert(
                 "The payment's record didn't match",
-                "The chain recorded a payment, but not for this upload from this wallet. Check your wallet's activity before paying again."
-                    .to_string(),
+                if context.keeps_activity {
+                    "The chain recorded a payment, but not for this upload from this wallet. Check your wallet's activity before paying again."
+                        .to_string()
+                } else {
+                    format!(
+                        "The chain recorded a payment, but not for this upload from this wallet. Check your address on the {} explorer before paying again.",
+                        context.chain
+                    )
+                },
             ),
             Self::WrongPayer { uploader, approved } => {
                 let uploader = crate::format::short_hash(&format!("{uploader:?}"));
@@ -178,15 +185,21 @@ impl AuthorError {
                     TxError::Stuck { .. } => {
                         "Your payment was sent and still isn't mined after a long wait.".to_string()
                     }
-                    TxError::Replaced { .. } => format!(
+                    TxError::Replaced { .. } if context.keeps_activity => format!(
                         "Another transaction took your payment's place in {wallet}: it may have been sped up or cancelled."
                     ),
+                    TxError::Replaced { .. } => "Another transaction from this address used your payment's nonce. It may be an earlier try of this same payment, from this tab or another.".to_string(),
                     _ => "Your payment was sent and hasn't been seen mined.".to_string(),
+                };
+                let look = if context.keeps_activity {
+                    format!("Check the activity in {wallet}")
+                } else {
+                    format!("Check your address on the {} explorer", context.chain)
                 };
                 alert(
                     "Your payment may still go through",
                     format!(
-                        "{seen} It may still land. Check {wallet}'s activity, then check the chain for it here before paying again."
+                        "{seen} It may still land. {look}, then check the chain for it here before paying again."
                     ),
                 )
             }
@@ -196,33 +209,39 @@ impl AuthorError {
                 then,
             } => {
                 use super::flow::Spender;
-                let (step, title, to, again) = match spender {
+                let (step, title, to, again, noun) = match spender {
                     Spender::Factory => (
                         "The activation wasn't sent.",
                         "Not activated: your approval stands",
                         "the vault factory",
                         "activating again with a {amount} tank uses it, without asking for it again; another tank replaces it with an approval of exactly that tank.",
+                        "activation",
                     ),
                     Spender::Vault => (
                         "The top-up wasn't sent.",
                         "Not topped up: your approval stands",
                         "the vault",
                         "topping up {amount} again uses it, without asking for it again; another amount replaces it with an approval of exactly that amount.",
+                        "top-up",
                     ),
                     Spender::Publishing => (
                         "The payment wasn't sent.",
                         "Not paid: your approval stands",
                         "the publishing contract",
                         "paying again uses it, without asking for it again.",
+                        "payment",
                     ),
                 };
                 let words = then.words(context);
                 // The inner words say nothing moved; the approval did.
-                let reason = ["Nothing was sent.", "No money moved and no request was made."]
-                    .iter()
-                    .find_map(|said| words.text.strip_suffix(said))
-                    .map(|text| format!("{text}{step}"))
-                    .unwrap_or(words.text);
+                let reason = crate::tx::error::refused_after_approval(&words.text, noun)
+                    .unwrap_or_else(|| {
+                        ["Nothing was sent.", "No money moved and no request was made."]
+                            .iter()
+                            .find_map(|said| words.text.strip_suffix(said))
+                            .map(|text| format!("{text}{step}"))
+                            .unwrap_or(words.text)
+                    });
                 // The fee is said in the dollar's own name, as the publish
                 // page says it.
                 let amount = match spender {
@@ -308,12 +327,48 @@ mod tests {
     fn context() -> Context<'static> {
         Context {
             wallet: "MetaMask",
+            keeps_activity: true,
             chain: "Base",
             wallet_chain: None,
             symbol: "USDC",
             decimals: 6,
             native: "ETH",
         }
+    }
+
+    /// A payment from a wallet that signs in the page whose record didn't
+    /// match, or whose place another transaction took, points to the
+    /// explorer: such a wallet keeps no activity list, and the other
+    /// transaction came from elsewhere.
+    #[test]
+    fn a_payment_from_a_wallet_in_the_page_never_points_to_an_activity_list() {
+        let context = Context {
+            wallet: crate::wallet::PHRASE_WALLET,
+            keeps_activity: false,
+            ..context()
+        };
+        let words = AuthorError::PaymentMismatch.words(&context);
+        assert!(!words.text.contains("activity"), "{}", words.text);
+        assert!(words.text.contains("Base explorer"), "{}", words.text);
+        let words = AuthorError::PaymentUnsure {
+            upload: alloy_primitives::B256::ZERO,
+            since: U256::ZERO,
+            then: Box::new(TxError::Replaced {
+                hash: alloy_primitives::B256::repeat_byte(7),
+            }),
+        }
+        .words(&context);
+        assert!(!words.text.contains("activity"), "{}", words.text);
+        assert!(
+            !words.text.contains(crate::wallet::PHRASE_WALLET),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("used your payment's nonce"),
+            "{}",
+            words.text
+        );
     }
 
     #[test]
@@ -327,6 +382,38 @@ mod tests {
             "The starting tank must be at least $10.00. Nothing was sent."
         );
         assert!(words.alert);
+    }
+
+    #[test]
+    fn a_step_refused_when_mined_after_its_approval_says_both_network_fees_were_paid() {
+        use super::super::flow::Spender;
+        for (spender, step) in [
+            (Spender::Factory, "the refused activation"),
+            (Spender::Vault, "the refused top-up"),
+            (Spender::Publishing, "the refused payment"),
+        ] {
+            let words = AuthorError::ApprovalStands {
+                spender,
+                amount: U256::from(10_000_000u64),
+                then: Box::new(AuthorError::Tx(TxError::Reverted {
+                    hash: alloy_primitives::B256::repeat_byte(7),
+                    reason: None,
+                })),
+            }
+            .words(&context());
+            assert!(
+                !words.text.contains("except the network fee"),
+                "{}",
+                words.text
+            );
+            assert!(
+                words.text.contains(&format!(
+                    "No money moved. Two network fees were paid: one for the approval and one for {step}."
+                )),
+                "{}",
+                words.text
+            );
+        }
     }
 
     #[test]

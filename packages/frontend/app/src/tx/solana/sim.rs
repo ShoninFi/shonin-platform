@@ -359,6 +359,12 @@ enum Answer {
     SignAfterCancel,
     /// The person switches account in the wallet, and the old one signs.
     SignAfterSwitch,
+    /// Signs and sends it itself, and the flow is cancelled (the account
+    /// changed) while the wallet's answer is on its way.
+    SendThenCancel,
+    /// Signs and sends it itself, and the person switches account before
+    /// the wallet's answer arrives.
+    SendThenSwitch,
 }
 
 struct Cluster0 {
@@ -381,6 +387,12 @@ struct Cluster0 {
     drop_sends: bool,
     /// What the next simulation answers instead of running.
     simulation: Option<Failure>,
+    /// The vault's list becomes these codes as the next transaction is
+    /// simulated (after the flow read it).
+    list_at_simulation: Option<Vec<[u8; 32]>>,
+    /// The vault's own list hash becomes this as the next transaction is
+    /// simulated (after the flow read it).
+    vault_hash_at_simulation: Option<[u8; 32]>,
     answer: Answer,
     wallet_account: Option<Pubkey>,
     /// Ticks the keeper waits after a request lands before pricing it.
@@ -468,6 +480,8 @@ impl Sim {
             exit: Exit::Cash,
             drop_sends: false,
             simulation: None,
+            list_at_simulation: None,
+            vault_hash_at_simulation: None,
             answer: Answer::Sign,
             wallet_account: Some(account),
             keeper_delay: 2,
@@ -730,6 +744,18 @@ impl SolReader for Sim {
     }
 
     async fn simulate(&self, _wire: &[u8]) -> Result<Simulated, SolError> {
+        let changed = self.0.borrow_mut().list_at_simulation.take();
+        if let Some(codes) = changed {
+            let vault = keys().vault;
+            self.0.borrow_mut().accounts.insert(
+                address::restricted(&vault),
+                owned(restricted_bytes(&vault, &codes)),
+            );
+        }
+        let hash = self.0.borrow_mut().vault_hash_at_simulation.take();
+        if let Some(hash) = hash {
+            self.set_vault(|v| v.restricted_hash = hash);
+        }
         Ok(match self.0.borrow_mut().simulation.take() {
             Some(failure) => Simulated::Failed(failure),
             None => Simulated::Ok { units: 100_000 },
@@ -823,6 +849,19 @@ impl SolSigner for Wallet {
                     .signed(&[self.key.sign(unsigned.message())])
                     .unwrap();
                 let signature = self.sim.send(&wire).await?;
+                Ok(Signed::Sent(signature))
+            }
+            Answer::SendThenCancel | Answer::SendThenSwitch => {
+                let wire = unsigned
+                    .signed(&[self.key.sign(unsigned.message())])
+                    .unwrap();
+                let signature = self.sim.send(&wire).await?;
+                let mut sim = self.sim.0.borrow_mut();
+                if answer == Answer::SendThenCancel {
+                    sim.cancel.cancel();
+                } else {
+                    sim.wallet_account = Some(Pubkey::new_from_array([0x77; 32]));
+                }
                 Ok(Signed::Sent(signature))
             }
             Answer::Alter => {
@@ -1020,6 +1059,43 @@ fn a_vault_whose_account_names_another_station_is_refused() {
 }
 
 #[test]
+fn a_list_changed_after_the_flow_read_it_is_said_as_the_new_list_to_review_never_a_bare_refusal() {
+    let sim = Sim::new();
+    let now = vec![code("SANCTIONED"), code("US"), code("CA")];
+    {
+        let mut cluster = sim.0.borrow_mut();
+        cluster.list_at_simulation = Some(now.clone());
+        cluster.simulation = Some(Failure {
+            err: r#"{"InstructionError":[2,{"Custom":6003}]}"#.to_string(),
+            logs: vec!["Program log: AnchorError occurred. Error Code: NoStatement. Error Number: 6003. Error Message: no.".to_string()],
+        });
+    }
+    let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    // The review is shown again with the list as it is now, the amount kept.
+    assert_eq!(end, Err(SolError::ListChanged { now }));
+    assert!(sim.0.borrow().prompts.is_empty());
+    assert_eq!(sim.sends(), 0);
+}
+
+#[test]
+fn a_statement_refused_after_the_vaults_own_list_hash_changed_is_said_as_a_list_to_review_again() {
+    // The list account still reads as shown; the vault's own hash moved on.
+    let sim = Sim::new();
+    {
+        let mut cluster = sim.0.borrow_mut();
+        cluster.vault_hash_at_simulation = Some([9; 32]);
+        cluster.simulation = Some(Failure {
+            err: r#"{"InstructionError":[2,{"Custom":6003}]}"#.to_string(),
+            logs: vec!["Program log: AnchorError occurred. Error Code: NoStatement. Error Number: 6003. Error Message: no.".to_string()],
+        });
+    }
+    let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert!(matches!(end, Err(SolError::ListChanged { .. })), "{end:?}");
+    assert!(sim.0.borrow().prompts.is_empty());
+    assert_eq!(sim.sends(), 0);
+}
+
+#[test]
 fn a_transaction_that_would_fail_is_refused_in_words_before_the_wallet_is_asked() {
     let sim = Sim::new();
     sim.0.borrow_mut().simulation = Some(Failure {
@@ -1071,6 +1147,22 @@ fn a_wallet_that_sends_itself_is_followed_to_the_same_outcome() {
     let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
     assert!(matches!(end, Ok(Outcome::Deposited { .. })), "{end:?}");
     assert_eq!(sim.sends(), 1);
+}
+
+#[test]
+fn a_transaction_the_wallet_already_sent_is_followed_even_if_the_flow_was_cancelled_or_the_account_switched()
+ {
+    for answer in [Answer::SendThenCancel, Answer::SendThenSwitch] {
+        let sim = Sim::new();
+        sim.0.borrow_mut().answer = answer;
+        let (end, steps) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+        assert_eq!(sim.sends(), 1);
+        assert!(
+            steps.iter().any(|step| matches!(step, Step::Sent { .. })),
+            "{steps:?}"
+        );
+        assert!(matches!(end, Ok(Outcome::Deposited { .. })), "{end:?}");
+    }
 }
 
 #[test]
@@ -1312,6 +1404,7 @@ fn a_request_that_landed_and_isnt_settled_in_time_is_said_to_stand_never_that_no
     assert!(error.signature().is_some());
     let words = error.words(&crate::tx::error::Context {
         wallet: "Phantom",
+        keeps_activity: true,
         chain: "Solana",
         wallet_chain: None,
         symbol: "USDC",

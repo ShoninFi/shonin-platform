@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use futures_signals::signal::Mutable;
 use serde_json::{Value, json};
 use shared::Chain;
@@ -29,15 +29,17 @@ use super::machine::{self, Connection, Event, Refusal, WalletId};
 use super::network::Network;
 use super::phrase::{BadPhrase, Fees, LocalKey, Unsigned};
 use super::rpc::{Endpoint, RpcReader, transaction_json};
-use super::run::{FlowKey, Running};
+use super::run::{FlowKey, Running, Timer};
+use super::signed::Unavailable;
+pub use super::signed::{Highest, SignedSend, SignedSends};
 #[cfg(target_arch = "wasm32")]
 use super::{
     networks,
     rpc::{Transport, quantity_u64},
 };
 use crate::tx::error::TxError;
-use crate::tx::flow::Cancel;
-use crate::tx::port::{Reader, Signer, StatementRequest, TxRequest};
+use crate::tx::flow::{Approval, Cancel};
+use crate::tx::port::{Clock, Reader, Signer, StatementRequest, TxRequest};
 
 #[cfg(target_arch = "wasm32")]
 use super::eip1193::{self, Announced, Provider};
@@ -110,6 +112,50 @@ pub struct Session {
     active: RefCell<Option<Active>>,
     /// Flows in progress: cancelled when the account changes.
     flows: RefCell<Vec<Cancel>>,
+    /// Approvals seen mined for a deposit that then stopped: the next
+    /// deposit there takes them as known ([`super::run::approval_after`]).
+    approvals: RefCell<Approvals>,
+    /// The highest nonce the page signed at, per chain and account.
+    pub signed: SignedSends,
+}
+
+/// Where a kept approval was seen: the chain and the config it was read
+/// with, the dollar approved, the vault it was approved to, and the account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ApprovalKey {
+    pub chain_id: u64,
+    pub config: ConfigId,
+    pub asset: Address,
+    pub vault: Address,
+    pub account: Address,
+}
+
+/// Approvals seen mined for a deposit that then stopped, by where they were
+/// seen. One kept under a chain's earlier config is let go once that chain
+/// is read with another.
+#[derive(Default)]
+pub struct Approvals(BTreeMap<ApprovalKey, Approval>);
+
+impl Approvals {
+    /// The approval kept for `key`, if any.
+    pub fn get(&mut self, key: &ApprovalKey) -> Option<Approval> {
+        self.forget_other_configs(key);
+        self.0.get(key).copied()
+    }
+
+    /// Keep (or, with `None`, let go of) the approval for `key`.
+    pub fn set(&mut self, key: ApprovalKey, approval: Option<Approval>) {
+        self.forget_other_configs(&key);
+        match approval {
+            Some(approval) => self.0.insert(key, approval),
+            None => self.0.remove(&key),
+        };
+    }
+
+    fn forget_other_configs(&mut self, key: &ApprovalKey) {
+        self.0
+            .retain(|kept, _| kept.chain_id != key.chain_id || kept.config == key.config);
+    }
 }
 
 thread_local! {
@@ -127,6 +173,8 @@ thread_local! {
         vaults_at: std::cell::Cell::new(f64::NEG_INFINITY),
         active: RefCell::new(None),
         flows: RefCell::new(Vec::new()),
+        approvals: RefCell::new(Approvals::default()),
+        signed: SignedSends::page(),
     });
 }
 
@@ -421,6 +469,17 @@ impl Session {
         }
     }
 
+    /// The approval seen mined for a deposit at `key` that then stopped, if
+    /// one is kept.
+    pub fn approval(&self, key: &ApprovalKey) -> Option<Approval> {
+        self.approvals.borrow_mut().get(key)
+    }
+
+    /// Keep (or, with `None`, let go of) that approval.
+    pub fn set_approval(&self, key: ApprovalKey, approval: Option<Approval>) {
+        self.approvals.borrow_mut().set(key, approval);
+    }
+
     /// Keep a flow's cancel, so an account change stops it.
     pub fn track(&self, cancel: Cancel) {
         let mut flows = self.flows.borrow_mut();
@@ -457,6 +516,24 @@ impl Session {
         self.wallet_name.set_neq(String::new());
     }
 
+    /// The wallet connected now, as the words of what it sends need it:
+    /// whether it keeps an activity list is decided by its kind (a browser
+    /// wallet does; one that signs in the page doesn't).
+    pub fn sender(&self) -> super::Sender {
+        let name = self.wallet_name.get_cloned();
+        super::Sender {
+            name: if name.is_empty() {
+                "your wallet".to_string()
+            } else {
+                name
+            },
+            keeps_activity: !matches!(
+                *self.active.borrow(),
+                Some(Active::Phrase(_) | Active::DevNode(_) | Active::DevPhrase(_))
+            ),
+        }
+    }
+
     /// Whether the connection is waiting on `wallet`.
     fn is_connecting(&self, wallet: &WalletId) -> bool {
         matches!(&*self.connection.lock_ref(), Connection::Connecting { wallet: chosen } if chosen == wallet)
@@ -476,8 +553,7 @@ impl Session {
             return Err(BadPhrase);
         }
         self.active.replace(Some(Active::Phrase(key)));
-        self.wallet_name
-            .set_neq("your recovery phrase wallet".to_string());
+        self.wallet_name.set_neq(super::PHRASE_WALLET.to_string());
         self.apply(Event::Approved {
             account,
             chain_id: None,
@@ -500,8 +576,7 @@ impl Session {
             return false;
         }
         self.active.replace(Some(active));
-        self.wallet_name
-            .set_neq("the development wallet".to_string());
+        self.wallet_name.set_neq(super::DEV_WALLET.to_string());
         remember("dev");
         self.apply(Event::Approved {
             account,
@@ -524,6 +599,7 @@ impl Session {
         SessionSigner {
             session: self.clone(),
             network,
+            sent: RefCell::default(),
         }
     }
 }
@@ -532,6 +608,9 @@ impl Session {
 pub struct SessionSigner {
     session: Rc<Session>,
     network: Rc<Network>,
+    /// The transactions signed in the page and handed to the endpoint, by
+    /// chain and account.
+    sent: RefCell<Vec<(u64, Address, Sent)>>,
 }
 
 impl SessionSigner {
@@ -560,41 +639,406 @@ impl SessionSigner {
         Ok(reader)
     }
 
-    /// Sign locally and send through the public endpoint.
+    /// Sign locally and send through the public endpoint, keeping the
+    /// nonce it was signed at and the page's other tries there.
     async fn send_local(&self, key: &LocalKey, request: &TxRequest) -> Result<B256, TxError> {
         if key.address() != request.from {
             return Err(TxError::AccountChanged);
         }
-        let reader = self.check_endpoint(request.chain_id).await?;
-        let nonce = reader.pending_nonce(request.from).await?;
-        let gas = match request.gas {
-            Some(gas) => gas,
-            None => reader.estimate_gas(request).await?,
-        };
-        let tip = reader.priority_fee().await;
-        let fees = match reader.base_fee().await? {
-            Some(base) => {
-                let tip = u128::try_from(tip).unwrap_or(0);
-                let base = u128::try_from(base).unwrap_or(u128::MAX / 4);
-                Fees::Eip1559 {
-                    max_fee: base.saturating_mul(2).saturating_add(tip),
-                    max_priority_fee: tip,
-                }
-            }
-            None => Fees::Legacy {
-                gas_price: u128::try_from(reader.gas_price().await?).unwrap_or(u128::MAX),
+        let endpoint = self.check_endpoint(request.chain_id).await?;
+        // Every request is made while holding the send's turn, which other
+        // tabs wait on: none may hang it.
+        let reader = RpcReader {
+            transport: super::rpc::Bounded {
+                inner: &endpoint.transport,
+                clock: &Timer,
+                millis: TURN_REQUEST_MILLIS,
             },
         };
-        let raw = key.sign_transaction(&Unsigned {
-            chain_id: request.chain_id,
-            nonce,
+        let sent = sign_and_send(&reader, key, request, &self.session.signed, &Timer).await?;
+        let hash = sent.hash;
+        self.sent
+            .borrow_mut()
+            .push((request.chain_id, request.from, sent));
+        Ok(hash)
+    }
+}
+
+/// How long one request to the endpoint may take while a send holds its
+/// turn: one with no answer by then is said lost, and a raw send ending so
+/// is followed as one that may have reached a node.
+pub const TURN_REQUEST_MILLIS: u32 = 20_000;
+
+/// A transaction signed in the page and handed to the endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub hash: B256,
+    /// The nonce it was signed at.
+    pub nonce: u64,
+    /// The page's other transactions signed at that nonce before it.
+    pub others: Vec<B256>,
+}
+
+/// Sign `request` with `key` and hand it to the endpoint, by the mined-nonce
+/// rule: the page never signs past the highest nonce it signed at (H, kept
+/// in `signed`, the browser's storage, so a reload or another tab sees it)
+/// until the endpoint's mined count ("latest") shows H used. The pending
+/// count never chooses a nonce.
+///
+/// - H recorded and "latest" at or below it: the send signs at H, whatever
+///   it calls, taking the place of every send there (at most one of them
+///   can land), with fees at least 12.5% above the highest recorded at H,
+///   so nodes take it as a replacement, and never below the endpoint's
+///   fees now. A node behind only makes the send sign at H again: if H is
+///   mined it can't land, and its follow says what used H.
+///   A sealed receipt on the endpoint for any send at H shows H used
+///   however far behind its count is: the send signs at H + 1, the new H.
+///   A look that finds none, or fails, leaves the send at H.
+/// - No H, or "latest" past it (H is mined): the send signs at "latest",
+///   which becomes the new H, replacing the record.
+/// - The coin held must cover the gas at the fee cap actually signed, and
+///   on an OP-stack chain the L1 data fee too ([`l1_fee`], read for the
+///   send's shape signed by a throwaway key, with a margin; one that can't be read sends nothing). At
+///   H, a raise that costs more than the coin held gives way to the highest
+///   cap what's left after the L1 data fee pays for, when that is at least
+///   the endpoint's fees now:
+///   a node still holding an earlier send at H refuses it as underpriced
+///   (its follow says not taken), and at most one send at H can land.
+///   Short even of the endpoint's fees now, nothing is signed or recorded
+///   ([`TxError::InsufficientGas`], with the cost at those fees, the L1
+///   data fee included).
+/// - The only release of an H not shown mined: "latest" and "pending" both
+///   below H and every send at H unknown to the endpoint (not pending, no
+///   receipt) on every look for as long as a follow takes to say a send not
+///   taken ([`out_of_reach`]): a chain that was reset. The record is
+///   cleared, and the send signs at "latest".
+///
+/// Sends for one chain and account take turns ([`SignedSends::turn`]), and
+/// the record is read again just before signing. The send's hash is
+/// written to the record before it is handed on: storage that can't be
+/// read or written sends nothing ([`TxError::StorageNeeded`]). A raw send
+/// that couldn't be made never left: its hash is taken off the record, and
+/// when it was the only one at a new H the record before it stands again.
+pub async fn sign_and_send<T: super::rpc::Transport, C: Clock>(
+    reader: &RpcReader<T>,
+    key: &LocalKey,
+    request: &TxRequest,
+    signed: &SignedSends,
+    clock: &C,
+) -> Result<Sent, TxError> {
+    let (chain_id, who) = (request.chain_id, request.from);
+    let _turn = signed.turn(chain_id, who).await;
+    let mut latest = reader.latest_nonce(who).await?;
+    if let Some(highest) = signed.get(chain_id, who).map_err(storage_needed)?
+        && latest < highest.nonce
+        && out_of_reach(reader, who, highest.nonce, &highest.hashes(), clock).await
+    {
+        signed.set(chain_id, who, None).map_err(storage_needed)?;
+        latest = reader.latest_nonce(who).await?;
+    }
+    if let Some(highest) = signed.get(chain_id, who).map_err(storage_needed)?
+        && latest <= highest.nonce
+        && sealed_at(reader, &highest.hashes()).await
+    {
+        latest = highest.nonce.saturating_add(1);
+    }
+    let gas = match request.gas {
+        Some(gas) => gas,
+        None => reader.estimate_gas(request).await?,
+    };
+    let now = fees_now(reader).await?;
+    let have = reader.native_balance(who).await?;
+    // The L1 data fee is read for a send shaped as this one will be: the
+    // record as it stands now gives its nonce and fees.
+    let probe = match signed.get(chain_id, who).map_err(storage_needed)? {
+        Some(highest) if latest <= highest.nonce => (highest.nonce, raised(now, &highest)),
+        _ => (latest, now),
+    };
+    let l1 = l1_fee(
+        reader,
+        &Unsigned {
+            chain_id,
+            nonce: probe.0,
             gas,
-            fees,
+            fees: probe.1,
             to: request.to,
             data: request.data.clone(),
-        });
-        reader.send_raw(&raw).await
+        },
+    )
+    .await?;
+    // The record as it stands just before signing: nothing is awaited from
+    // here until the send's hash is written to it.
+    let before = signed.get(chain_id, who).map_err(storage_needed)?;
+    let (nonce, fees, mut record) = match &before {
+        Some(highest) if latest <= highest.nonce => {
+            let fees = raised(now, highest);
+            let fees = if cost(gas, fees).saturating_add(l1) > have {
+                fitted(fees, now, gas, have.saturating_sub(l1))
+            } else {
+                fees
+            };
+            (highest.nonce, fees, highest.clone())
+        }
+        _ => (
+            latest,
+            now,
+            Highest {
+                nonce: latest,
+                sends: Vec::new(),
+            },
+        ),
+    };
+    let need = cost(gas, fees).saturating_add(l1);
+    if need > have {
+        return Err(TxError::InsufficientGas { need, have });
     }
+    let raw = key.sign_transaction(&Unsigned {
+        chain_id,
+        nonce,
+        gas,
+        fees,
+        to: request.to,
+        data: request.data.clone(),
+    });
+    let hash = alloy_primitives::keccak256(&raw);
+    let others = record.hashes();
+    if !others.contains(&hash) {
+        record.sends.push(SignedSend {
+            hash,
+            to: request.to,
+            data: request.data.clone(),
+            fees,
+        });
+    }
+    signed
+        .set(chain_id, who, Some(&record))
+        .map_err(storage_needed)?;
+    match reader.send_raw(&raw).await {
+        Ok(_) => Ok(Sent {
+            hash,
+            nonce,
+            others: others.into_iter().filter(|other| *other != hash).collect(),
+        }),
+        Err(error) => {
+            // It never left. Storage that won't take that keeps the hash:
+            // H stays where it is, which only ever signs at H again.
+            if !others.contains(&hash) {
+                let _ = unrecord(signed, chain_id, who, hash, before.as_ref());
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The most `gas` at `fees` can cost: the gas times the fee cap.
+fn cost(gas: u64, fees: Fees) -> U256 {
+    let cap = match fees {
+        Fees::Eip1559 { max_fee, .. } => max_fee,
+        Fees::Legacy { gas_price } => gas_price,
+    };
+    U256::from(gas).saturating_mul(U256::from(cap))
+}
+
+alloy_sol_types::sol! {
+    /// The OP stack's GasPriceOracle: the L1 data fee a transaction's bytes
+    /// pay at L1's fees now.
+    function getL1Fee(bytes data) external view returns (uint256);
+}
+
+/// Where the OP stack keeps its GasPriceOracle, the same on every OP chain.
+const GAS_PRICE_ORACLE: Address = Address::new([
+    0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f,
+]);
+
+/// The L1 data fee a send shaped as `unsigned` pays on a chain that charges
+/// one ([`super::networks::charges_l1_fee`]), with a quarter more, since it
+/// moves with L1's fees until the send is mined; nothing elsewhere. It is
+/// read for `unsigned` signed by [`LocalKey::probe_signer`], never the
+/// person's key: the bytes handed to the endpoint are the same type, fields
+/// and length as the send, so the oracle prices them the same, but they are
+/// no send of the person's anyone could land. The fees a send at the same
+/// nonce is signed with change its size by a byte or two at most. A fee
+/// that can't be read sends nothing.
+async fn l1_fee<T: super::rpc::Transport>(
+    reader: &RpcReader<T>,
+    unsigned: &Unsigned,
+) -> Result<U256, TxError> {
+    use alloy_sol_types::SolCall;
+    if !super::networks::charges_l1_fee(unsigned.chain_id) {
+        return Ok(U256::ZERO);
+    }
+    let unread = || {
+        TxError::Network("The chain's data fee couldn't be read, so nothing was sent".to_string())
+    };
+    let call = getL1FeeCall {
+        data: LocalKey::probe_signer().sign_transaction(unsigned),
+    };
+    let answer = reader
+        .call(GAS_PRICE_ORACLE, Bytes::from(call.abi_encode()))
+        .await
+        .map_err(|_| unread())?;
+    let fee = getL1FeeCall::abi_decode_returns(&answer).map_err(|_| unread())?;
+    Ok(fee.saturating_add(fee / U256::from(4u8)))
+}
+
+/// Fees at the highest nonce when the raise over the sends there costs more
+/// than `have`: the highest cap `have` pays for `gas`, with the raised tip
+/// no higher than that cap. Nodes still holding an earlier send there take
+/// it as underpriced and refuse it, and at most one send at a nonce can
+/// land. A cap below `now` isn't offered: `now` stands, and the coin check
+/// refuses it.
+fn fitted(raised: Fees, now: Fees, gas: u64, have: U256) -> Fees {
+    let fits = u128::try_from(have / U256::from(gas.max(1))).unwrap_or(u128::MAX);
+    match (raised, now) {
+        (
+            Fees::Eip1559 {
+                max_priority_fee, ..
+            },
+            Fees::Eip1559 { max_fee: least, .. },
+        ) if fits >= least => Fees::Eip1559 {
+            max_fee: fits,
+            max_priority_fee: max_priority_fee.min(fits),
+        },
+        (Fees::Legacy { .. }, Fees::Legacy { gas_price: least }) if fits >= least => {
+            Fees::Legacy { gas_price: fits }
+        }
+        _ => now,
+    }
+}
+
+/// Whether the endpoint holds a sealed receipt for any of `sends`: their
+/// nonce is used, whatever its mined count says. One look at each; a look
+/// that fails shows nothing.
+async fn sealed_at<T: super::rpc::Transport>(reader: &RpcReader<T>, sends: &[B256]) -> bool {
+    for &send in sends {
+        if matches!(reader.receipt(send).await, Ok(Some(_))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Take `hash`, which never left the page, off the record; when it was the
+/// only send at its nonce, the record `before` it stands again.
+fn unrecord(
+    signed: &SignedSends,
+    chain_id: u64,
+    who: Address,
+    hash: B256,
+    before: Option<&Highest>,
+) -> Result<(), Unavailable> {
+    let Some(mut now) = signed.get(chain_id, who)? else {
+        return Ok(());
+    };
+    if !now.sends.iter().any(|send| send.hash == hash) {
+        return Ok(());
+    }
+    now.sends.retain(|send| send.hash != hash);
+    if now.sends.is_empty() {
+        signed.set(chain_id, who, before)
+    } else {
+        signed.set(chain_id, who, Some(&now))
+    }
+}
+
+/// The fees the endpoint asks for now.
+async fn fees_now<T: super::rpc::Transport>(reader: &RpcReader<T>) -> Result<Fees, TxError> {
+    Ok(match reader.base_fee().await? {
+        Some(base) => {
+            // A tip that can't be read is never taken as none: a send
+            // signed with no tip may never be mined.
+            let tip = reader
+                .priority_fee()
+                .await
+                .ok()
+                .and_then(|tip| u128::try_from(tip).ok())
+                .ok_or_else(|| {
+                    TxError::Network(
+                        "The fee to offer couldn't be read, so nothing was sent".to_string(),
+                    )
+                })?;
+            let base = u128::try_from(base).unwrap_or(u128::MAX / 4);
+            Fees::Eip1559 {
+                max_fee: base.saturating_mul(2).saturating_add(tip),
+                max_priority_fee: tip,
+            }
+        }
+        None => Fees::Legacy {
+            gas_price: u128::try_from(reader.gas_price().await?).unwrap_or(u128::MAX),
+        },
+    })
+}
+
+/// Fees for a send at `highest`'s nonce: each at least 12.5% above the
+/// highest recorded there, and never below `now`. A legacy gas price counts
+/// as both a fee cap and a tip, as nodes compare a replacement with it. The
+/// raise is the least a node takes as a replacement, so it has no ceiling:
+/// any lower would leave a send that may sit in a pool unreplaced.
+pub fn raised(now: Fees, highest: &Highest) -> Fees {
+    let up = |fee: u128| fee.saturating_add(fee.div_ceil(8));
+    let (mut cap, mut tip) = match now {
+        Fees::Eip1559 {
+            max_fee,
+            max_priority_fee,
+        } => (max_fee, max_priority_fee),
+        Fees::Legacy { gas_price } => (gas_price, gas_price),
+    };
+    for send in &highest.sends {
+        let (old_cap, old_tip) = match send.fees {
+            Fees::Eip1559 {
+                max_fee,
+                max_priority_fee,
+            } => (max_fee, max_priority_fee),
+            Fees::Legacy { gas_price } => (gas_price, gas_price),
+        };
+        cap = cap.max(up(old_cap));
+        tip = tip.max(up(old_tip));
+    }
+    match now {
+        Fees::Eip1559 { .. } => Fees::Eip1559 {
+            max_fee: cap.max(tip),
+            max_priority_fee: tip,
+        },
+        Fees::Legacy { .. } => Fees::Legacy { gas_price: cap },
+    }
+}
+
+fn storage_needed(_: Unavailable) -> TxError {
+    TxError::StorageNeeded
+}
+
+/// Whether the endpoint shows `nonce` out of reach on every look for as
+/// long as a follow takes to say a send not taken: "pending" and "latest"
+/// both below it, and every one of `sends` unknown to it (not pending, no
+/// receipt). A look that fails shows nothing out of reach.
+async fn out_of_reach<T: super::rpc::Transport, C: Clock>(
+    reader: &RpcReader<T>,
+    who: Address,
+    nonce: u64,
+    sends: &[B256],
+    clock: &C,
+) -> bool {
+    let pace = crate::tx::flow::Pace::LIVE;
+    for look in 0..pace.not_taken_after.max(1) {
+        if look > 0 {
+            clock.sleep(pace.poll_millis).await;
+        }
+        if !matches!(reader.pending_nonce(who).await, Ok(next) if next < nonce)
+            || !matches!(reader.latest_nonce(who).await, Ok(next) if next < nonce)
+        {
+            return false;
+        }
+        for &send in sends {
+            if !matches!(
+                reader.pending(send).await,
+                Ok(crate::tx::port::Pending::Unknown)
+            ) || !matches!(reader.receipt_seen(send).await, Ok(false))
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The EVM network a config names, if this build can use it.
@@ -623,6 +1067,51 @@ impl Signer for SessionSigner {
 
     fn name(&self) -> String {
         self.session.wallet_name.get_cloned()
+    }
+
+    fn sent_nonce(&self, hash: B256) -> Option<u64> {
+        self.sent
+            .borrow()
+            .iter()
+            .find(|(_, _, sent)| sent.hash == hash)
+            .map(|(_, _, sent)| sent.nonce)
+    }
+
+    fn checks_fee(&self) -> bool {
+        // A key held in the page signs through [`sign_and_send`], which
+        // checks the coin at the fees it signs with.
+        matches!(self.active(), Ok(Active::Phrase(_) | Active::DevPhrase(_)))
+    }
+
+    fn other_tries(&self, hash: B256) -> Vec<B256> {
+        let sent = self.sent.borrow();
+        let Some((chain_id, who, this)) = sent.iter().find(|(_, _, sent)| sent.hash == hash) else {
+            return Vec::new();
+        };
+        let mut tries = this.others.clone();
+        // This signer's later tries at the nonce, and every one the record
+        // keeps there now (another tab's included).
+        let later = sent
+            .iter()
+            .filter(|(chain, account, other)| {
+                chain == chain_id && account == who && other.nonce == this.nonce
+            })
+            .map(|(_, _, other)| other.hash);
+        let kept = self
+            .session
+            .signed
+            .get(*chain_id, *who)
+            .ok()
+            .flatten()
+            .filter(|highest| highest.nonce == this.nonce)
+            .map(|highest| highest.hashes())
+            .unwrap_or_default();
+        for other in later.chain(kept) {
+            if other != hash && !tries.contains(&other) {
+                tries.push(other);
+            }
+        }
+        tries
     }
 
     async fn chain_id(&self) -> Result<u64, TxError> {
@@ -1157,6 +1646,56 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_approval_is_found_only_for_its_own_chain_dollar_vault_and_account_and_is_dropped_on_a_config_change()
+     {
+        use alloy_primitives::U256;
+        let key = ApprovalKey {
+            chain_id: 84532,
+            config: ConfigId(B256::repeat_byte(1)),
+            asset: Address::repeat_byte(0xe2),
+            vault: Address::repeat_byte(0xaa),
+            account: Address::repeat_byte(0x42),
+        };
+        let approval = Approval {
+            amount: U256::from(1_000_000_000u64),
+            block: 101,
+        };
+        let mut approvals = Approvals::default();
+        approvals.set(key, Some(approval));
+        assert_eq!(approvals.get(&key), Some(approval));
+        for other in [
+            ApprovalKey { chain_id: 1, ..key },
+            ApprovalKey {
+                asset: Address::repeat_byte(0xe3),
+                ..key
+            },
+            ApprovalKey {
+                vault: Address::repeat_byte(0xab),
+                ..key
+            },
+            ApprovalKey {
+                account: Address::repeat_byte(0x43),
+                ..key
+            },
+        ] {
+            assert_eq!(approvals.get(&other), None, "{other:?}");
+        }
+        assert_eq!(approvals.get(&key), Some(approval));
+        // The chain is read with another config now: the approval kept
+        // under the earlier one is let go, even when that config returns.
+        let changed = ApprovalKey {
+            config: ConfigId(B256::repeat_byte(2)),
+            ..key
+        };
+        assert_eq!(approvals.get(&changed), None);
+        assert_eq!(approvals.get(&key), None);
+        // Let go once set to none.
+        approvals.set(key, Some(approval));
+        approvals.set(key, None);
+        assert_eq!(approvals.get(&key), None);
+    }
 
     #[test]
     fn reconnecting_an_evm_wallet_never_waits_on_the_solana_clusters_config() {

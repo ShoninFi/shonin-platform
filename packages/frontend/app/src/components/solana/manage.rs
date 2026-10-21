@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use alloy_primitives::U256;
-use chain::solana_ix::accounts::{Vault, VaultState};
+use chain::solana_ix::accounts::{Allowed, Vault, VaultState};
 use chain::solana_ix::vault::Allowances;
 use futures_signals::signal::{Mutable, SignalExt};
 
@@ -19,52 +19,179 @@ use crate::components::wallet::open_connect;
 use crate::money::format as money;
 use crate::money::{Rounding, parse_units};
 use crate::tx::solana::author::AuthorAction;
+use crate::tx::solana::flow::Step;
 use crate::tx::solana::run::{self, CardShows, SolAction, SolVault};
 use crate::view::{El, View, el, text};
 use crate::wallet::solana::SolNetwork;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct Read {
     vault: SolVault,
     network: Rc<SolNetwork>,
     account: Rc<Vault>,
-    now: u64,
+    /// Whether the tank's escape was open on the cluster's clock when read.
+    escape_open: bool,
+}
+
+/// Whether the tank's unsigned escape is open at `now`, on the cluster's
+/// clock: from its delay after it was asked for, for as long again.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn escape_open(vault: &Vault, now: u64) -> bool {
+    let at = vault.tank.escape_requested_at;
+    let delay = vault.timers.tank_escape_delay;
+    at != 0 && now >= at + delay && now <= at + 2 * delay
+}
+
+/// What the panel draws, and nothing else: it is drawn again only when this
+/// changes, so a refresh that reads the same vault keeps the controls (and
+/// the field being typed in) as they are.
+#[derive(Clone, Debug, PartialEq)]
+enum Shape {
+    SignedOut,
+    Reading,
+    Unreadable(String),
+    NotAuthor(chain::solana_ix::Pubkey),
+    Controls(Rc<Read>),
+}
+
+fn shape(
+    account: Option<chain::solana_ix::Pubkey>,
+    loaded: &Option<Result<Read, String>>,
+) -> Shape {
+    match (account, loaded) {
+        (None, _) => Shape::SignedOut,
+        (_, None) => Shape::Reading,
+        (_, Some(Err(why))) => Shape::Unreadable(why.clone()),
+        (Some(account), Some(Ok(read))) if account != read.account.author => {
+            Shape::NotAuthor(read.account.author)
+        }
+        (Some(_), Some(Ok(read))) => Shape::Controls(Rc::new(read.clone())),
+    }
+}
+
+/// What the author types into the controls: kept by the panel, so the
+/// controls drawn again after a read show it as typed.
+#[derive(Default)]
+struct Typed {
+    fund: Mutable<String>,
+    keep: Mutable<String>,
+    shares: Mutable<String>,
+    take: Mutable<String>,
+    /// Fuel, memory, requests, bytes, streams, inference, gas: the vault's
+    /// own values until the author types another.
+    allowances: [Mutable<String>; 7],
+    /// For each allowance field, the text at which it counts as untouched
+    /// (it follows the vault): the vault's value it was last filled with,
+    /// or, once allowances sent from it landed, what was sent.
+    untouched: Untouched,
+    floor: Mutable<String>,
+    confirm: Mutable<bool>,
+}
+
+/// The allowance fields' untouched texts, shared with what a flow does once
+/// it lands.
+type Untouched = Rc<std::cell::RefCell<Option<[String; 7]>>>;
+
+/// What to do to the fields once the flow they were sent in lands.
+type Landing = Box<dyn FnOnce()>;
+
+/// What a flow's step says of whether it landed: `None` while it runs;
+/// once it is over, whether it changed (or may have changed) the vault.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn landed(step: Option<&Step>) -> Option<bool> {
+    step.filter(|step| step.is_over())
+        .map(|step| run::ended_changed(Some(step)))
+}
+
+impl Typed {
+    /// Once the flow sent from `field` lands, empty it: what was typed was
+    /// sent, and is not offered again. Text the author typed since is kept.
+    fn sent_from(field: &Mutable<String>) -> Landing {
+        let field = field.clone();
+        let sent = field.get_cloned();
+        Box::new(move || {
+            if *field.lock_ref() == sent {
+                field.set(String::new());
+            }
+        })
+    }
+
+    /// Once the allowances sent from the fields land, each field still
+    /// showing what was sent follows the vault again; one the author typed
+    /// into since keeps its text.
+    fn sent_allowances(allowances: &[Mutable<String>; 7], untouched: &Untouched) -> Landing {
+        let untouched = untouched.clone();
+        let sent = allowances.clone().map(|field| field.get_cloned());
+        Box::new(move || *untouched.borrow_mut() = Some(sent))
+    }
+
+    /// Once the retiring lands, the box is unticked.
+    fn sent_confirm(confirm: &Mutable<bool>) -> Landing {
+        let confirm = confirm.clone();
+        Box::new(move || confirm.set_neq(false))
+    }
+
+    /// Fill the allowance fields from the vault's `now`: each field still
+    /// at its untouched text follows the vault; one the author typed into
+    /// keeps its text.
+    fn fill_allowances(&self, now: Allowed) {
+        let now = [
+            now.fuel_per_sec.to_string(),
+            now.memory_mib.to_string(),
+            now.requests_per_min.to_string(),
+            now.bytes_per_day.to_string(),
+            now.streams.to_string(),
+            now.inference_ms_per_min.to_string(),
+            now.gas_per_day.to_string(),
+        ];
+        let mut untouched = self.untouched.borrow_mut();
+        for (i, text) in now.iter().enumerate() {
+            let field = &self.allowances[i];
+            let follows = untouched
+                .as_ref()
+                .is_none_or(|untouched| field.lock_ref().as_str() == untouched[i]);
+            if follows {
+                field.set_neq(text.clone());
+            }
+        }
+        *untouched = Some(now);
+    }
 }
 
 /// The author's controls for `slug`'s Solana vault.
 pub fn panel(slug: &str) -> View {
     let loaded: Mutable<Option<Result<Read, String>>> = Mutable::new(None);
     let session = crate::wallet::solana::get();
+    let typed = Rc::new(Typed::default());
     el("div")
         .class("sh-manage sh-manage--solana")
         .child_signal(
             None,
             futures_signals::map_ref! {
                 let account = session.connection.signal_ref(|c| c.account()),
-                let loaded = loaded.signal_cloned() => (*account, loaded.clone())
+                let loaded = loaded.signal_cloned() => shape(*account, loaded)
             }
-            .map(|(account, loaded)| {
-                Some(match (account, loaded) {
-                    (None, _) => el("div")
+            .dedupe_cloned()
+            .map(move |shape| {
+                Some(match shape {
+                    Shape::SignedOut => el("div")
                         .child(el("p").text("This agent’s vault is on Solana. Connect the Solana wallet that published it to manage it."))
                         .child(on_click(
                             Button::new(Kind::Primary, "Connect a Solana wallet").build(),
                             open_connect,
                         ))
                         .into(),
-                    (_, None) => el("p").class("sh-muted").text("Reading the vault…").into(),
-                    (_, Some(Err(why))) => notice(NoticeTone::Info, text(why)).into(),
-                    (Some(account), Some(Ok(read))) if account != read.account.author => {
-                        notice(
-                            NoticeTone::Info,
-                            text(format!(
-                                "Only this agent’s author ({}) can change its vault.",
-                                short(&read.account.author.to_string())
-                            )),
-                        )
-                        .into()
-                    }
-                    (Some(_), Some(Ok(read))) => controls(&Rc::new(read)),
+                    Shape::Reading => el("p").class("sh-muted").text("Reading the vault…").into(),
+                    Shape::Unreadable(why) => notice(NoticeTone::Info, text(why)).into(),
+                    Shape::NotAuthor(author) => notice(
+                        NoticeTone::Info,
+                        text(format!(
+                            "Only this agent’s author ({}) can change its vault.",
+                            short(&author.to_string())
+                        )),
+                    )
+                    .into(),
+                    Shape::Controls(read) => controls(&read, &typed),
                 })
             }),
         )
@@ -106,8 +233,8 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
                             Some(account) => Ok(Read {
                                 vault,
                                 network,
+                                escape_open: escape_open(&account, now),
                                 account: Rc::new(account),
-                                now,
                             }),
                             None => Err("This vault can’t be read.".to_string()),
                         },
@@ -165,12 +292,13 @@ fn field(id: &'static str, label: &'static str, value: &Mutable<String>, unit: &
 }
 
 /// A button that builds its action from what's typed when pressed, runs it,
-/// and shows its status in place.
+/// and shows its status in place. Once that flow (on this panel's vault,
+/// started here) lands, what `make` gave to do to the fields is done.
 fn act(
     read: &Rc<Read>,
     label: &'static str,
     kind: Kind,
-    make: impl Fn() -> Result<SolAction, String> + 'static,
+    make: impl Fn() -> Result<(SolAction, Landing), String> + 'static,
 ) -> El {
     let address = read.vault.address;
     let refused: Mutable<Option<String>> = Mutable::new(None);
@@ -197,11 +325,15 @@ fn act(
                     let button: View = on_click(
                         Button::new(kind, label).size(Size::Small).build(),
                         move || match make() {
-                            Ok(action) => {
+                            Ok((action, landing)) => {
                                 refused.set(None);
                                 // Built with this read's cluster: the flow
                                 // signs with it or not at all.
-                                run::start_from(&card_now, address, action, reviewed.clone());
+                                if run::start_from(&card_now, address, action, reviewed.clone())
+                                    && let Some(flow) = card_now.slot.get_cloned()
+                                {
+                                    on_landing(flow, landing);
+                                }
                             }
                             Err(why) => refused.set(Some(why)),
                         },
@@ -225,12 +357,31 @@ fn act(
         )
 }
 
+/// Do `landing` once `flow` is over having changed the vault (or maybe so);
+/// nothing when it ends otherwise.
+fn on_landing(flow: run::SolRunning, landing: Landing) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        use futures::StreamExt;
+        let mut steps = flow.step.signal_cloned().to_stream();
+        while let Some(step) = steps.next().await {
+            match landed(step.as_ref()) {
+                Some(true) => return landing(),
+                Some(false) => return,
+                None => {}
+            }
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (flow, landing);
+}
+
 fn dollars(text: &str, decimals: u8) -> Result<u64, String> {
     let amount = parse_units(text, decimals).map_err(|error| error.words())?;
     u64::try_from(amount).map_err(|_| "That’s more than a dollar account holds.".to_string())
 }
 
-fn controls(read: &Rc<Read>) -> View {
+fn controls(read: &Rc<Read>, typed: &Typed) -> View {
     let v = &read.account;
     let decimals = read.network.asset_decimals;
     let usd = |value: u64| money::dollars(U256::from(value), decimals, Rounding::Down);
@@ -242,14 +393,12 @@ fn controls(read: &Rc<Read>) -> View {
     };
 
     // The tank.
-    let fund = Mutable::new(String::new());
-    let keep = Mutable::new(String::new());
-    let shares = Mutable::new(String::new());
-    let take = Mutable::new(String::new());
+    let fund = typed.fund.clone();
+    let keep = typed.keep.clone();
+    let shares = typed.shares.clone();
+    let take = typed.take.clone();
     let escape_at = v.tank.escape_requested_at;
-    let delay = v.timers.tank_escape_delay;
-    let escape_open =
-        escape_at != 0 && read.now >= escape_at + delay && read.now <= escape_at + 2 * delay;
+    let escape_open = read.escape_open;
     let tank = el("section")
         .class("sh-card sh-card--pad sh-manage__card")
         .child(el("h2").class("sh-portfolio__h2").text("Tank"))
@@ -266,7 +415,10 @@ fn controls(read: &Rc<Read>) -> View {
         .child(field("sol-fund", "Add to the tank", &fund, "USDC"))
         .child(act(read, "Add from your wallet", Kind::Primary, {
             let fund = fund.clone();
-            move || Ok(SolAction::Author(AuthorAction::FundTank(dollars(&fund.get_cloned(), decimals)?)))
+            move || {
+                let action = SolAction::Author(AuthorAction::FundTank(dollars(&fund.get_cloned(), decimals)?));
+                Ok((action, Typed::sent_from(&fund)))
+            }
         }))
         .child(field("sol-topup", "Top up from your shares", &shares, "shares"))
         .child(act(read, "Redeem into the tank", Kind::Secondary, {
@@ -274,18 +426,24 @@ fn controls(read: &Rc<Read>) -> View {
             move || {
                 let amount = parse_units(&shares.get_cloned(), 18).map_err(|error| error.words())?;
                 let amount = u128::try_from(amount).map_err(|_| "That’s more shares than exist.".to_string())?;
-                Ok(SolAction::Author(AuthorAction::TopUpFromShares(amount)))
+                Ok((SolAction::Author(AuthorAction::TopUpFromShares(amount)), Typed::sent_from(&shares)))
             }
         }))
         .child(field("sol-keep", "Keep the tank at (0 turns auto-fill off)", &keep, "USDC"))
         .child(act(read, "Set the level", Kind::Secondary, {
             let keep = keep.clone();
-            move || Ok(SolAction::Author(AuthorAction::SetKeep(dollars(&keep.get_cloned(), decimals)?)))
+            move || {
+                let action = SolAction::Author(AuthorAction::SetKeep(dollars(&keep.get_cloned(), decimals)?));
+                Ok((action, Typed::sent_from(&keep)))
+            }
         }))
         .child(field("sol-take", "Withdraw from the tank", &take, "USDC"))
         .child(act(read, "Withdraw (signed usage total)", Kind::Secondary, {
             let take = take.clone();
-            move || Ok(SolAction::WithdrawTankSigned(dollars(&take.get_cloned(), decimals)?))
+            move || {
+                let action = SolAction::WithdrawTankSigned(dollars(&take.get_cloned(), decimals)?);
+                Ok((action, Typed::sent_from(&take)))
+            }
         }))
         .child(el("p").class("sh-muted").text(if escape_open {
             "The escape is open: you can withdraw without a signed usage total."
@@ -298,27 +456,27 @@ fn controls(read: &Rc<Read>) -> View {
             act(read, "Withdraw through the escape", Kind::Secondary, {
                 let take = take.clone();
                 move || {
-                    Ok(SolAction::Author(AuthorAction::WithdrawTank {
+                    let action = SolAction::Author(AuthorAction::WithdrawTank {
                         assets: dollars(&take.get_cloned(), decimals)?,
                         signed: None,
-                    }))
+                    });
+                    Ok((action, Typed::sent_from(&take)))
                 }
             })
         } else {
             act(read, "Ask to withdraw without a signed total", Kind::Secondary, || {
-                Ok(SolAction::Author(AuthorAction::RequestEscape))
+                Ok((SolAction::Author(AuthorAction::RequestEscape), Box::new(|| {}) as Landing))
             })
         });
 
     // Allowances.
-    let a = v.allowances;
-    let fuel = Mutable::new(a.fuel_per_sec.to_string());
-    let memory = Mutable::new(a.memory_mib.to_string());
-    let requests = Mutable::new(a.requests_per_min.to_string());
-    let bytes = Mutable::new(a.bytes_per_day.to_string());
-    let streams = Mutable::new(a.streams.to_string());
-    let inference = Mutable::new(a.inference_ms_per_min.to_string());
-    let gas = Mutable::new(a.gas_per_day.to_string());
+    typed.fill_allowances(v.allowances);
+    let [fuel, memory, requests, bytes, streams, inference, gas] = typed.allowances.clone();
+    let sent_allowances = {
+        let allowances = typed.allowances.clone();
+        let untouched = typed.untouched.clone();
+        move || Typed::sent_allowances(&allowances, &untouched)
+    };
     let allowances = el("section")
         .class("sh-card sh-card--pad sh-manage__card")
         .child(el("h2").class("sh-portfolio__h2").text("Allowances"))
@@ -346,7 +504,7 @@ fn controls(read: &Rc<Read>) -> View {
                     .parse()
                     .map_err(|_| format!("{what} must be a whole number."))
             }
-            Ok(SolAction::Author(AuthorAction::SetAllowances(Allowances {
+            let action = SolAction::Author(AuthorAction::SetAllowances(Allowances {
                 fuel_per_sec: n(&fuel, "Fuel per second")?,
                 memory_mib: n(&memory, "Memory")?,
                 requests_per_min: n(&requests, "Requests per minute")?,
@@ -354,11 +512,12 @@ fn controls(read: &Rc<Read>) -> View {
                 streams: n(&streams, "Streams")?,
                 inference_ms_per_min: n(&inference, "Inference per minute")?,
                 gas_per_day: n(&gas, "Gas per day")?,
-            })))
+            }));
+            Ok((action, sent_allowances()))
         }));
 
     // The idle floor.
-    let floor = Mutable::new(String::new());
+    let floor = typed.floor.clone();
     let pending = (v.pending_floor_at != 0).then(|| {
         format!(
             "A change to {} takes effect at {}.",
@@ -389,12 +548,15 @@ fn controls(read: &Rc<Read>) -> View {
                     .ok_or_else(|| {
                         "The floor is a share of the vault: at most 100%.".to_string()
                     })?;
-                Ok(SolAction::Author(AuthorAction::SetIdleFloor(bps)))
+                Ok((
+                    SolAction::Author(AuthorAction::SetIdleFloor(bps)),
+                    Typed::sent_from(&floor),
+                ))
             }
         }));
 
     // Retiring.
-    let confirm = Mutable::new(false);
+    let confirm = typed.confirm.clone();
     let retire = el("section")
         .class("sh-card sh-card--pad sh-manage__card")
         .child(el("h2").class("sh-portfolio__h2").text("Retire"))
@@ -409,7 +571,7 @@ fn controls(read: &Rc<Read>) -> View {
                 .into(),
                 act(read, "Retire this vault", Kind::Danger, move || {
                     if confirm.get() {
-                        Ok(SolAction::Author(AuthorAction::Retire))
+                        Ok((SolAction::Author(AuthorAction::Retire), Typed::sent_confirm(&confirm)))
                     } else {
                         Err("Tick the box to retire.".to_string())
                     }
@@ -427,4 +589,140 @@ fn controls(read: &Rc<Read>) -> View {
         .child(idle)
         .child(retire)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::config_cache::ConfigId;
+    use chain::solana_ix::Pubkey;
+
+    fn read(vault: Vault, escape_open: bool) -> Read {
+        Read {
+            vault: SolVault {
+                slug: "solana-4".to_string(),
+                title: "Basis".to_string(),
+                address: Pubkey::new_from_array([3; 32]),
+            },
+            network: Rc::new(SolNetwork {
+                cluster: "devnet".to_string(),
+                label: "Solana devnet".to_string(),
+                rpc: "https://api.devnet.solana.com".to_string(),
+                mint: Pubkey::new_from_array([7; 32]),
+                asset_symbol: "USDC".to_string(),
+                asset_decimals: 6,
+                dev_account: None,
+                config: ConfigId(alloy_primitives::B256::repeat_byte(1)),
+            }),
+            account: Rc::new(vault),
+            escape_open,
+        }
+    }
+
+    #[test]
+    fn a_refresh_that_reads_the_same_vault_keeps_the_controls_and_a_changed_one_redraws_them() {
+        let vault = crate::tx::solana::sim::a_vault();
+        let author = vault.author;
+        let first = shape(Some(author), &Some(Ok(read(vault.clone(), false))));
+        // Read again ten seconds later: the same vault, the same escape.
+        let again = shape(Some(author), &Some(Ok(read(vault.clone(), false))));
+        assert_eq!(first, again);
+        // The tank changed, or the escape opened: drawn again.
+        let mut topped = vault.clone();
+        topped.tank.balance += 1;
+        assert_ne!(first, shape(Some(author), &Some(Ok(read(topped, false)))));
+        assert_ne!(first, shape(Some(author), &Some(Ok(read(vault, true)))));
+    }
+
+    #[test]
+    fn what_is_typed_survives_a_redraw_and_an_untouched_allowance_follows_the_vault() {
+        let vault = crate::tx::solana::sim::a_vault();
+        let typed = Rc::new(Typed::default());
+        let _ = controls(&Rc::new(read(vault.clone(), false)), &typed);
+        typed.fund.set("12.5".to_string());
+        typed.floor.set("7".to_string());
+        let fuel = typed.allowances[0].get_cloned();
+        assert_eq!(fuel, vault.allowances.fuel_per_sec.to_string());
+        typed.allowances[1].set("999".to_string());
+        // The vault's allowances changed (the author set them): a field
+        // left as it was read follows them; one typed in keeps its text.
+        let mut set = vault.clone();
+        set.allowances.fuel_per_sec += 5;
+        set.allowances.memory_mib += 5;
+        let _ = controls(&Rc::new(read(set.clone(), false)), &typed);
+        assert_eq!(typed.fund.get_cloned(), "12.5");
+        assert_eq!(typed.floor.get_cloned(), "7");
+        assert_eq!(
+            typed.allowances[0].get_cloned(),
+            set.allowances.fuel_per_sec.to_string()
+        );
+        assert_eq!(typed.allowances[1].get_cloned(), "999");
+    }
+
+    #[test]
+    fn a_landed_flow_empties_only_the_fields_it_was_sent_from_and_keeps_what_was_typed_since() {
+        let vault = crate::tx::solana::sim::a_vault();
+        let typed = Rc::new(Typed::default());
+        let _ = controls(&Rc::new(read(vault.clone(), false)), &typed);
+        typed.fund.set("12.5".to_string());
+        typed.floor.set("7".to_string());
+        typed.take.set("3".to_string());
+        // Funding the tank lands: its field is emptied, the others stay.
+        let landing = Typed::sent_from(&typed.fund);
+        landing();
+        assert_eq!(typed.fund.get_cloned(), "");
+        assert_eq!(typed.floor.get_cloned(), "7");
+        assert_eq!(typed.take.get_cloned(), "3");
+        // A withdrawal sent for 3, and 4 typed before it landed: kept.
+        let landing = Typed::sent_from(&typed.take);
+        typed.take.set("4".to_string());
+        landing();
+        assert_eq!(typed.take.get_cloned(), "4");
+
+        // Allowances sent: fuel and memory typed and sent; memory typed
+        // again before the flow landed.
+        typed.allowances[0].set("111".to_string());
+        typed.allowances[1].set("222".to_string());
+        let landing = Typed::sent_allowances(&typed.allowances, &typed.untouched);
+        typed.allowances[1].set("333".to_string());
+        landing();
+        // The vault read after it landed holds what was sent.
+        let mut set = vault.clone();
+        set.allowances.fuel_per_sec = 111;
+        set.allowances.memory_mib = 222;
+        set.allowances.streams += 1;
+        let _ = controls(&Rc::new(read(set.clone(), false)), &typed);
+        assert_eq!(typed.allowances[0].get_cloned(), "111");
+        assert_eq!(typed.allowances[1].get_cloned(), "333");
+        assert_eq!(
+            typed.allowances[4].get_cloned(),
+            set.allowances.streams.to_string()
+        );
+        // Sent fuel follows the vault from then on.
+        let mut later = set.clone();
+        later.allowances.fuel_per_sec = 150;
+        let _ = controls(&Rc::new(read(later, false)), &typed);
+        assert_eq!(typed.allowances[0].get_cloned(), "150");
+        assert_eq!(typed.allowances[1].get_cloned(), "333");
+        assert_eq!(typed.floor.get_cloned(), "7");
+    }
+
+    #[test]
+    fn the_fields_are_let_go_only_once_their_flow_is_over_having_changed_the_vault() {
+        use crate::tx::solana::error::SolError;
+        use crate::tx::solana::flow::Outcome;
+        use crate::tx::solana::port::Sig;
+        let signature = Sig([3; 64]);
+        assert_eq!(landed(None), None);
+        assert_eq!(landed(Some(&Step::Checking)), None);
+        assert_eq!(
+            landed(Some(&Step::Done(Outcome::Changed { signature }))),
+            Some(true)
+        );
+        assert_eq!(
+            landed(Some(&Step::Failed(SolError::Stuck { signature }))),
+            Some(true)
+        );
+        assert_eq!(landed(Some(&Step::Failed(SolError::Altered))), Some(false));
+    }
 }

@@ -1847,11 +1847,22 @@ fn start(panel: &Rc<Panel>, action: Action, reviewed: Rc<Network>) {
     crate::wallet::run::start(&vault, action, &running);
 }
 
-fn context_names(panel: &Panel) -> (String, String, Option<String>, String, String) {
+/// The wallet that sent for `running` (the one connected now, before it
+/// has sent), the chain, the wallet's chain, the dollar and the coin.
+fn context_names(
+    panel: &Panel,
+    running: &Running,
+) -> (
+    crate::wallet::Sender,
+    String,
+    Option<String>,
+    String,
+    String,
+) {
     let session = crate::wallet::get();
     let network = panel.network.get_cloned();
     (
-        session.wallet_name.get_cloned(),
+        running.sender().unwrap_or_else(|| session.sender()),
         network
             .as_ref()
             .map(|n| n.label.clone())
@@ -1871,7 +1882,7 @@ fn context_names(panel: &Panel) -> (String, String, Option<String>, String, Stri
 /// Words for an error, with this panel's names.
 pub fn error_words(
     error: &TxError,
-    wallet: &str,
+    sender: &crate::wallet::Sender,
     chain: &str,
     wallet_chain: Option<&str>,
     symbol: &str,
@@ -1879,7 +1890,8 @@ pub fn error_words(
     native: &str,
 ) -> crate::tx::error::Words {
     error.words(&Context {
-        wallet,
+        wallet: &sender.name,
+        keeps_activity: sender.keeps_activity,
         chain,
         wallet_chain,
         symbol,
@@ -2043,7 +2055,8 @@ fn prompt_lines(
 }
 
 fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
-    let (wallet, chain_name, wallet_chain, symbol, native) = context_names(panel);
+    let (sender, chain_name, wallet_chain, symbol, native) = context_names(panel, running);
+    let wallet = sender.name.clone();
     // The flow's amounts are in the reviewed network's units.
     let decimals = running.reviewed.asset_decimals;
     let vault_title = panel
@@ -2112,7 +2125,12 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
                 (
                     "Sent. Not seen by the network yet",
                     format!(
-                        "It may still go through: the app keeps watching. Check {wallet}’s activity before sending anything again."
+                        "It may still go through: the app keeps watching. {}.",
+                        crate::format::sentence(&crate::tx::error::look_before_sending_again(
+                            &wallet,
+                            sender.keeps_activity,
+                            &chain_name
+                        ))
                     ),
                 )
             } else {
@@ -2145,6 +2163,7 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
                                 "The app’s own second step didn’t go through: {}.",
                                 why.unsent_words(&Context {
                                     wallet: &wallet,
+                                    keeps_activity: sender.keeps_activity,
                                     chain: &chain_name,
                                     wallet_chain: wallet_chain.as_deref(),
                                     symbol: &symbol,
@@ -2330,7 +2349,7 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
         Step::Failed(error) => {
             let words = error_words(
                 error,
-                &wallet,
+                &sender,
                 &chain_name,
                 wallet_chain.as_deref(),
                 &symbol,
@@ -3372,6 +3391,7 @@ mod tests {
         // And an error's words.
         let words = TxError::BadSignature.words(&Context {
             wallet: "the development wallet",
+            keeps_activity: false,
             chain: "Base",
             wallet_chain: None,
             symbol: "USDC",

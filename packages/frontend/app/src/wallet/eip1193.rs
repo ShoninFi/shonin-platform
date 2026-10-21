@@ -13,7 +13,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-use super::rpc::{RpcError, Transport};
+use super::rpc::{Fate, RpcError, Transport};
 
 /// A wallet's provider object.
 #[derive(Clone)]
@@ -69,6 +69,7 @@ fn error_of(value: &JsValue) -> RpcError {
             .as_string()
             .unwrap_or_else(|| "the wallet refused it".to_string()),
         data: None,
+        fate: Fate::Answered,
     }
 }
 

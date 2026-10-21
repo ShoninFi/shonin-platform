@@ -7,7 +7,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use serde_json::{Value, json};
 
 use crate::tx::error::{Revert, TxError};
-use crate::tx::port::{Log, Pending, Reader, Receipt, TxRequest};
+use crate::tx::port::{Clock, Log, Pending, Reader, Receipt, ReceiptSeen, TxRequest};
 
 /// Where a JSON-RPC request goes.
 #[allow(async_fn_in_trait)]
@@ -22,16 +22,49 @@ pub struct RpcError {
     pub message: String,
     /// Revert data, when the node gave it.
     pub data: Option<String>,
+    /// How far the request got.
+    pub fate: Fate,
+}
+
+/// How far a request that ended in an error got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fate {
+    /// It couldn't be made, so it never left.
+    NotMade,
+    /// A node, a wallet, or something in front of a node answered with an
+    /// error.
+    Answered,
+    /// It may have reached a node, and the answer was lost or made no
+    /// sense: what it asked may have happened.
+    Lost,
 }
 
 impl RpcError {
-    /// No answer at all (the network, a refused fetch).
+    /// No answer, and the request can't have been handled: it couldn't be
+    /// made.
     pub fn unreachable(why: impl Into<String>) -> Self {
         Self {
             code: 0,
             message: why.into(),
             data: None,
+            fate: Fate::NotMade,
         }
+    }
+
+    /// No answer that makes sense to a request that may have reached the
+    /// node: the connection dropped or timed out, a gateway failed, or the
+    /// reply was garbled.
+    pub fn lost(why: impl Into<String>) -> Self {
+        Self {
+            fate: Fate::Lost,
+            ..Self::unreachable(why)
+        }
+    }
+
+    /// An endpoint's HTTP status other than 200, after any waiting out of a
+    /// 429, whose body held no JSON-RPC error: said by the status alone.
+    pub fn status(status: u16) -> Self {
+        Self::lost(format!("the chain's endpoint answered {status}"))
     }
 
     /// Read an error object: `{code, message, data}`. `data` may be the
@@ -55,6 +88,7 @@ impl RpcError {
             code,
             message,
             data,
+            fate: Fate::Answered,
         }
     }
 
@@ -170,6 +204,20 @@ pub fn receipt_exists(value: &Value) -> bool {
     !value.is_null() && !value.get("blockNumber").is_none_or(Value::is_null)
 }
 
+/// What a receipt answer shows, sealed or not: a status other than 1 is a
+/// revert, and a receipt whose status is missing or isn't a number is
+/// mined with its outcome unknown.
+pub fn receipt_seen_of(value: &Value) -> ReceiptSeen {
+    if !receipt_exists(value) {
+        return ReceiptSeen::Absent;
+    }
+    match value.get("status").map(quantity) {
+        Some(Ok(status)) if status == U256::from(1u8) => ReceiptSeen::Succeeded,
+        Some(Ok(_)) => ReceiptSeen::Reverted,
+        _ => ReceiptSeen::StatusUnread,
+    }
+}
+
 /// A receipt, or `None` while it isn't mined.
 pub fn parse_receipt(value: &Value) -> Result<Option<Receipt>, TxError> {
     if value.is_null() {
@@ -194,6 +242,7 @@ pub fn parse_receipt(value: &Value) -> Result<Option<Receipt>, TxError> {
         .unwrap_or_default();
     Ok(Some(Receipt {
         hash: word(&value["transactionHash"])?,
+        from: address(&value["from"]).ok(),
         success: quantity(&value["status"])? == U256::from(1u8),
         block: quantity_u64(&value["blockNumber"])?,
         logs,
@@ -213,6 +262,28 @@ pub fn transaction_json(request: &TxRequest) -> Value {
         tx["gas"] = json!(format!("{gas:#x}"));
     }
     tx
+}
+
+/// A transport whose every request ends within `millis`: one with no
+/// answer by then may still have reached a node, so it is lost
+/// ([`Fate::Lost`]), never refused (a raw send ending so is followed).
+pub struct Bounded<'a, T, C> {
+    pub inner: &'a T,
+    pub clock: &'a C,
+    pub millis: u32,
+}
+
+impl<T: Transport, C: Clock> Transport for Bounded<'_, T, C> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let answer = std::pin::pin!(self.inner.request(method, params));
+        let late = std::pin::pin!(self.clock.sleep(self.millis));
+        match futures::future::select(answer, late).await {
+            futures::future::Either::Left((answer, _)) => answer,
+            futures::future::Either::Right(_) => {
+                Err(RpcError::lost("the chain's endpoint didn't answer in time"))
+            }
+        }
+    }
 }
 
 /// Reading a chain through a transport.
@@ -240,6 +311,20 @@ impl<T: Transport> RpcReader<T> {
         )
     }
 
+    /// `eth_call` at `block` (`"latest"`, or a number in hex).
+    async fn call_with(&self, to: Address, data: Bytes, block: Value) -> Result<Bytes, TxError> {
+        let answer = self
+            .ask(
+                "eth_call",
+                json!([{"to": format!("{to:?}"), "data": format!("{data}")}, block]),
+            )
+            .await?;
+        let text = answer.as_str().ok_or_else(|| {
+            TxError::Network("the chain answered a read with nothing".to_string())
+        })?;
+        Ok(Bytes::from(hex_bytes(text)?))
+    }
+
     /// The latest block's base fee, if the chain has one (EIP-1559).
     pub async fn base_fee(&self) -> Result<Option<U256>, TxError> {
         let block = self
@@ -252,20 +337,42 @@ impl<T: Transport> RpcReader<T> {
             .transpose()
     }
 
-    /// A tip the chain suggests; zero where it can't say.
-    pub async fn priority_fee(&self) -> U256 {
-        match self.ask("eth_maxPriorityFeePerGas", json!([])).await {
-            Ok(value) => quantity(&value).unwrap_or_default(),
-            Err(_) => U256::ZERO,
-        }
+    /// The tip the chain suggests.
+    pub async fn priority_fee(&self) -> Result<U256, TxError> {
+        quantity(&self.ask("eth_maxPriorityFeePerGas", json!([])).await?)
     }
 
-    pub async fn send_raw(&self, raw: &Bytes) -> Result<B256, TxError> {
-        word(
+    /// The account's next nonce counting only mined transactions.
+    pub async fn latest_nonce(&self, who: Address) -> Result<u64, TxError> {
+        quantity_u64(
             &self
-                .ask("eth_sendRawTransaction", json!([format!("{raw}")]))
+                .ask(
+                    "eth_getTransactionCount",
+                    json!([format!("{who:?}"), "latest"]),
+                )
                 .await?,
         )
+    }
+
+    /// Hand a signed transaction to the endpoint. It is known by the hash
+    /// of its signed bytes. Only a request that couldn't be made is a
+    /// refusal: it never left. After any other error, whatever its words,
+    /// the transaction may have reached a node (an endpoint can be a pool
+    /// of nodes, and no one look at it proves a node didn't take it), so it
+    /// is followed by its hash. The page never signs past its nonce until
+    /// the chain shows that nonce mined ([`super::session::sign_and_send`]),
+    /// so a send after it takes its place, and at most one of the two can
+    /// land.
+    pub async fn send_raw(&self, raw: &Bytes) -> Result<B256, TxError> {
+        let hash = alloy_primitives::keccak256(raw);
+        match self
+            .transport
+            .request("eth_sendRawTransaction", json!([format!("{raw}")]))
+            .await
+        {
+            Err(error) if error.fate == Fate::NotMade => Err(error.into_tx_error()),
+            _ => Ok(hash),
+        }
     }
 }
 
@@ -275,16 +382,11 @@ impl<T: Transport> Reader for RpcReader<T> {
     }
 
     async fn call(&self, to: Address, data: Bytes) -> Result<Bytes, TxError> {
-        let answer = self
-            .ask(
-                "eth_call",
-                json!([{"to": format!("{to:?}"), "data": format!("{data}")}, "latest"]),
-            )
-            .await?;
-        let text = answer.as_str().ok_or_else(|| {
-            TxError::Network("the chain answered a read with nothing".to_string())
-        })?;
-        Ok(Bytes::from(hex_bytes(text)?))
+        self.call_with(to, data, json!("latest")).await
+    }
+
+    async fn call_at(&self, to: Address, data: Bytes, block: u64) -> Result<Bytes, TxError> {
+        self.call_with(to, data, json!(format!("{block:#x}"))).await
     }
 
     async fn native_balance(&self, who: Address) -> Result<U256, TxError> {
@@ -324,6 +426,13 @@ impl<T: Transport> Reader for RpcReader<T> {
         ))
     }
 
+    async fn receipt_seen_as(&self, hash: B256) -> Result<ReceiptSeen, TxError> {
+        let value = self
+            .ask("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
+            .await?;
+        Ok(receipt_seen_of(&value))
+    }
+
     async fn pending(&self, hash: B256) -> Result<Pending, TxError> {
         let tx = self
             .ask("eth_getTransactionByHash", json!([format!("{hash:?}")]))
@@ -337,14 +446,11 @@ impl<T: Transport> Reader for RpcReader<T> {
     }
 
     async fn mined_nonce(&self, who: Address) -> Result<u64, TxError> {
-        quantity_u64(
-            &self
-                .ask(
-                    "eth_getTransactionCount",
-                    json!([format!("{who:?}"), "latest"]),
-                )
-                .await?,
-        )
+        self.latest_nonce(who).await
+    }
+
+    async fn pending_nonce(&self, who: Address) -> Result<u64, TxError> {
+        RpcReader::pending_nonce(self, who).await
     }
 
     async fn chain_time(&self) -> Result<u64, TxError> {
@@ -417,6 +523,23 @@ pub fn backoff(attempt: u32, retry_after_seconds: Option<u32>) -> Option<u32> {
     })
 }
 
+/// The error of an endpoint's answer whose HTTP status isn't 200, after any
+/// waiting out of a 429, from its status and, for a 4xx, its body read as
+/// JSON: a 4xx carrying a JSON-RPC error object is shown in its words (some
+/// endpoints answer a node's error with a 4xx); anything else is said by the
+/// status alone ([`RpcError::status`]). What became of a raw send is never
+/// read from either: it is followed ([`RpcReader::send_raw`]).
+pub fn not_ok(status: u16, body: Option<&Value>) -> RpcError {
+    if (400..500).contains(&status)
+        && let Some(error) = body
+            .and_then(|body| body.get("error"))
+            .filter(|error| error.is_object())
+    {
+        return RpcError::from_json(error);
+    }
+    RpcError::status(status)
+}
+
 /// A chain's public endpoint, over the browser's `fetch`.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
@@ -429,16 +552,20 @@ impl Transport for Endpoint {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut attempt = 0;
         let reply = loop {
+            // A request that couldn't be made never left.
             let request = gloo_net::http::Request::post(&self.url)
                 .json(&body)
                 .map_err(|error| RpcError::unreachable(error.to_string()))?;
+            // A fetch that fails may have failed after the request was sent
+            // (the connection dropped, the answer timed out).
             let reply = request
                 .send()
                 .await
-                .map_err(|_| RpcError::unreachable("the chain's endpoint didn't answer"))?;
-            // A public endpoint asking us to slow down refused the request
-            // before doing anything with it, so asking again is safe, sends
-            // included: wait as it asks, or back off, a few times.
+                .map_err(|_| RpcError::lost("the chain's endpoint didn't answer"))?;
+            // A public endpoint asking us to slow down: wait as it asks, or
+            // back off, a few times. Asking again is safe, sends included:
+            // a send is the same signed bytes each time, and what became of
+            // it is read from the chain afterwards.
             if reply.status() == 429 {
                 let asked = reply
                     .headers()
@@ -453,14 +580,22 @@ impl Transport for Endpoint {
             break reply;
         };
         if !reply.ok() {
-            return Err(RpcError::unreachable(format!(
-                "the chain's endpoint answered {}",
-                reply.status()
-            )));
+            // Some endpoints answer a node's JSON-RPC error with a 4xx: its
+            // words are what is shown. A body without one (or any other
+            // status) is said by the status alone.
+            let status = reply.status();
+            let body = if (400..500).contains(&status) {
+                reply.json::<Value>().await.ok()
+            } else {
+                None
+            };
+            return Err(not_ok(status, body.as_ref()));
         }
-        let reply: Value = reply.json().await.map_err(|_| {
-            RpcError::unreachable("the chain's endpoint answered in an unexpected shape")
-        })?;
+        // A 200 whose body can't be read: the node had the request.
+        let reply: Value = reply
+            .json()
+            .await
+            .map_err(|_| RpcError::lost("the chain's endpoint answered in an unexpected shape"))?;
         if let Some(error) = reply.get("error") {
             return Err(RpcError::from_json(error));
         }
@@ -621,6 +756,71 @@ mod tests {
         assert_eq!(tx["gas"], "0x5208");
         assert_eq!(tx["data"], "0xab");
         assert_eq!(tx["to"], format!("0x{}", "02".repeat(20)));
+    }
+
+    /// An endpoint whose `eth_sendRawTransaction` ends in `send`, and which
+    /// is asked nothing else.
+    struct Node {
+        send: Result<Value, RpcError>,
+    }
+
+    impl Transport for Node {
+        async fn request(&self, method: &str, _params: Value) -> Result<Value, RpcError> {
+            match method {
+                "eth_sendRawTransaction" => self.send.clone(),
+                other => panic!("unexpected request {other}"),
+            }
+        }
+    }
+
+    const RAW: [u8; 3] = [0x02, 0xab, 0xcd];
+
+    fn send_raw_on(send: Result<Value, RpcError>) -> Result<B256, TxError> {
+        let reader = RpcReader {
+            transport: Node { send },
+        };
+        futures::executor::block_on(reader.send_raw(&Bytes::from(RAW.to_vec())))
+    }
+
+    fn node(message: &str) -> RpcError {
+        RpcError::from_json(&json!({"code": -32000, "message": message}))
+    }
+
+    #[test]
+    fn a_raw_send_the_node_took_is_known_by_the_hash_of_its_signed_bytes() {
+        let hash = alloy_primitives::keccak256(RAW);
+        assert_eq!(send_raw_on(Ok(json!(format!("{hash:?}")))), Ok(hash));
+        assert_eq!(send_raw_on(Ok(Value::Null)), Ok(hash));
+    }
+
+    #[test]
+    fn any_error_to_a_raw_send_that_was_made_is_followed_whatever_its_words() {
+        let hash = alloy_primitives::keccak256(RAW);
+        for error in [
+            node("nonce too low"),
+            node("txpool is full"),
+            node("already known"),
+            node("request timed out"),
+            node("something no node is known to say"),
+            RpcError::from_json(&json!({})),
+            RpcError::lost("the chain's endpoint didn't answer"),
+            RpcError::status(429),
+            RpcError::status(502),
+            not_ok(
+                429,
+                Some(&json!({"error": {"code": -32016, "message": "over rate limit"}})),
+            ),
+        ] {
+            assert_eq!(send_raw_on(Err(error.clone())), Ok(hash), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_raw_send_that_couldnt_be_made_is_a_refusal() {
+        assert!(matches!(
+            send_raw_on(Err(RpcError::unreachable("couldn't encode the request"))),
+            Err(TxError::Network(_))
+        ));
     }
 
     #[test]

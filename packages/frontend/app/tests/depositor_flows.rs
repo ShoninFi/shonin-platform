@@ -14,7 +14,7 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use app::tx::error::{Context, TxError};
-use app::tx::flow::{self, Cancel, Ctx, Fallback, Nudge, Outcome, Pace, Prompt, Step};
+use app::tx::flow::{self, Approval, Cancel, Ctx, Fallback, Nudge, Outcome, Pace, Prompt, Step};
 use app::tx::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
 use app::tx::read::ClaimState;
 use chain::bindings::vault::{self as b, IVault};
@@ -46,6 +46,14 @@ enum Wallet {
     /// Never answers the second step (`settle`): a wallet session gone
     /// quiet. Meanwhile the keeper settles the request.
     NeverAnswersSettle,
+    /// Declines the deposit request (and nothing else).
+    DeclinesDeposit,
+    /// Sends the deposit request, which is mined and reverts.
+    DepositRevertsWhenMined,
+    /// The endpoint's node hasn't seen the mined approval yet: it refuses
+    /// to simulate the deposit (the test also has it read the allowance
+    /// as zero).
+    NodeLags,
 }
 
 /// What becomes of the app's own `settle` (the second step) once the wallet
@@ -658,10 +666,26 @@ impl Reader for SimReader {
     async fn call(&self, to: Address, data: Bytes) -> Result<Bytes, TxError> {
         self.0.borrow_mut().call(to, &data)
     }
+    /// Answered by a node that has the block: the chain as it stands.
+    async fn call_at(&self, to: Address, data: Bytes, _block: u64) -> Result<Bytes, TxError> {
+        self.0.borrow_mut().call(to, &data)
+    }
+    /// A lagging node reports a block before the known approval's (101);
+    /// otherwise the endpoint can't say.
+    async fn block_number(&self) -> Result<Option<u64>, TxError> {
+        Ok((self.0.borrow().wallet == Wallet::NodeLags).then_some(100))
+    }
     async fn native_balance(&self, _who: Address) -> Result<U256, TxError> {
         Ok(U256::from(10u64).pow(U256::from(18u8)))
     }
     async fn estimate_gas(&self, request: &TxRequest) -> Result<u64, TxError> {
+        if self.0.borrow().wallet == Wallet::NodeLags
+            && request.data[..4] == IVault::requestDepositCall::SELECTOR
+        {
+            return Err(TxError::WouldRevert {
+                reason: app::tx::error::Revert::Unknown,
+            });
+        }
         match self.0.borrow().simulate(request) {
             Ok(()) => Ok(100_000),
             Err(name) => Err(TxError::WouldRevert {
@@ -759,6 +783,10 @@ impl Signer for SimWallet {
         if sim.wallet == Wallet::DeclinesSettle && selector == IVault::settleCall::SELECTOR {
             return Err(TxError::Rejected);
         }
+        if sim.wallet == Wallet::DeclinesDeposit && selector == IVault::requestDepositCall::SELECTOR
+        {
+            return Err(TxError::Rejected);
+        }
         assert_eq!(
             request.chain_id, sim.wallet_chain,
             "sent on the wrong chain"
@@ -777,7 +805,9 @@ impl Signer for SimWallet {
         }
         sim.block += 1;
         let first = sim.logs.len();
-        let success = sim.simulate(request).is_ok();
+        let success = sim.simulate(request).is_ok()
+            && !(sim.wallet == Wallet::DepositRevertsWhenMined
+                && selector == IVault::requestDepositCall::SELECTOR);
         if success {
             sim.execute(request);
         }
@@ -791,6 +821,7 @@ impl Signer for SimWallet {
             hash,
             Receipt {
                 hash,
+                from: Some(request.from),
                 success,
                 block,
                 logs,
@@ -803,6 +834,7 @@ impl Signer for SimWallet {
 fn words(error: &TxError) -> String {
     let words = error.words(&Context {
         wallet: "MetaMask",
+        keeps_activity: true,
         chain: "Base",
         wallet_chain: Some("Hyperliquid"),
         symbol: "USDC",
@@ -1264,5 +1296,144 @@ fn skipping_the_second_step_lets_only_that_step_go_and_the_deposit_still_ends_do
     assert!(
         matches!(result, Ok(Outcome::Deposited { .. })),
         "{result:?}; steps {steps:?}"
+    );
+}
+
+fn dollars(amount: u64) -> U256 {
+    U256::from(amount * USD)
+}
+
+/// An approval of `amount` seen mined by an earlier try, in a block past
+/// the chain's start.
+fn known(amount: u64) -> Approval {
+    Approval {
+        amount: dollars(amount),
+        block: 101,
+    }
+}
+
+fn deposit_after(
+    world: &World,
+    amount: u64,
+    known: Option<Approval>,
+) -> (Result<Outcome, TxError>, Vec<Step>) {
+    world.run(move |ctx| {
+        Box::pin(flow::deposit_after(
+            ctx,
+            dollars(amount),
+            "SANCTIONED,US",
+            known,
+        ))
+    })
+}
+
+/// The app's own record after a flow, as `wallet::run::start` keeps it:
+/// every step, then the end the flow reports.
+fn remembered_after(
+    steps: &[Step],
+    result: Result<Outcome, TxError>,
+    known: Option<Approval>,
+) -> Option<Approval> {
+    let end = match result {
+        Ok(done) => Step::Done(done),
+        Err(error) => Step::Failed(error),
+    };
+    steps.iter().chain([&end]).fold(known, |known, step| {
+        app::wallet::run::approval_after(step, known)
+    })
+}
+
+fn asked_to_approve(steps: &[Step]) -> bool {
+    steps
+        .iter()
+        .any(|step| matches!(step, Step::Signing(Prompt::Approve { .. })))
+}
+
+/// A $1,000 approval was seen mined. The person then deposits $500 instead
+/// and declines it in the wallet: what is kept is still the $1,000 approval,
+/// so depositing $1,000 next, through a node that reads the allowance short,
+/// asks for no second approval.
+#[test]
+fn a_known_approval_is_not_shrunk_by_a_smaller_deposit_so_the_full_amount_asks_no_second_approval()
+{
+    let world = World::new(Wallet::DeclinesDeposit);
+    let (result, steps) = deposit_after(&world, 500, Some(known(1_000)));
+    let kept = remembered_after(&steps, result, Some(known(1_000)));
+    assert_eq!(kept, Some(known(1_000)));
+    world.with(|chain| {
+        chain.wallet = Wallet::Approves;
+        let account = chain.wallet_account;
+        chain.allowance.insert((account, vault()), U256::ZERO);
+    });
+    let (_, steps) = deposit_after(&world, 1_000, kept);
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step, Step::Signing(Prompt::Deposit { .. }))),
+        "the flow got as far as the wallet: {steps:?}"
+    );
+    assert!(!asked_to_approve(&steps), "{steps:?}");
+}
+
+/// A retry on the earlier try's approval sends only the deposit, which is
+/// mined and refused: one fee was paid by this try, not two.
+#[test]
+fn a_retry_that_sent_only_the_deposit_never_says_two_fees_were_paid() {
+    let world = World::new(Wallet::DepositRevertsWhenMined);
+    let (result, _) = deposit_after(&world, 1_000, Some(known(1_000)));
+    assert_eq!(
+        world.sent_selectors(),
+        vec![IVault::requestDepositCall::SELECTOR],
+        "this try sent only the deposit"
+    );
+    let said = words(&result.unwrap_err());
+    assert!(!said.contains("Two network fees were paid"), "{said}");
+    assert!(
+        said.contains("Nothing moved except the network fee."),
+        "{said}"
+    );
+}
+
+/// A deposit of $500 on a known $1,000 approval, declined: the approval on
+/// the chain is said, and kept, at $1,000.
+#[test]
+fn a_known_approval_is_said_and_kept_at_its_own_amount_not_the_smaller_deposits() {
+    let world = World::new(Wallet::DeclinesDeposit);
+    let (result, _) = deposit_after(&world, 500, Some(known(1_000)));
+    let Err(error @ TxError::ApprovalStands { amount, block, .. }) = &result else {
+        panic!("{result:?}");
+    };
+    let said = words(error);
+    assert!(!said.contains("Your approval of $500.00"), "{said}");
+    assert!(said.contains("Your approval of $1,000.00"), "{said}");
+    assert_eq!((*amount, *block), (dollars(1_000), 101));
+}
+
+/// The approval of $1,000 was mined and the deposit stopped. The endpoint's
+/// node still lags (it reads the allowance as zero and refuses to simulate
+/// the deposit) for two more tries: neither asks for a second approval, and
+/// each says the network hasn't caught up yet.
+#[test]
+fn a_lagging_node_never_causes_a_second_approval_however_many_tries_on() {
+    let world = World::new(Wallet::NodeLags);
+    world.with(|chain| {
+        let account = chain.wallet_account;
+        chain.allowance.insert((account, vault()), U256::ZERO);
+    });
+    let mut kept = Some(known(1_000));
+    for _ in 0..3 {
+        let (result, steps) = deposit_after(&world, 1_000, kept);
+        assert!(!asked_to_approve(&steps), "kept {kept:?}: {steps:?}");
+        let said = words(result.as_ref().unwrap_err());
+        assert!(
+            said.contains("hasn't caught up with your approval yet"),
+            "{said}"
+        );
+        kept = remembered_after(&steps, result, kept);
+        assert_eq!(kept, Some(known(1_000)));
+    }
+    assert!(
+        world.sent_selectors().is_empty(),
+        "nothing sent on any retry"
     );
 }

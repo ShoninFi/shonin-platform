@@ -675,8 +675,8 @@ fn state_view(connection: &Connection, phrase: bool, phrase_mode: &Mutable<bool>
     }
     let wallet_name = |id: &WalletId| -> String {
         match id {
-            WalletId::Phrase => "your recovery phrase wallet".to_string(),
-            WalletId::Dev => "the development wallet".to_string(),
+            WalletId::Phrase => crate::wallet::PHRASE_WALLET.to_string(),
+            WalletId::Dev => crate::wallet::DEV_WALLET.to_string(),
             other => session
                 .wallets
                 .lock_ref()
@@ -1120,8 +1120,10 @@ fn switch_button_as(chain_id: u64, size: Size, kind: Kind) -> El {
                     )),
                 };
                 if let Err(error) = result {
+                    let sender = session.sender();
                     let context = crate::tx::error::Context {
-                        wallet: &session.wallet_name.get_cloned(),
+                        wallet: &sender.name,
+                        keeps_activity: sender.keeps_activity,
                         chain: &networks::chain_name(chain_id),
                         wallet_chain: None,
                         symbol: "",
