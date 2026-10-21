@@ -15,9 +15,12 @@
 //! call or estimate to such a target (or to a precompile itself) goes to
 //! the endpoints shown to serve them first, then those not known, in the
 //! list's order; an endpoint marked as not serving them is asked again only
-//! once [`ASK_AGAIN_AFTER`] has passed. Every other request goes through the
-//! list as before, so cheap reads stay on whichever endpoint answers them
-//! best.
+//! once [`ASK_AGAIN_AFTER`] has passed, or when no endpoint shown to serve
+//! them is left to ask. An endpoint shown to serve them is marked only when
+//! it fails them [`FAILURES_TO_MARK`] times within [`FAILURE_SPAN`], so one
+//! dropped request never stops these calls. Every other request goes
+//! through the list as before, so cheap reads stay on whichever endpoint
+//! answers them best.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,6 +43,14 @@ pub(crate) const PROBE: Address = Address::new([
 /// How long an endpoint marked as not serving HyperCore's reads is passed
 /// over before a call that reads HyperCore is sent to it again.
 pub(crate) const ASK_AGAIN_AFTER: Duration = Duration::from_secs(60);
+
+/// How many failures within [`FAILURE_SPAN`] mark an endpoint shown to
+/// serve HyperCore's reads (or one failing for a reason that names no
+/// precompile, such as its node refusing connections) as not serving them.
+pub(crate) const FAILURES_TO_MARK: usize = 3;
+
+/// The span within which [`FAILURES_TO_MARK`] failures mark an endpoint.
+pub(crate) const FAILURE_SPAN: Duration = Duration::from_secs(30);
 
 /// What the client says of an endpoint that failed to reach what a call
 /// needs.
@@ -74,6 +85,13 @@ pub(crate) fn is_forwarding_failure(code: i64, message: &str) -> bool {
     .any(|phrase| message.contains(phrase))
 }
 
+/// Whether a successful call's raw result shows the endpoint serving a read
+/// of HyperCore: an empty `0x` is what an address with no code answers, so
+/// it shows nothing.
+pub(crate) fn is_answer(result: &str) -> bool {
+    !matches!(result.trim(), "\"0x\"" | "\"\"" | "null")
+}
+
 /// Whether a forwarding failure names a HyperCore read precompile.
 pub(crate) fn names_precompile(message: &str) -> bool {
     message.to_ascii_lowercase().contains("precompile")
@@ -105,6 +123,11 @@ struct Known {
     /// Whether each endpoint served a read of HyperCore when last asked,
     /// and when that was.
     serves: HashMap<usize, (bool, tokio::time::Instant)>,
+    /// The endpoints that have served a read of HyperCore at least once.
+    served: HashSet<usize>,
+    /// Each endpoint's failures of HyperCore's reads since it last served
+    /// one or was marked, within [`FAILURE_SPAN`].
+    failures: HashMap<usize, Vec<tokio::time::Instant>>,
     /// The contracts a call to which failed for a precompile it reads.
     targets: HashSet<Address>,
 }
@@ -123,6 +146,10 @@ impl HyperCore {
         known
             .serves
             .insert(at, (serves, tokio::time::Instant::now()));
+        known.failures.remove(&at);
+        if serves {
+            known.served.insert(at);
+        }
         drop(known);
         if before != Some(serves) {
             if serves {
@@ -156,33 +183,59 @@ impl HyperCore {
     /// The order to ask `count` endpoints in for a call that reads HyperCore:
     /// those shown to serve it, then those not known, in the list's order,
     /// then those marked as not serving it whose mark is older than
-    /// [`ASK_AGAIN_AFTER`]. One marked more lately is not asked.
+    /// [`ASK_AGAIN_AFTER`]. One marked more lately is asked only when no
+    /// endpoint shown to serve it is left, last, those that once served
+    /// it first: the call is never left with fewer endpoints to try than
+    /// any other call has.
     pub(crate) fn order(&self, count: usize) -> Vec<usize> {
         let known = self.known();
         let rank = |at: &usize| match known.serves.get(at) {
-            Some((true, _)) => Some(0),
-            None => Some(1),
-            Some((false, when)) if when.elapsed() >= ASK_AGAIN_AFTER => Some(2),
-            Some((false, _)) => None,
+            Some((true, _)) => 0,
+            None => 1,
+            Some((false, when)) if when.elapsed() >= ASK_AGAIN_AFTER => 2,
+            Some((false, _)) if known.served.contains(at) => 3,
+            Some((false, _)) => 4,
         };
-        let mut order: Vec<(u8, usize)> = (0..count)
-            .filter_map(|at| rank(&at).map(|rank| (rank, at)))
-            .collect();
+        let mut order: Vec<(u8, usize)> = (0..count).map(|at| (rank(&at), at)).collect();
+        if order.iter().any(|(rank, _)| *rank == 0) {
+            order.retain(|(rank, _)| *rank < 3);
+        }
         order.sort();
         order.into_iter().map(|(_, at)| at).collect()
     }
 
-    /// What a call failed for `at` says of it: a forwarding failure naming a
-    /// precompile marks the endpoint as not serving HyperCore's reads, and
-    /// the call's targets as reading HyperCore.
+    /// Note that endpoint `at` failed a read of HyperCore as its own
+    /// trouble, `names_precompile` when its failure named a precompile it
+    /// could not forward. One not shown to serve these reads is marked as
+    /// not serving them at a failure naming a precompile; otherwise an
+    /// endpoint is marked once it has failed [`FAILURES_TO_MARK`] times
+    /// within [`FAILURE_SPAN`], so that a blip on the endpoint that serves
+    /// them does not stop them.
+    pub(crate) fn failed(&self, at: usize, names_precompile: bool) {
+        let mut known = self.known();
+        let serving = matches!(known.serves.get(&at), Some((true, _)));
+        let now = tokio::time::Instant::now();
+        let failures = known.failures.entry(at).or_default();
+        failures.retain(|when| now.duration_since(*when) < FAILURE_SPAN);
+        failures.push(now);
+        let repeated = failures.len() >= FAILURES_TO_MARK;
+        drop(known);
+        if repeated || (names_precompile && !serving) {
+            self.saw(at, false);
+        }
+    }
+
+    /// What a read failed for `at` as a forwarding failure says of it: it
+    /// counts as the endpoint failing HyperCore's reads ([`HyperCore::failed`]),
+    /// and when it names a precompile, the call's targets read HyperCore.
     pub(crate) fn failed_forwarding(&self, at: usize, targets: &[Address], message: &str) {
-        if !names_precompile(message) {
-            return;
+        let precompile = names_precompile(message);
+        if precompile {
+            for to in targets {
+                self.reads_hypercore(*to);
+            }
         }
-        self.saw(at, false);
-        for to in targets {
-            self.reads_hypercore(*to);
-        }
+        self.failed(at, precompile);
     }
 }
 
@@ -241,20 +294,30 @@ where
         let each = self.each.clone();
         let hypercore = self.hypercore.clone();
         Box::pin(async move {
-            let mut last = None;
+            // The failure returned is the first endpoint's, the one best
+            // placed to serve the call: a rate limit there stays a rate
+            // limit, to be waited out, rather than hidden behind the
+            // failure of an endpoint that never serves these reads.
+            let mut first = None;
             for at in hypercore.order(each.len()) {
                 let mut endpoint = each[at].clone();
                 match endpoint.call(request.clone()).await {
                     Ok(answer) => {
-                        if answer.responses().iter().all(|r| r.payload.is_success()) {
+                        if answer.responses().iter().all(|r| {
+                            r.payload
+                                .as_success()
+                                .is_some_and(|result| is_answer(result.get()))
+                        }) {
                             hypercore.saw(at, true);
                         }
                         return Ok(answer);
                     }
-                    Err(error) => last = Some(error),
+                    Err(error) => {
+                        first.get_or_insert(error);
+                    }
                 }
             }
-            Err(last.unwrap_or_else(|| {
+            Err(first.unwrap_or_else(|| {
                 TransportErrorKind::custom_str(
                     "no endpoint of the list serves HyperCore's reads now",
                 )
@@ -311,6 +374,70 @@ mod tests {
         assert_eq!(hypercore.order(3), vec![2, 1]);
         tokio::time::advance(ASK_AGAIN_AFTER).await;
         assert_eq!(hypercore.order(3), vec![2, 1, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_failure_of_the_endpoint_that_serves_hypercore_keeps_it_first() {
+        let hypercore = HyperCore::default();
+        hypercore.saw(0, false);
+        hypercore.saw(1, true);
+        hypercore.failed(1, true);
+        assert_eq!(hypercore.order(3), vec![1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_endpoint_that_serves_hypercore_is_marked_only_after_repeated_failures_close_together()
+     {
+        let hypercore = HyperCore::default();
+        hypercore.saw(0, true);
+        // Failures spread wider than the span never add up.
+        for _ in 0..FAILURES_TO_MARK + 1 {
+            hypercore.failed(0, true);
+            tokio::time::advance(FAILURE_SPAN).await;
+        }
+        assert_eq!(hypercore.order(2), vec![0, 1]);
+        for _ in 0..FAILURES_TO_MARK {
+            hypercore.failed(0, true);
+        }
+        assert_eq!(hypercore.order(2), vec![1, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_endpoint_serving_hypercore_left_the_marked_ones_are_still_asked_once_serving_first()
+     {
+        let hypercore = HyperCore::default();
+        hypercore.saw(0, false);
+        hypercore.saw(1, true);
+        for _ in 0..FAILURES_TO_MARK {
+            hypercore.failed(1, true);
+        }
+        // The endpoint not known goes first, then the one that served, then
+        // the one that never did.
+        assert_eq!(hypercore.order(3), vec![2, 1, 0]);
+        hypercore.saw(2, false);
+        assert_eq!(hypercore.order(3), vec![1, 0, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_endpoint_refusing_every_connection_is_marked_though_it_names_no_precompile() {
+        let hypercore = HyperCore::default();
+        hypercore.saw(1, true);
+        for _ in 0..FAILURES_TO_MARK {
+            hypercore.failed_forwarding(
+                0,
+                &[],
+                "Post \"\": dial tcp 172.18.0.2:3001: connect: connection refused",
+            );
+        }
+        assert_eq!(hypercore.order(2), vec![1]);
+    }
+
+    #[test]
+    fn an_empty_answer_shows_no_endpoint_serving_hypercore() {
+        assert!(!is_answer("\"0x\""));
+        assert!(is_answer(
+            "\"0x000000000000000000000000000000000000000000000000000000002c34b2e0\""
+        ));
     }
 
     #[test]

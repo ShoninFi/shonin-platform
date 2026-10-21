@@ -1089,8 +1089,11 @@ impl Endpoints {
                             return;
                         };
                         let read = TransactionRequest::default().with_to(hypercore::PROBE);
-                        if let Ok(Ok(_)) =
+                        // An empty answer is what an address with no code
+                        // gives: it shows nothing of serving the read.
+                        if let Ok(Ok(answer)) =
                             tokio::time::timeout(CHECK_TIMEOUT, provider.call(read)).await
+                            && !answer.is_empty()
                         {
                             hypercore.saw(at, true);
                         }
@@ -1627,7 +1630,21 @@ where
         let noted = self.hypercore.clone();
         let answer = self.inner.call(request);
         Box::pin(async move {
-            let answer = answer.await?;
+            let answer = match answer.await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // An endpoint that can't be reached at all (its
+                    // connection refused, no answer in time) fails a read of
+                    // HyperCore as surely as one that names the precompile.
+                    if let Some((hypercore, at)) = &noted
+                        && !rate_limited(&error)
+                        && targets.iter().any(|to| hypercore.touches(*to))
+                    {
+                        hypercore.failed(*at, false);
+                    }
+                    return Err(error);
+                }
+            };
             let refusals = || {
                 answer
                     .responses()

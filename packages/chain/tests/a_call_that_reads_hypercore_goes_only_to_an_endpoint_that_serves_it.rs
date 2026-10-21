@@ -61,6 +61,13 @@ enum Reads {
     FailsOnce,
     /// It answers precompile reads, and reverts every call to [`VALUED`].
     Reverts,
+    /// It serves them, but fails the first call to [`VALUED`] for a
+    /// precompile it could not forward this once.
+    BlipsOnce,
+    /// It serves them, but limits the rate of the first call to [`VALUED`].
+    RateLimitedOnce,
+    /// Its node refuses every connection: it fails every call and estimate.
+    Down,
 }
 
 /// What each endpoint was asked: method and target, in order.
@@ -112,6 +119,34 @@ fn endpoint(reads: Reads, asked: Asked, mined: Mined) -> stand_in::Answer {
         asked.lock().unwrap().push((method.to_string(), to));
         let precompile = to.is_some_and(|to| to[..18] == [0; 18] && to[18] == 0x08);
         let reads_hypercore = precompile || to == Some(VALUED);
+        if matches!(method, "eth_call" | "eth_estimateGas") && matches!(reads, Reads::Down) {
+            return refusal(
+                request,
+                -32603,
+                "Post \"\": dial tcp 172.18.0.2:3001: connect: connection refused",
+            );
+        }
+        let first_call = matches!(reads, Reads::BlipsOnce | Reads::RateLimitedOnce)
+            && method == "eth_call"
+            && to == Some(VALUED)
+            && {
+                let mut failed = failed_once.lock().unwrap();
+                !std::mem::replace(&mut *failed, true)
+            };
+        match reads {
+            Reads::BlipsOnce if first_call => {
+                return refusal(
+                    request,
+                    -32603,
+                    "Revm error: failed to forward read precompile \
+                     0x000000000000000000000000000000000000080F: client error (Connect)",
+                );
+            }
+            Reads::RateLimitedOnce if first_call => {
+                return refusal(request, 429, "Too many requests, rate limit exceeded");
+            }
+            _ => {}
+        }
         if matches!(method, "eth_call" | "eth_estimateGas") && reads_hypercore {
             match reads {
                 Reads::CannotForward => {
@@ -317,4 +352,58 @@ async fn a_revert_from_an_endpoint_that_serves_hypercore_reads_is_the_answer() {
         "a revert was taken for an endpoint's trouble"
     );
     assert!(mined.lock().unwrap().is_empty(), "a reverted call was sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_failure_of_the_only_endpoint_serving_hypercore_does_not_stop_the_next_call() {
+    let (client, from, asked, _) =
+        client_over(&[Reads::CannotForward, Reads::BlipsOnce, Reads::Down]).await;
+    // Learned through the first endpoint, taken by the second.
+    client.send_estimated(from, VALUED, call()).await.unwrap();
+
+    // The only endpoint serving HyperCore's reads fails one call...
+    let blip = client
+        .read(VALUED, IERC20::balanceOfCall { account: from })
+        .await;
+    assert!(blip.is_err(), "the endpoint's one failure was never seen");
+    assert_eq!(count(&asked[1], "eth_call"), 1);
+
+    // ...and the next call, at once, still goes to it and is answered.
+    let read = client
+        .read(VALUED, IERC20::balanceOfCall { account: from })
+        .await;
+    match read {
+        Ok(value) => assert_eq!(value, U256::from(7u64)),
+        Err(error) => panic!(
+            "one failure of the only endpoint serving HyperCore's reads stopped the next call: \
+             {error:#}"
+        ),
+    }
+    assert_eq!(count(&asked[1], "eth_call"), 2);
+    assert_eq!(
+        client.hypercore_order([VALUED]).map(|order| order[0]),
+        Some(1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limit_from_the_endpoint_serving_hypercore_is_the_failure_and_is_waited_out() {
+    let (client, from, asked, _) =
+        client_over(&[Reads::CannotForward, Reads::RateLimitedOnce, Reads::Down]).await;
+    client.send_estimated(from, VALUED, call()).await.unwrap();
+
+    // The endpoint serving the read limits the rate once; the others fail
+    // it for their own trouble. The rate limit is what the call failed
+    // for, so it is waited out and the read asked again.
+    let read = client
+        .read(VALUED, IERC20::balanceOfCall { account: from })
+        .await;
+    match read {
+        Ok(value) => assert_eq!(value, U256::from(7u64)),
+        Err(error) => panic!(
+            "the rate limit of the endpoint serving the read was hidden behind another's \
+             failure: {error:#}"
+        ),
+    }
+    assert_eq!(count(&asked[1], "eth_call"), 2);
 }
