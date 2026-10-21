@@ -202,6 +202,16 @@ impl Gathered {
     }
 }
 
+/// The endpoints to observe a plan on, in order: `routed` when the plan
+/// reads HyperCore and the client has an order for it, else every one of
+/// `count`, from `preferred` on.
+fn observation_order(routed: Option<&[usize]>, preferred: usize, count: usize) -> Vec<usize> {
+    match routed {
+        Some(routed) => routed.to_vec(),
+        None => (0..count).map(|step| (preferred + step) % count).collect(),
+    }
+}
+
 /// Whether `answer` ran at `block`.
 fn ran_at(answer: &Answer, block: &Header) -> bool {
     answer.number == block.number
@@ -214,23 +224,22 @@ impl Follower {
     /// the others in turn, each alone for the whole observation. A plan
     /// that reads a contract known to read HyperCore is observed only on
     /// the endpoints that serve HyperCore's reads, in their order
-    /// ([`crate::Client::hypercore_order`]).
+    /// ([`crate::Client::hypercore_order`]), and the endpoint that answers
+    /// it is not taken as the one to start the next observation on: the
+    /// other plans keep the list's own order.
     pub async fn observe(&mut self, plan: &Plan, at: At) -> Result<Observed> {
         plan.check()?;
-        let count = self.endpoints.len();
-        let order = self
+        let routed = self
             .client
-            .hypercore_order(plan.reads.iter().map(|read| read.target))
-            .unwrap_or_else(|| {
-                (0..count)
-                    .map(|step| (self.preferred + step) % count)
-                    .collect()
-            });
+            .hypercore_order(plan.reads.iter().map(|read| read.target));
+        let order = observation_order(routed.as_deref(), self.preferred, self.endpoints.len());
         let mut failures = Vec::new();
         for endpoint in order {
             match self.observe_on(endpoint, plan, at).await {
                 Ok(observed) => {
-                    self.preferred = endpoint;
+                    if routed.is_none() {
+                        self.preferred = endpoint;
+                    }
                     return Ok(observed);
                 }
                 Err(error) => failures.push(format!("endpoint {}: {error:#}", endpoint + 1)),
@@ -1136,6 +1145,13 @@ async fn single_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_reading_hypercore_goes_to_its_endpoints_and_any_other_starts_from_the_preferred() {
+        assert_eq!(observation_order(Some(&[1]), 0, 3), vec![1]);
+        assert_eq!(observation_order(None, 0, 3), vec![0, 1, 2]);
+        assert_eq!(observation_order(None, 2, 3), vec![2, 0, 1]);
+    }
 
     fn reads(count: usize, size: usize) -> Vec<Read> {
         (0..count)
