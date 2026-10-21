@@ -510,6 +510,16 @@ impl Funder {
         // station would be sent its dollars and HYPE again.
         let worth = account_value(&self.api, station).await?;
         if worth < dollars * 0.9 {
+            // A usd send pays from the funder's perp side; the faucet pays
+            // to its spot side, so move what the perp side lacks first.
+            let me = self.signer.address();
+            let perp = account_value(&self.api, me).await?;
+            if perp < dollars {
+                self.core
+                    .usd_class_transfer((dollars - perp + 1.0).ceil(), true)
+                    .await
+                    .context("moving the funder's spot dollars to its perp side")?;
+            }
             self.core
                 .usd_send(station, dollars)
                 .await
@@ -1242,7 +1252,7 @@ pub async fn run(
     progress.paid = Some(paid.to_string());
     progress.write(&progress_file)?;
     log_valuation(client, vault).await?;
-    tracing::info!(%vault, "the run is done: fills, a valuation, a deposit priced and a claim paid");
+    tracing::info!(%vault, "the run is done: a valuation, a deposit priced and a claim paid (any fills are logged above)");
     Ok(())
 }
 
