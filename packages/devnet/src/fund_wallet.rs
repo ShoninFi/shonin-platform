@@ -7,7 +7,14 @@
 //! (which holds the gas) sends the mint; elsewhere (Circle's USDC) the
 //! dollar comes from its issuer's faucet alone, and none is minted. The coin
 //! comes from each chain's funder (the EVM funder, the Solana deployer),
-//! never past the reserve `config/funding.toml` keeps for it. Both are
+//! never past the reserve `config/funding.toml` keeps for it.
+//!
+//! On Hyperliquid's testnet (HyperEVM) the funder's money is on HyperCore:
+//! the dollars (Circle's USDC, which can't be minted) are sent home from its
+//! HyperCore balance to the wallet on HyperEVM, and what its HyperEVM HYPE
+//! above the reserve can't cover of the coin is bought on HyperCore's spot
+//! market (at no more than the funding file's price) and brought across
+//! first, as `chains:fund` does for the roles. Both are
 //! top-ups: a wallet already holding its amount is left alone, so running it
 //! again sends nothing new. Testnet only.
 
@@ -26,6 +33,7 @@ use chain::solana::{Pubkey, Signer};
 use chain::{ChainConfig, ChainKey, Deployments, NetworkName};
 
 use crate::fund::{self, Funding};
+use crate::hyperliquid_vaults;
 
 /// Who is funded: an EVM address on the EVM chains, a Solana one on the
 /// Solana clusters.
@@ -120,29 +128,91 @@ async fn evm(
     let from = funder.address();
     println!("{} ({key}): {wallet}", config.label);
 
+    let hyperliquid = client.chain_id == hyperliquid_vaults::CHAIN_ID;
+
     if amounts.gas {
         let target = funding
             .wallet_coin(key)
             .ok_or_else(|| anyhow!("{key} is not in the funding file"))?;
         let held = client.balance(wallet).await?;
         let need = target.saturating_sub(held);
-        if need.is_zero() {
-            println!("  coin: holds {}, enough", format_ether(held));
-        } else {
-            let reserve = funding.reserve(key).unwrap_or(U256::ZERO);
-            let available = provider.get_balance(from).await?.saturating_sub(reserve);
-            if need > available {
-                bail!(
-                    "the funder ({from}) can't send {} past its reserve",
+        let reserve = funding.reserve(key).unwrap_or(U256::ZERO);
+        let surplus = || async {
+            Ok::<_, anyhow::Error>(provider.get_balance(from).await?.saturating_sub(reserve))
+        };
+        match gas_source(need, surplus().await?, hyperliquid) {
+            GasSource::Enough => println!("  coin: holds {}, enough", format_ether(held)),
+            GasSource::Funder => {
+                let hash = send(&provider, from, wallet, need, None).await?;
+                println!("  coin: sent {} ({hash})", format_ether(need));
+            }
+            GasSource::HyperCore { missing } => {
+                // What the funder's HyperEVM HYPE above its reserve lacks
+                // comes across from HyperCore first, bought there at no
+                // more than the funding file's price.
+                let api = hyperliquid::Api::for_chain(client.chain_id)
+                    .ok_or_else(|| anyhow!("{key} has no HyperCore"))?;
+                let core = hyperliquid::HyperCore::new(api.clone(), funder.clone());
+                fund::hype_from_hypercore(
+                    funding,
+                    &core,
+                    &api,
+                    &provider,
+                    from,
+                    format_ether(missing).parse()?,
+                    true,
+                )
+                .await
+                .context("bringing HYPE across from HyperCore")?;
+                if need > surplus().await? {
+                    bail!(
+                        "the funder ({from}) can't send {} past its reserve, even with HYPE from HyperCore",
+                        format_ether(need)
+                    );
+                }
+                let hash = send(&provider, from, wallet, need, None).await?;
+                println!(
+                    "  coin: sent {} ({hash}), with HYPE from the funder's HyperCore balance",
                     format_ether(need)
                 );
             }
-            let hash = send(&provider, from, wallet, need, None).await?;
-            println!("  coin: sent {} ({hash})", format_ether(need));
+            GasSource::Short => bail!(
+                "the funder ({from}) can't send {} past its reserve",
+                format_ether(need)
+            ),
         }
     }
 
     let usd = deployments.usd;
+    if hyperliquid {
+        // HyperEVM's USDC can't be minted: it is sent home from the
+        // funder's HyperCore balance.
+        if usd != hyperliquid_vaults::USDC {
+            bail!(
+                "the deployment's dollar ({usd}) is not HyperEVM's USDC ({}), the dollar HyperCore sends home",
+                hyperliquid_vaults::USDC
+            );
+        }
+        let decimals = client.read(usd, ILocalUsd::decimalsCall {}).await?;
+        let held = client
+            .read(usd, ILocalUsd::balanceOfCall { account: wallet })
+            .await?;
+        let need = dollars_to_send(amounts.dollars, decimals, held);
+        if need.is_zero() {
+            println!("  dollars: holds {}, enough", units(held, decimals));
+        } else {
+            let sent = hyperliquid_vaults::Funder::new(&client)?
+                .send_dollars(&client, wallet, need)
+                .await?;
+            if let Some(dollars) = sent.from_core {
+                println!(
+                    "  dollars: the funder sent {dollars} USDC home from HyperCore to HyperEVM"
+                );
+            }
+            println!("  dollars: sent {} ({})", units(need, decimals), sent.hash);
+        }
+        return holdings(&client, usd, wallet, decimals).await;
+    }
     // Minted only where the chain's public dollar is open to anyone (the
     // Robinhood Chain testnet's USDG).
     let mintable = crate::deploy::public_dollar(client.chain_id)
@@ -154,11 +224,10 @@ async fn evm(
         return Ok(());
     }
     let decimals = client.read(usd, ILocalUsd::decimalsCall {}).await?;
-    let target = U256::from(amounts.dollars) * U256::from(10u64).pow(U256::from(decimals));
     let held = client
         .read(usd, ILocalUsd::balanceOfCall { account: wallet })
         .await?;
-    let need = target.saturating_sub(held);
+    let need = dollars_to_send(amounts.dollars, decimals, held);
     if need.is_zero() {
         println!("  dollars: holds {}, enough", units(held, decimals));
     } else {
@@ -169,6 +238,16 @@ async fn evm(
         let hash = send(&provider, from, usd, U256::ZERO, Some(mint.abi_encode())).await?;
         println!("  dollars: minted {} ({hash})", units(need, decimals));
     }
+    holdings(&client, usd, wallet, decimals).await
+}
+
+/// Print what the wallet holds of the coin and the dollar.
+async fn holdings(
+    client: &chain::Client,
+    usd: Address,
+    wallet: Address,
+    decimals: u8,
+) -> Result<()> {
     let coin = client.balance(wallet).await?;
     let dollars = client
         .read(usd, ILocalUsd::balanceOfCall { account: wallet })
@@ -179,6 +258,45 @@ async fn evm(
         units(dollars, decimals)
     );
     Ok(())
+}
+
+/// What tops a wallet holding `held` (in the dollar's units) up to `dollars`
+/// whole dollars: nothing if it holds that already.
+fn dollars_to_send(dollars: u64, decimals: u8, held: U256) -> U256 {
+    let target = U256::from(dollars) * U256::from(10u64).pow(U256::from(decimals));
+    target.saturating_sub(held)
+}
+
+/// Where a wallet's coin comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum GasSource {
+    /// Nowhere: it holds its amount.
+    Enough,
+    /// The funder's coin above its reserve on this chain.
+    Funder,
+    /// The same, after `missing` (what that surplus lacks) is brought across
+    /// from HyperCore.
+    HyperCore { missing: U256 },
+    /// Nowhere: the funder's surplus is short, and there is no HyperCore to
+    /// make it up.
+    Short,
+}
+
+/// Where a wallet short `need` of its coin is topped up from, given what the
+/// funder holds above its reserve (`surplus`) and whether the chain is
+/// HyperEVM, whose funder can bring HYPE across from HyperCore.
+fn gas_source(need: U256, surplus: U256, hyperliquid: bool) -> GasSource {
+    if need.is_zero() {
+        GasSource::Enough
+    } else if need <= surplus {
+        GasSource::Funder
+    } else if hyperliquid {
+        GasSource::HyperCore {
+            missing: need - surplus,
+        }
+    } else {
+        GasSource::Short
+    }
 }
 
 async fn solana(
@@ -342,6 +460,66 @@ mod tests {
         assert!(Wallet::parse("0x1234").is_err());
         assert!(Wallet::parse("not-an-address").is_err());
         assert!(Wallet::parse("").is_err());
+    }
+
+    #[test]
+    fn dollars_top_a_wallet_up_to_its_amount_and_no_further() {
+        let dollar = U256::from(1_000_000u64);
+        assert_eq!(dollars_to_send(25, 6, U256::ZERO), dollar * U256::from(25));
+        assert_eq!(
+            dollars_to_send(25, 6, dollar * U256::from(10)),
+            dollar * U256::from(15)
+        );
+        assert_eq!(dollars_to_send(25, 6, dollar * U256::from(25)), U256::ZERO);
+        assert_eq!(dollars_to_send(25, 6, dollar * U256::from(40)), U256::ZERO);
+        assert_eq!(dollars_to_send(0, 6, U256::ZERO), U256::ZERO);
+        assert_eq!(
+            dollars_to_send(1, 18, U256::ZERO),
+            U256::from(10u64).pow(U256::from(18))
+        );
+    }
+
+    #[test]
+    fn a_wallet_holding_its_coin_is_sent_none_from_anywhere() {
+        let surplus = U256::from(5u64);
+        assert_eq!(gas_source(U256::ZERO, surplus, true), GasSource::Enough);
+        assert_eq!(gas_source(U256::ZERO, U256::ZERO, false), GasSource::Enough);
+    }
+
+    #[test]
+    fn the_coin_comes_from_the_funder_s_surplus_when_it_covers_the_need() {
+        assert_eq!(
+            gas_source(U256::from(3u64), U256::from(5u64), true),
+            GasSource::Funder
+        );
+        assert_eq!(
+            gas_source(U256::from(5u64), U256::from(5u64), false),
+            GasSource::Funder
+        );
+    }
+
+    #[test]
+    fn on_hyperevm_hypercore_makes_up_only_what_the_surplus_lacks() {
+        assert_eq!(
+            gas_source(U256::from(8u64), U256::from(5u64), true),
+            GasSource::HyperCore {
+                missing: U256::from(3u64)
+            }
+        );
+        assert_eq!(
+            gas_source(U256::from(8u64), U256::ZERO, true),
+            GasSource::HyperCore {
+                missing: U256::from(8u64)
+            }
+        );
+    }
+
+    #[test]
+    fn elsewhere_a_short_funder_is_refused_rather_than_dipping_into_its_reserve() {
+        assert_eq!(
+            gas_source(U256::from(8u64), U256::from(5u64), false),
+            GasSource::Short
+        );
     }
 
     #[test]
