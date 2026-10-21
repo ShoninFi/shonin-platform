@@ -104,7 +104,7 @@ impl Sealing for shonin_rootkey::service::Identity {
 pub enum Signer {
     Key(PrivateKeySigner),
     Node {
-        client: chain::Client,
+        client: Box<chain::Client>,
         address: Address,
     },
 }
@@ -680,7 +680,7 @@ pub async fn development(
         ))
         .await?;
     let signer = Signer::Node {
-        client,
+        client: Box::new(client),
         address: role(&deployments.roles),
     };
     let signature = signer
