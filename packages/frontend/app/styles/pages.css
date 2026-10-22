@@ -60,7 +60,7 @@
 .lb-list { display: flex; flex-direction: column; gap: var(--space-3); }
 .lb-panel { overflow: hidden; }
 .lb-panel__notice { margin: var(--space-4) var(--space-4) 4px; }
-.lb-table-wrap { overflow-x: auto; }
+.lb-table-wrap { overflow-x: auto; position: relative; }
 .lb-table { table-layout: fixed; }
 .lb-table th, .lb-table td { padding-left: var(--space-3); padding-right: var(--space-3); }
 .lb-table th:first-child, .lb-table td:first-child { padding-left: var(--space-5); }
@@ -147,7 +147,7 @@
 /* Sparklines in the table only from 900px. */
 @media (max-width: 899px) { .lb-table .lb-spark { display: none; } }
 
-/* Tablet: Agent, Review, 30 days, In vault; the rest under the name. */
+/* Tablet: the controls in sheets and filters. */
 @media (max-width: 1023px) {
   .lb { gap: 28px; }
   .lb-head__text { gap: 10px; }
@@ -158,6 +158,22 @@
   .lb-search .sh-input { height: 48px; }
   .lb-menus { display: none; }
   .lb-tools__filters { display: inline-flex; }
+  .lb-summary { flex: 1 1 auto; }
+}
+
+/* A small desktop: the search gives up width so the menus, the count and
+   List/Grid share one row (measured at 1024: 160 + 320 + 241 + 146 and
+   the gaps, in 945); a longer count wraps inside itself. */
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .lb-tools { gap: var(--space-2); }
+  .lb-search { flex: 1 1 160px; min-width: 160px; }
+  .lb-summary { flex: 0 1 auto; min-width: 120px; }
+}
+
+/* The compact table (Agent, Review, 30 days, In vault; the rest under the
+   name) until the full one fits its box without scrolling inside it: it
+   needs about 1200px, so below 1280. */
+@media (max-width: 1279px) {
   .lb-wide { display: none; }
   .lb-narrow { display: inline; }
   span.lb-narrow.lb-meta { display: block; }
@@ -172,7 +188,6 @@
   .lb-c-open { width: 44px; }
   .lb-view { opacity: 1; transform: none; color: var(--ink-muted); font-size: 0; }
   .lb-view .sh-icon { width: 20px; height: 20px; }
-  .lb-summary { flex: 1 1 auto; }
 }
 
 /* Phone: lists of cards; sort and filters in sheets. */
@@ -363,13 +378,15 @@
   .nf-inner { grid-template-columns: minmax(0, 1fr); padding: 64px 0 var(--space-6); }
   .nf-art-wrap { order: -1; }
   .nf-art { max-width: 360px; }
+  /* Drawn smaller, the notes would shrink past reading; the hexagon says it. */
+  .nf-note { display: none; }
   .nf-title { font-size: 44px; line-height: 50px; }
   .nf-glow { left: 30%; top: 0; }
 }
 @media (max-width: 599px) {
   .nf { min-height: calc(100vh - 56px); }
   .nf-inner { padding: 32px 0 var(--space-6); gap: var(--space-4); }
-  .nf-art { max-width: 240px; }
+  .nf-art { max-width: 280px; margin: calc(var(--space-5) * -1) 0; }
   .nf-title { font-size: 34px; line-height: 40px; }
   .nf-lede { font: 400 17px/26px var(--font-sans); }
   .nf-actions .sh-btn { flex: 1 1 auto; }
@@ -428,7 +445,8 @@
   .sh-claim__crumbs a, .ag-by a, .ag-chip-link, .ag-more, .ag-chart__table-toggle,
   .ag-report__go, .ag-record__read, .sh-seg button, .st-filter, .sh-nav, .lb-howto,
   .sh-appheader .sh-logo, .sh-walletbtn, .ag-crumb a, .ag-tank__about a, .ag-source-line a,
-  .sh-footer__brand .sh-logo, .sh-strip .sh-iconbtn, .sh-table th a, .sh-you__name {
+  .sh-footer__brand .sh-logo, .sh-strip .sh-iconbtn, .sh-table th a, .sh-you__name,
+  .ag-tx, .ag-claims__verdict a, .ag-copy, .sh-exit__tabs .sh-tab {
     position: relative;
   }
   .sh-link::after, .sh-notice__actions a::after, .sh-notice__body > a::after, .st-event__link::after,
@@ -437,10 +455,12 @@
   .sh-seg button::after, .st-filter::after, .sh-nav::after, .lb-howto::after,
   .sh-appheader .sh-logo::after, .sh-walletbtn::after, .ag-crumb a::after,
   .ag-tank__about a::after, .ag-source-line a::after, .sh-footer__brand .sh-logo::after,
-  .sh-strip .sh-iconbtn::after, .sh-table th a::after, .sh-you__name::after {
+  .sh-strip .sh-iconbtn::after, .sh-table th a::after, .sh-you__name::after,
+  .ag-tx::after, .ag-claims__verdict a::after, .ag-copy::after, .sh-exit__tabs .sh-tab::after {
     content: ""; position: absolute; left: 50%; top: 50%;
     width: max(100%, 44px); height: max(100%, 44px); transform: translate(-50%, -50%);
   }
+  .sh-skip { min-height: 44px; display: inline-flex; align-items: center; }
   .sh-footer__col { gap: 0; }
   .ag-src__link { min-height: 44px; }
   .sh-footer__col a { display: flex; align-items: center; min-height: 44px; }

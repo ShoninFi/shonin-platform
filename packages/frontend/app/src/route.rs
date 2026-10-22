@@ -335,12 +335,8 @@ impl Route {
             Self::Job { .. } => Some("Publishing job".to_string()),
             Self::Activate { .. } => Some("Activate".to_string()),
             Self::You => Some("Your agents".to_string()),
-            Self::Manage { slug } => Some(
-                store::get()
-                    .agent(slug)
-                    .map(|agent| agent.title.get_cloned())
-                    .unwrap_or_else(|| "Your agent".to_string()),
-            ),
+            // The agent's name is the page's own heading.
+            Self::Manage { .. } => Some("Your agents".to_string()),
             Self::Status => Some("Status".to_string()),
             Self::Atoms => Some("Atoms".to_string()),
             Self::States => Some("States".to_string()),

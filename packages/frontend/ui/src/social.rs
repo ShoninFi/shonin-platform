@@ -34,6 +34,46 @@ pub const GITHUB: Social = Social {
 /// The footer's row, in order.
 pub const ALL: [Social; 3] = [X, DISCORD, GITHUB];
 
+/// Shonin's account on X, as a page's `twitter:site` names it.
+pub const X_HANDLE: &str = "@ShoninFi";
+
+/// The page head's social tags, the same on every page of both sites: the
+/// X account the page belongs to, and a JSON-LD Organization whose `url` is
+/// `site` and whose `sameAs` lists every place in [`ALL`]. A data block, not
+/// a script, so the Content-Security-Policy has nothing to allow.
+pub fn head_html(site: &str) -> String {
+    let same_as = ALL
+        .iter()
+        .map(|social| json_string(social.href))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "<meta name=\"twitter:site\" content=\"{X_HANDLE}\">\n\
+         <script type=\"application/ld+json\">{{\"@context\":\"https://schema.org\",\"@type\":\"Organization\",\"name\":\"Shonin\",\"url\":{},\"sameAs\":[{same_as}]}}</script>\n",
+        json_string(site.trim_end_matches('/'))
+    )
+}
+
+/// `value` as a JSON string that is safe inside a `<script>` element: no
+/// quote, backslash, control character or `<` is left as itself.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl Social {
     /// Its mark at `size` pixels, hidden from screen readers (the link
     /// carries the name) and drawn in the link's colour.
@@ -88,5 +128,25 @@ mod tests {
         }
         assert_eq!(row.matches("<svg").count(), 3);
         assert_eq!(row.matches("aria-hidden=\"true\"").count(), 3);
+    }
+
+    #[test]
+    fn the_head_names_the_x_account_and_every_place_shonin_is() {
+        let head = head_html("https://shonin.fi/");
+        assert!(head.contains("<meta name=\"twitter:site\" content=\"@ShoninFi\">"));
+        assert!(head.contains(
+            "\"sameAs\":[\"https://x.com/ShoninFi\",\"https://discord.gg/2pabyT6rYJ\",\"https://github.com/ShoninFi\"]"
+        ));
+        assert!(head.contains("\"url\":\"https://shonin.fi\""));
+        assert!(head.contains("<script type=\"application/ld+json\">"));
+    }
+
+    #[test]
+    fn a_site_address_can_never_close_the_data_block() {
+        let head = head_html("https://x.test/</script><script>alert(1)</script>\"");
+        assert_eq!(head.matches("</script>").count(), 1);
+        assert!(!head.contains("<script>"));
+        assert!(head.contains("\\u003c/script\\u003e"));
+        assert!(head.contains("\\\""));
     }
 }

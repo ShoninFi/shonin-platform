@@ -251,6 +251,23 @@ async fn watch(slug: String, load: Mutable<Load>) {
             // chain's settings change: the controls are then drawn with the
             // network a send would sign with.
             let seen = (session.changed.get(), session.account(), session.configs());
+            // A remembered wallet still reconnecting: the loading shape
+            // stays until it has (a slow wallet extension takes seconds),
+            // for 10 s at most; then the signed-out card, and the page
+            // follows the wallet should it connect later.
+            if seen.1.is_none() && session.restoring.get() {
+                use futures_signals::signal::SignalExt;
+                let restored = Box::pin(session.restoring.signal().wait_for(false));
+                let late = gloo_timers::future::TimeoutFuture::new(10_000);
+                futures::future::select(restored, late).await;
+                session.restoring.set_neq(false);
+                continue;
+            }
+            // A wallet connected since the signed-out card: the loading
+            // shape while its vault is read.
+            if seen.1.is_some() && matches!(*load.lock_ref(), Load::SignedOut) {
+                load.set(Load::Loading);
+            }
             match seen.1 {
                 None => load.set(Load::SignedOut),
                 Some(account) => match read(&slug, account).await {
@@ -284,9 +301,17 @@ async fn watch(slug: String, load: Mutable<Load>) {
                     }
                 },
             }
-            for _ in 0..15 {
-                gloo_timers::future::TimeoutFuture::new(1_000).await;
+            // Read again in 15 s, or as soon as the account, a flow or the
+            // chain's settings change, or the agent reaches the store while
+            // the page still waits for it.
+            for _ in 0..60 {
+                gloo_timers::future::TimeoutFuture::new(250).await;
                 if (session.changed.get(), session.account(), session.configs()) != seen {
+                    break;
+                }
+                if matches!(*load.lock_ref(), Load::Loading)
+                    && crate::store::get().agent(&slug).is_some()
+                {
                     break;
                 }
             }
@@ -356,6 +381,7 @@ fn manage(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>) -> View {
         .child(
             el("div")
                 .class("sh-author__headtext")
+                .child(crumb(&read.title))
                 .child(
                     el("div")
                         .class("sh-job__titlerow")
@@ -386,7 +412,7 @@ fn manage(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>) -> View {
                 ),
         );
     let vault = el("section")
-        .class("sh-card sh-card--pad sh-manage__card")
+        .class("sh-card sh-card--pad sh-manage__card sh-manage__vault")
         .attr("aria-labelledby", "m-vault")
         .child(
             el("h2")
@@ -406,28 +432,44 @@ fn manage(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>) -> View {
                     parts::words(money::dollars(read.at.cash, decimals, Rounding::Down)),
                 )),
         );
+    // In reading order, which is the phone's: the tank, earnings, the
+    // vault, the idle floor, allowances, then retiring. On a wide screen
+    // they flow two to a row, with the vault's figures above them all.
     el("div")
         .class("sh-manage__body")
         .child(head)
         .child(
             el("div")
-                .class("sh-manage__grid")
-                .child(
-                    el("div")
-                        .class("sh-manage__main")
-                        .child(tank_card(read, controls, &names))
-                        .child(allowances_card(read, controls, &names)),
-                )
-                .child(
-                    el("div")
-                        .class("sh-manage__side")
-                        .child(shares_card(slug, read, controls, &names))
-                        .child(floor_card(read, controls, &names))
-                        .child(vault)
-                        .child(retire_card(read, controls, &names)),
-                ),
+                .class("sh-manage__cards")
+                .child(tank_card(read, controls, &names).class("sh-manage__tank"))
+                .child(shares_card(slug, read, controls, &names).class("sh-manage__earnings"))
+                .child(vault)
+                .child(floor_card(read, controls, &names))
+                .child(allowances_card(read, controls, &names))
+                .child(retire_card(read, controls, &names)),
         )
         .into()
+}
+
+/// "Your agents / {agent}".
+fn crumb(title: &str) -> El {
+    el("nav")
+        .class("ag-crumb")
+        .class("sh-manage__crumb")
+        .attr("aria-label", "Breadcrumb")
+        .child(
+            el("ol")
+                .child(
+                    el("li")
+                        .child(crate::web::app_link("/you").text("Your agents"))
+                        .child(el("span").attr("aria-hidden", "true").text("/")),
+                )
+                .child(
+                    el("li")
+                        .attr("aria-current", "page")
+                        .text(title.to_string()),
+                ),
+        )
 }
 
 /// Start `action` for this vault into `slot`, unless a flow there is live.

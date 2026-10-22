@@ -36,7 +36,9 @@
     <link data-trunk rel="copy-dir" href="../ui/dist/fonts" />
     <link data-trunk rel="copy-dir" href="../ui/dist/logos" />
     <link data-trunk rel="copy-dir" href="../ui/images/icons" />
-    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" data-integrity="none" />
+    <!-- data-wasm-no-import: the loader only starts the app and never puts
+         its bindings on the window, where any script could call them. -->
+    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" data-integrity="none" data-wasm-no-import />
     <!-- Workers static assets read these from the output root. -->
     <link data-trunk rel="copy-file" href="_headers" />
     <link data-trunk rel="copy-file" href="_redirects" />

@@ -119,6 +119,7 @@ pub fn open_sheet(slug: &str, tab: Tab) {
         body: build(slug, tab, true),
         foot: None,
         wide: false,
+        alert: None,
     });
 }
 
@@ -186,6 +187,26 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
             async {}
         })
     };
+    // Another account (or none) shows nothing of the last account's
+    // holdings.
+    let account_change = {
+        let panel = panel.clone();
+        let mut seen = None;
+        solana
+            .connection
+            .signal_cloned()
+            .map(|connection| connection.account())
+            .dedupe()
+            .for_each(move |account| {
+                if seen
+                    .replace(account)
+                    .is_some_and(|before| before != account)
+                {
+                    panel.holdings.set(None);
+                }
+                async {}
+            })
+    };
     el("section")
         .class("sh-exit")
         .class_if(in_sheet, "sh-exit--sheet")
@@ -208,7 +229,11 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 .child(icon(Icon::Concern, 16).class("sh-exit__warn"))
                 .text("The agent can lose money. Nothing here stops that."),
         )
-        .hook(move |dom| dom.future(follow(loader)).future(network_change))
+        .hook(move |dom| {
+            dom.future(follow(loader))
+                .future(network_change)
+                .future(account_change)
+        })
         .into()
 }
 
@@ -322,6 +347,7 @@ async fn follow(panel: Rc<Panel>) {
             let reader = SolSession::reader(&network);
             // What had landed before this read: the read shows it.
             let at = session.changed.get();
+            let mut read_for = session.account();
             let read = reader.account(&vault.address).await;
             if !reads_with(&panel, network.config) {
                 continue;
@@ -339,7 +365,9 @@ async fn follow(panel: Rc<Panel>) {
                 if let Ok(codes) = flow::restricted(&reader, &vault.address).await {
                     panel.codes.set_neq(Some(codes));
                 }
-                match session.account() {
+                // The account these holdings are read for.
+                read_for = session.account();
+                match read_for {
                     Some(owner) => {
                         let holder = flow::holder(&reader, &vault.address, &owner)
                             .await
@@ -357,6 +385,7 @@ async fn follow(panel: Rc<Panel>) {
                         };
                         if let Some(balance) = balance
                             && reads_with(&panel, network.config)
+                            && session.account() == Some(owner)
                         {
                             panel.holdings.set(Some(crate::tx::solana::read::holdings(
                                 &read,
@@ -371,8 +400,9 @@ async fn follow(panel: Rc<Panel>) {
             } else if panel.figures.lock_ref().is_none() {
                 panel.missing.set(true);
             }
-            // A flow that landed while reading is read again at once.
-            wait_or_retry_since(&panel, 10, at).await;
+            // A flow that landed, or an account switched to, while reading
+            // is read again at once.
+            wait_or_retry_since(&panel, 10, at, read_for).await;
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -383,13 +413,20 @@ async fn follow(panel: Rc<Panel>) {
 /// reader presses "Try again".
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry(panel: &Panel, seconds: u32) {
-    wait_or_retry_since(panel, seconds, crate::wallet::solana::get().changed.get()).await;
+    let session = crate::wallet::solana::get();
+    wait_or_retry_since(panel, seconds, session.changed.get(), session.account()).await;
 }
 
 /// The same, counting flows landed since `changed` (the session's count
-/// when the last read began).
+/// when the last read began) and any account other than `account` (the one
+/// the last read was for): either ends the wait at once.
 #[cfg(target_arch = "wasm32")]
-async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
+async fn wait_or_retry_since(
+    panel: &Panel,
+    seconds: u32,
+    changed: u64,
+    account: Option<chain::solana_ix::Pubkey>,
+) {
     let session = crate::wallet::solana::get();
     let config = || {
         panel
@@ -398,9 +435,8 @@ async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
             .as_ref()
             .map(|network| network.config)
     };
-    let seen = (changed, session.account(), panel.retry.get(), config());
+    let seen = (changed, account, panel.retry.get(), config());
     for _ in 0..seconds {
-        gloo_timers::future::TimeoutFuture::new(1_000).await;
         if (
             session.changed.get(),
             session.account(),
@@ -410,6 +446,7 @@ async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
         {
             break;
         }
+        gloo_timers::future::TimeoutFuture::new(1_000).await;
     }
 }
 

@@ -89,12 +89,11 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "source hash",
             glyph: Icon::Code,
             link: Some("The report on the chain names the source it read."),
-            read: strategy.bundle.source.is_published().then(|| {
-                (
-                    format!("/agents/{}/source", strategy.slug),
-                    "Read the source",
-                )
-            }),
+            read: strategy
+                .bundle
+                .source
+                .is_published()
+                .then(|| (format!("/agents/{}/source", strategy.slug), "the source")),
         },
         Node {
             title: "Review".into(),
@@ -105,12 +104,9 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "report hash",
             glyph: Icon::Review,
             link: Some("The build came from that same source, on an approved builder."),
-            read: review.is_some().then(|| {
-                (
-                    format!("/agents/{}/review", strategy.slug),
-                    "Read the review",
-                )
-            }),
+            read: review
+                .is_some()
+                .then(|| (format!("/agents/{}/review", strategy.slug), "the review")),
         },
         Node {
             title: "Build".into(),
@@ -190,7 +186,7 @@ fn chain_of_records(strategy: &Strategy) -> View {
                 .child(View::from(node.read.clone().map(|(href, words)| {
                     crate::web::app_link(href)
                         .class("ag-record__read")
-                        .attr("aria-label", words)
+                        .attr("aria-label", format!("Read it: {words}"))
                         .text("Read it")
                         .child(icon(Icon::ArrowRight, 16))
                         .into()
@@ -411,8 +407,14 @@ fn rebuild(strategy: &Strategy) -> View {
 fn check_commands(strategy: &Strategy) -> El {
     let bundle = &strategy.bundle;
     let digits = |hash: &str| hash.strip_prefix("sha256:").unwrap_or(hash).to_string();
-    let source = parts::store_url(&bundle.source_hash, "source.tar");
-    let build = parts::store_url(&bundle.bundle_hash, "component.wasm");
+    let (Some(source), Some(build)) = (
+        parts::store_url(&bundle.source_hash, "source.tar"),
+        parts::store_url(&bundle.bundle_hash, "component.wasm"),
+    ) else {
+        return el("p")
+            .class("ag-body")
+            .text("The store's addresses for these files aren't in this page's record.");
+    };
     let steps = [
         (
             "# 1  The source the Reviewer read",
@@ -494,6 +496,7 @@ fn keys(strategy: &Strategy) -> View {
                 el("table")
                     .class("sh-table")
                     .class("ag-keys")
+                    .class("ag-stack")
                     .child(el("caption").class("sh-vh").text("Blessed keys"))
                     .child(
                         el("thead").child(
@@ -522,9 +525,10 @@ fn keys(strategy: &Strategy) -> View {
                                     .child(el("span").class("sh-mono").attr("title", key.address.clone()).text(format::short_hash(&key.address)))
                                     .child(el("span").class("ag-keys__role").text(format!("{} · trade-only", role(key.role)))),
                             )
-                            .child(el("td").child(el("span").class("sh-mono").text(format::short_hash(&attestation.image.digest))))
+                            .child(el("td").attr("data-label", "Made on image").child(el("span").class("sh-mono").text(format::short_hash(&attestation.image.digest))))
                             .child(
                                 el("td")
+                                    .attr("data-label", "Expires")
                                     .child(el("span").class("ag-keys__day").text(format!(
                                         "{}, {}",
                                         format::day(key.blessed_until.date(), this_year),
@@ -532,7 +536,7 @@ fn keys(strategy: &Strategy) -> View {
                                     )))
                                     .child(el("span").class("ag-keys__left").text(left)),
                             )
-                            .child(el("td").child(parts::tx_link(chain, &key.proof_tx, "Proof transaction")))
+                            .child(el("td").attr("data-label", "Proof").child(parts::tx_link(chain, &key.proof_tx, "Proof transaction")))
                     }))),
             ),
         )
@@ -560,6 +564,24 @@ fn keys(strategy: &Strategy) -> View {
                 ),
         )
         .into()
+}
+
+/// When an image the snapshot gives no date for came to count: its newest
+/// proposal on the public feed, plus the timelock. `None` where the feed
+/// holds no proposal of it or the timelock isn't known.
+fn counted_since(
+    digest: &str,
+    feed: &[Rc<store::FeedItem>],
+    timelock_days: Option<f64>,
+) -> Option<time::Date> {
+    feed.iter()
+        .filter(|item| {
+            item.kind == shared::FeedKind::ImageProposed
+                && item.reference.eq_ignore_ascii_case(digest)
+        })
+        .filter_map(|item| crate::pages::status::counts_at(item, timelock_days))
+        .max()
+        .map(|at| at.date())
 }
 
 fn images(strategy: &Strategy) -> View {
@@ -613,6 +635,7 @@ fn images(strategy: &Strategy) -> View {
             super::parts::scroll("Machine images behind this agent").child(
                 el("table")
                     .class("sh-table")
+                    .class("ag-stack")
                     .child(el("caption").class("sh-vh").text("Machine images behind this agent"))
                     .child(
                         el("thead").child(
@@ -627,9 +650,9 @@ fn images(strategy: &Strategy) -> View {
                         el("tr")
                             .class("sh-row")
                             .child(el("th").attr("scope", "row").text(name))
-                            .child(el("td").class("ag-muted").text(job))
-                            .child(el("td").child(el("span").class("sh-mono").attr("title", digest.clone()).text(format::short_hash(&digest))))
-                            .child(el("td").text(since.map(facts::full_day).unwrap_or_else(|| format::MISSING.to_string())))
+                            .child(el("td").class("ag-muted").attr("data-label", "Its job").text(job))
+                            .child(el("td").attr("data-label", "Fingerprint").child(el("span").class("sh-mono").attr("title", digest.clone()).text(format::short_hash(&digest))))
+                            .child(since_cell(digest, since))
                     }))),
             ),
         )
@@ -641,6 +664,65 @@ fn images(strategy: &Strategy) -> View {
                 .text(" the day it's proposed."),
         )
         .into()
+}
+
+/// What the "Counted since" cell says once the snapshot and the terms are
+/// in: the day it began to count, or "—" where nothing gives it.
+/// `None` while either is still loading.
+fn since_said(
+    digest: &str,
+    feed: &[Rc<store::FeedItem>],
+    loaded: bool,
+    timelock_days: Option<f64>,
+    failing: bool,
+) -> Option<String> {
+    match counted_since(digest, feed, timelock_days) {
+        Some(day) => Some(facts::full_day(day)),
+        None if !failing && (!loaded || timelock_days.is_none()) => None,
+        None => Some(format::MISSING.to_string()),
+    }
+}
+
+/// The "Counted since" cell: the day the snapshot gives, or the one the
+/// public feed and the timelock give, drawn as they arrive, with a loading
+/// shape until they have.
+fn since_cell(digest: String, since: Option<time::Date>) -> El {
+    let cell = el("td")
+        .class("ag-since")
+        .attr("data-label", "Counted since");
+    if let Some(since) = since {
+        return cell.text(facts::full_day(since));
+    }
+    let draw = move |feed: &[Rc<store::FeedItem>],
+                     loaded: bool,
+                     days: Option<f64>,
+                     failing: bool|
+          -> Option<View> {
+        Some(match since_said(&digest, feed, loaded, days, failing) {
+            Some(said) => text(said),
+            None => el("span")
+                .class("ag-loading")
+                .attr("aria-busy", "true")
+                .child(crate::atoms::skeleton::skeleton("96px", 14))
+                .child(el("span").class("sh-vh").text("Loading"))
+                .into(),
+        })
+    };
+    let store = store::get();
+    let now = draw(
+        &store.feed.lock_ref(),
+        store.loaded.get(),
+        store.image_timelock_days.get(),
+        store.sync.failing.get(),
+    );
+    use futures_signals::signal_vec::SignalVecExt;
+    let signal = futures_signals::map_ref! {
+        let feed = store.feed.signal_vec_cloned().to_signal_cloned(),
+        let loaded = store.loaded.signal(),
+        let days = store.image_timelock_days.signal(),
+        let failing = store.sync.failing.signal() => draw(feed, *loaded, *days, *failing)
+    };
+    cell.child_signal(now, signal)
 }
 
 fn cant_tell() -> El {
@@ -689,4 +771,59 @@ fn cant_tell() -> El {
                     )
             }),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn proposed(digest: &str, at: time::PrimitiveDateTime) -> Rc<store::FeedItem> {
+        Rc::new(store::FeedItem {
+            at,
+            kind: shared::FeedKind::ImageProposed,
+            title: String::new(),
+            detail: String::new(),
+            link: None,
+            reference: digest.to_string(),
+        })
+    }
+
+    #[test]
+    fn an_image_counts_from_its_newest_proposal_plus_the_timelock_and_is_unknown_without_either() {
+        let feed = vec![
+            proposed("0xABCD", datetime!(2026-06-01 12:00)),
+            proposed("0xabcd", datetime!(2026-05-01 12:00)),
+            proposed("0xffff", datetime!(2026-06-20 12:00)),
+        ];
+        assert_eq!(
+            counted_since("0xabcd", &feed, Some(2.0)),
+            Some(time::macros::date!(2026 - 06 - 03))
+        );
+        assert_eq!(counted_since("0xabcd", &feed, None), None);
+        assert_eq!(counted_since("0x1234", &feed, Some(2.0)), None);
+    }
+
+    #[test]
+    fn counted_since_is_loading_until_the_snapshot_and_terms_are_in_and_only_then_unknown() {
+        let feed = vec![proposed("0xabcd", datetime!(2026-06-01 12:00))];
+        // Not yet in: loading, never "—".
+        assert_eq!(since_said("0x1234", &[], false, None, false), None);
+        assert_eq!(since_said("0x1234", &feed, true, None, false), None);
+        assert_eq!(since_said("0x1234", &feed, false, Some(2.0), false), None);
+        // In, and nothing gives a day: "—".
+        assert_eq!(
+            since_said("0x1234", &feed, true, Some(2.0), false).as_deref(),
+            Some(format::MISSING)
+        );
+        // The API not answering: "—", not loading forever.
+        assert_eq!(
+            since_said("0x1234", &[], false, None, true).as_deref(),
+            Some(format::MISSING)
+        );
+        assert_eq!(
+            since_said("0xabcd", &feed, true, Some(2.0), false),
+            Some(facts::full_day(time::macros::date!(2026 - 06 - 03)))
+        );
+    }
 }

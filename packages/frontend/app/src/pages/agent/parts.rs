@@ -78,7 +78,13 @@ pub fn network(chain: Chain) -> Option<String> {
 /// A transaction on its chain's explorer, opening in a new tab, or the hash
 /// alone where the chain has no explorer (a local chain).
 pub fn tx_link(chain: Chain, reference: &str, label: &'static str) -> El {
+    tx_link_said(chain, reference, label, "")
+}
+
+/// [`tx_link`], with `prefix` ("tx ") before the short hash.
+pub fn tx_link_said(chain: Chain, reference: &str, label: &'static str, prefix: &str) -> El {
     match network(chain).and_then(|key| super::facts::tx_url(&key, reference)) {
+        // The name starts with the short hash shown, then the full words.
         Some(url) => el("a")
             .class("ag-tx")
             .attr("href", url)
@@ -86,20 +92,23 @@ pub fn tx_link(chain: Chain, reference: &str, label: &'static str) -> El {
             .attr("rel", "noopener noreferrer")
             .attr(
                 "aria-label",
-                format!("{label} {reference} (opens the block explorer)"),
+                format!(
+                    "{prefix}{}, {label} {reference} (opens the block explorer)",
+                    crate::format::short_hash(reference)
+                ),
             )
             .child(
                 el("span")
                     .class("sh-mono-s")
                     .attr("aria-hidden", "true")
-                    .text(crate::format::short_hash(reference)),
+                    .text(format!("{prefix}{}", crate::format::short_hash(reference))),
             )
             .child(icon(Icon::External, 14)),
         None => el("span")
             .class("ag-tx")
             .class("sh-mono-s")
             .attr("title", reference.to_string())
-            .text(crate::format::short_hash(reference)),
+            .text(format!("{prefix}{}", crate::format::short_hash(reference))),
     }
 }
 
@@ -230,10 +239,25 @@ pub fn copy_button(value: String, what: &'static str) -> El {
         })
 }
 
+/// Whether `hash` is a store hash: `sha256:` and 64 lowercase hex digits,
+/// as the store names every file.
+pub fn is_store_hash(hash: &str) -> bool {
+    hash.strip_prefix("sha256:").is_some_and(|digits| {
+        digits.len() == 64
+            && digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Where the API's store serves a file, as an address a reader can use
 /// anywhere: the API's own origin when the build names it, else this page's
-/// (a development build, whose server passes `/api` on).
-pub fn store_url(hash: &str, name: &str) -> String {
+/// (a development build, whose server passes `/api` on). None for a hash
+/// that isn't a store hash, so nothing else is ever put into the address.
+pub fn store_url(hash: &str, name: &str) -> Option<String> {
+    if !is_store_hash(hash) {
+        return None;
+    }
     let base = crate::api::BASE.trim_end_matches('/');
     let base = if crate::api::origin(base).is_some() || !cfg!(target_arch = "wasm32") {
         base.to_string()
@@ -245,5 +269,29 @@ pub fn store_url(hash: &str, name: &str) -> String {
             .unwrap_or_default();
         format!("{here}{base}")
     };
-    format!("{base}/store/{hash}/{name}")
+    Some(format!("{base}/store/{hash}/{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_store_address_is_made_only_from_a_well_formed_store_hash() {
+        let hash = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        let url = store_url(&hash, "source.tar").expect("a store hash");
+        assert!(url.ends_with(&format!("/store/{hash}/source.tar")), "{url}");
+        for bad in [
+            String::new(),
+            "0123456789abcdef".repeat(4),
+            format!("sha256:{}", "0123456789ABCDEF".repeat(4)),
+            format!("sha256:{}", "0123456789abcdef".repeat(3)),
+            format!("sha256:{}0", "0123456789abcdef".repeat(4)),
+            format!("sha256:{}/../x", "0123456789abcdef".repeat(4)),
+            format!("sha256:../../{}", "0123456789abcdef".repeat(4)),
+            format!("sha256:{}?a", &"0123456789abcdef".repeat(4)[1..]),
+        ] {
+            assert_eq!(store_url(&bad, "source.tar"), None, "{bad}");
+        }
+    }
 }

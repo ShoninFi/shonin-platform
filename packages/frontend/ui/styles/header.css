@@ -16,6 +16,24 @@
 .sh-appheader .sh-logo--mark { display: none; }
 .sh-appheader__short { display: none; }
 
+/* Tablet (600-1023): Docs as its icon alone (its name stays for screen
+   readers). Below 768 the mark stands for the lockup, and the gaps and
+   the edges are 16. Should the wallet
+   control still need the room (two wallets at the narrowest), the
+   sections scroll sideways under it rather than run beneath it. */
+@media (min-width: 600px) and (max-width: 1279px) {
+  .sh-appheader__nav { overflow-x: auto; scrollbar-width: none; }
+  .sh-appheader__nav::-webkit-scrollbar { display: none; }
+  .sh-appheader__nav .sh-nav { flex: none; }
+}
+@media (min-width: 600px) and (max-width: 1023px) {
+  .sh-appheader__nav .sh-nav__label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+}
+@media (min-width: 600px) and (max-width: 767px) {
+  .sh-appheader__inner { gap: var(--space-4); width: auto; padding: 0 var(--space-4); }
+  .sh-appheader .sh-logo--lockup { display: none; }
+  .sh-appheader .sh-logo--mark { display: flex; }
+}
 @media (max-width: 599px) {
   .sh-appheader__inner { height: 56px; gap: var(--space-3); width: auto; padding: 0 var(--space-4); }
   .sh-appheader__nav { display: none; }

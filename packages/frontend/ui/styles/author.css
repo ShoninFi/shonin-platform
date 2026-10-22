@@ -180,6 +180,19 @@
 /* /you/agents/:id */
 .sh-manage__body { display: flex; flex-direction: column; gap: var(--space-6); }
 .sh-manage__card { display: flex; flex-direction: column; gap: var(--space-3); }
+/* The cards in reading order (the phone's), one column; from 1024px two to
+   a row, the tank wider than earnings, the vault's figures (no controls in
+   them) drawn above the rest and retiring across the foot. */
+.sh-manage__cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-5); align-items: start; }
+@media (min-width: 1024px) {
+  .sh-manage__cards { grid-template-columns: repeat(12, minmax(0, 1fr)); align-items: stretch; }
+  .sh-manage__cards > * { grid-column: span 6; }
+  .sh-manage__cards > .sh-manage__tank { grid-column: span 7; }
+  .sh-manage__cards > .sh-manage__earnings { grid-column: span 5; }
+  .sh-manage__cards > .sh-manage__vault, .sh-manage__cards > .sh-manage__retire { grid-column: 1 / -1; }
+  .sh-manage__cards > .sh-manage__vault { order: -1; }
+  .sh-manage__cards > .sh-manage__retire { align-items: flex-start; }
+}
 .sh-manage__cardhead { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
 .sh-manage__figure { font: var(--type-figure-l); letter-spacing: var(--track-figure-l); }
 .sh-manage__switch { width: 100%; }
@@ -248,6 +261,8 @@
   .sh-publish__barline { display: flex; }
   .sh-app:has(.sh-publish__bar) { padding-bottom: calc(64px + 140px + env(safe-area-inset-bottom)); }
   .sh-activate__fields, .sh-manage__split { grid-template-columns: minmax(0, 1fr); }
+  /* The phone's header names the page; the trail would repeat it. */
+  .sh-manage__crumb { display: none; }
   .sh-you__row, .sh-you__row--job { grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2) var(--space-3); padding: var(--space-4); }
   .sh-you__fig { flex-direction: row; align-items: baseline; gap: var(--space-2); }
   .sh-you__row--job .sh-you__actions { grid-column: 1 / -1; justify-content: flex-start; }

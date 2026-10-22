@@ -22,7 +22,15 @@ pub struct Dialog {
     /// The buttons along the bottom: the safe one first, the action last.
     pub foot: Option<View>,
     pub wide: bool,
+    /// An alert (`alertdialog`): this chip above the title, and no close
+    /// button; Esc, the scrim and a swipe still close it. Its body's message
+    /// carries [`DESCRIPTION_ID`], which describes the dialog.
+    pub alert: Option<View>,
 }
+
+/// The id of an alert dialog's message, which describes it
+/// (`aria-describedby`).
+pub const DESCRIPTION_ID: &str = "sh-dialog-desc";
 
 type Slot = Rc<RefCell<Option<Dialog>>>;
 
@@ -87,31 +95,35 @@ pub fn layer() -> El {
 
 fn render(dialog: Dialog) -> View {
     const TITLE_ID: &str = "sh-dialog-title";
+    let alert = dialog.alert.is_some();
+    let title = el("h2")
+        .class("sh-dialog__title")
+        .attr("id", TITLE_ID)
+        .attr("tabindex", "-1")
+        .text(dialog.title);
     let head = el("div")
         .class("sh-dialog__head")
+        .class_if(alert, "sh-dialog__head--alert")
         .child(
             el("span")
                 .class("sh-dialog__grab")
                 .attr("aria-hidden", "true"),
-        )
-        .child(
-            el("h2")
-                .class("sh-dialog__title")
-                .attr("id", TITLE_ID)
-                .attr("tabindex", "-1")
-                .text(dialog.title),
-        )
-        .child(
+        );
+    let head = match dialog.alert {
+        Some(chip) => head.child(chip).child(title),
+        None => head.child(title).child(
             icon_button(Icon::Close, "Close dialog")
                 .class("sh-dialog__close")
                 .hook(|dom| dom.event(|_: dominator::events::Click| close())),
-        );
+        ),
+    };
     let mut panel = el("div")
         .class("sh-dialog")
         .class_if(dialog.wide, "sh-dialog--wide")
-        .attr("role", "dialog")
+        .attr("role", if alert { "alertdialog" } else { "dialog" })
         .attr("aria-modal", "true")
         .attr("aria-labelledby", TITLE_ID)
+        .attr_if(alert, "aria-describedby", DESCRIPTION_ID)
         .child(head)
         .child(el("div").class("sh-dialog__body").child(dialog.body));
     if let Some(foot) = dialog.foot {
@@ -127,7 +139,12 @@ fn render(dialog: Dialog) -> View {
             gloo_timers::future::TimeoutFuture::new(0).await;
             focus_first(&target);
         })
-        .event(move |event: dominator::events::KeyDown| trap(&element, event))
+        // Not passive, so the trap's `prevent_default` keeps the browser
+        // from also moving focus on.
+        .event_with_options(
+            &dominator::EventOptions::preventable(),
+            move |event: dominator::events::KeyDown| trap(&element, event),
+        )
         .apply(|dom| swipe_to_close(dom, swipe))
     });
     el("div")
@@ -152,7 +169,6 @@ fn render(dialog: Dialog) -> View {
         .into()
 }
 
-/// Keep Tab and Shift+Tab inside the dialog.
 /// Focus the dialog's first control in the body or the buttons (never the
 /// close button, and a tab row at its selected tab), else its title.
 fn focus_first(element: &web_sys::Element) {
@@ -175,6 +191,26 @@ fn focus_first(element: &web_sys::Element) {
     }
 }
 
+/// Which end of the dialog's controls Tab moves focus to instead of the
+/// browser's next: past the last (or from outside) to the first, and with
+/// Shift before the first (or from outside) to the last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wrap {
+    First,
+    Last,
+}
+
+fn wrap(shift: bool, at_first: bool, at_last: bool, inside: bool) -> Option<Wrap> {
+    if shift && (at_first || !inside) {
+        Some(Wrap::Last)
+    } else if !shift && (at_last || !inside) {
+        Some(Wrap::First)
+    } else {
+        None
+    }
+}
+
+/// Keep Tab and Shift+Tab inside the dialog.
 fn trap(element: &web_sys::Element, event: dominator::events::KeyDown) {
     if event.key() != "Tab" {
         return;
@@ -192,13 +228,13 @@ fn trap(element: &web_sys::Element, event: dominator::events::KeyDown) {
     let inside = active
         .as_ref()
         .is_some_and(|active| element.contains(Some(active)));
-    if event.shift_key() && (at(first) || !inside) {
-        event.prevent_default();
-        crate::web::focus(last);
-    } else if !event.shift_key() && (at(last) || !inside) {
-        event.prevent_default();
-        crate::web::focus(first);
-    }
+    let to = match wrap(event.shift_key(), at(first), at(last), inside) {
+        Some(Wrap::First) => first,
+        Some(Wrap::Last) => last,
+        None => return,
+    };
+    event.prevent_default();
+    crate::web::focus(to);
 }
 
 /// On a phone the dialog is a sheet: dragging its top edge down moves it
@@ -253,4 +289,42 @@ fn swipe_to_close(
             style(&up_el, "translateY(0)");
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Wrap, wrap};
+
+    #[test]
+    fn an_alert_dialog_is_described_by_its_message_and_a_plain_dialog_is_not() {
+        use crate::view::{View, el};
+        let dialog = |alert: bool| super::Dialog {
+            title: "Switch network".to_string(),
+            body: el("p").attr("id", super::DESCRIPTION_ID).text("Why").into(),
+            foot: None,
+            wide: false,
+            alert: alert.then(|| el("span").text("Wrong network").into()),
+        };
+        let alert = View::Many(vec![super::render(dialog(true))]).html();
+        assert!(alert.contains("role=\"alertdialog\""), "{alert}");
+        assert!(
+            alert.contains(&format!("aria-describedby=\"{}\"", super::DESCRIPTION_ID)),
+            "{alert}"
+        );
+        let plain = View::Many(vec![super::render(dialog(false))]).html();
+        assert!(!plain.contains("aria-describedby"), "{plain}");
+    }
+
+    #[test]
+    fn tab_wraps_from_the_last_control_to_the_first_and_shift_tab_from_the_first_to_the_last() {
+        // (shift, at first, at last, focus inside)
+        assert_eq!(wrap(false, false, true, true), Some(Wrap::First));
+        assert_eq!(wrap(true, true, false, true), Some(Wrap::Last));
+        assert_eq!(wrap(false, false, false, false), Some(Wrap::First));
+        assert_eq!(wrap(true, false, false, false), Some(Wrap::Last));
+        // Between the ends the browser moves focus on by itself.
+        assert_eq!(wrap(false, true, false, true), None);
+        assert_eq!(wrap(true, false, true, true), None);
+        assert_eq!(wrap(false, false, false, true), None);
+    }
 }

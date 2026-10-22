@@ -99,12 +99,16 @@ fn published(strategy: &Strategy) -> View {
             size_words(total)
         )
     };
-    let download = Button::new(Kind::Secondary, "Download source.tar")
-        .size(Size::Small)
-        .icon_before(Icon::Code)
-        .href(archive)
-        .build()
-        .attr("download", "source.tar");
+    let download: View = match archive {
+        Some(archive) => Button::new(Kind::Secondary, "Download source.tar")
+            .size(Size::Small)
+            .icon_before(Icon::Code)
+            .href(archive)
+            .build()
+            .attr("download", "source.tar")
+            .into(),
+        None => View::Empty,
+    };
     let head = card("ag-src-title", "The source the Reviewer read", Some(Icon::Code))
         .class("ag-src-head")
         .child(el("p").class("ag-body").text(summary))

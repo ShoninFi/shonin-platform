@@ -315,11 +315,29 @@ pub fn exit_sentence(strategy: &Strategy) -> View {
 }
 
 fn buttons(slug: &str) -> El {
+    // While a browser wallet is on another chain than the vault's, the
+    // primary action is "Switch to <chain>", as on the phone's action bar.
     let deposit = {
         let slug = slug.to_string();
-        on_click(
-            Button::new(Kind::Primary, "Deposit").block().build(),
-            move || exit::open_sheet(&slug, Tab::Deposit),
+        el("div").class("ag-mini-exit__primary").child_signal(
+            None,
+            crate::components::wallet::vault_wrong_signal(&slug).map(move |wrong| {
+                Some(match wrong {
+                    Some((_, want)) => crate::components::wallet::switch_button(
+                        want,
+                        crate::atoms::button::Size::Medium,
+                    )
+                    .class("sh-btn-block")
+                    .into(),
+                    None => {
+                        let slug = slug.clone();
+                        View::from(on_click(
+                            Button::new(Kind::Primary, "Deposit").block().build(),
+                            move || exit::open_sheet(&slug, Tab::Deposit),
+                        ))
+                    }
+                })
+            }),
         )
     };
     let withdraw = {
@@ -530,6 +548,13 @@ pub fn facts_hashes(strategy: &Strategy) -> Vec<(&'static str, String)> {
         rows.push(("Executor image", attestation.image.digest.clone()));
     }
     rows.push(("Vault contract", strategy.vault.address.clone()));
+    if let Some(tx) = strategy
+        .review
+        .as_ref()
+        .and_then(|review| review.recorded_tx.clone())
+    {
+        rows.push(("Report recorded in", tx));
+    }
     rows
 }
 

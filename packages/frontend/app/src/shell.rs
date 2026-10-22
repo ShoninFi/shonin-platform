@@ -42,6 +42,7 @@ pub fn frame(route: &Route, page: pages::Page) -> El {
         )
         .child(testnet::line())
         .child(header::header(route))
+        .child(crate::components::wallet::page_wrong_network_bar(route))
         .child(freshness::bar())
         .child(page.top.unwrap_or(View::Empty))
         .child(main)

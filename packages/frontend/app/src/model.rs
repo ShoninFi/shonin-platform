@@ -383,6 +383,7 @@ mod tests {
             prompt_hash: String::new(),
             report_hash: String::new(),
             limits: vec![],
+            recorded_tx: None,
         }
     }
 

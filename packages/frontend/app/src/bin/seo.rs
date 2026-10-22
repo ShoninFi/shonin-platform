@@ -3,7 +3,7 @@
 //! ```text
 //! seo --dist .trunk-dist/app --base-url https://app.shonin.fi \
 //!     --app-api https://testnet-api.shonin.fi/api --chains config/chains.toml \
-//!     [--api https://testnet-api.shonin.fi/api]
+//!     --network testnet [--api https://testnet-api.shonin.fi/api]
 //! ```
 //!
 //! The app is a wasm single-page app, so the HTML Trunk writes has no content
@@ -24,8 +24,9 @@
 //!   served by `_redirects` with status 200 at every such address.
 //! - `sitemap.xml` and `robots.txt`.
 //! - `_headers` with its Content-Security-Policy filled in: `'self'`, the
-//!   API origin the app was built with, and the public RPC origins in
-//!   `config/chains.toml`. Trunk's inline loader script is moved into a file
+//!   API origin the app was built with, and the public RPC origins of the
+//!   chains `config/chains.toml` lists for the network the build is for
+//!   (`--network`), and no other network's. Trunk's inline loader script is moved into a file
 //!   first, so scripts need nothing but `'self'` and `'wasm-unsafe-eval'`.
 //!
 //! Without `--api` only the pages that need no data are written.
@@ -66,6 +67,7 @@ mod native {
         base_url: String,
         app_api: String,
         chains: PathBuf,
+        network: String,
         api: Option<String>,
     }
 
@@ -157,8 +159,8 @@ mod native {
     }
 
     fn parse_args() -> Result<Args, Box<dyn Error>> {
-        let (mut dist, mut base_url, mut app_api, mut chains, mut api) =
-            (None, None, None, None, None);
+        let (mut dist, mut base_url, mut app_api, mut chains, mut network, mut api) =
+            (None, None, None, None, None, None);
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -166,19 +168,21 @@ mod native {
                 "--base-url" => base_url = args.next(),
                 "--app-api" => app_api = args.next(),
                 "--chains" => chains = args.next().map(PathBuf::from),
+                "--network" => network = args.next().filter(|name| !name.is_empty()),
                 "--api" => api = args.next().filter(|url| !url.is_empty()),
                 other => return Err(format!("unknown argument `{other}`").into()),
             }
         }
-        match (dist, base_url, app_api, chains) {
-            (Some(dist), Some(base_url), Some(app_api), Some(chains)) => Ok(Args {
+        match (dist, base_url, app_api, chains, network) {
+            (Some(dist), Some(base_url), Some(app_api), Some(chains), Some(network)) => Ok(Args {
                 dist,
                 base_url,
                 app_api,
                 chains,
+                network,
                 api,
             }),
-            _ => Err("usage: seo --dist <dir> --base-url <url> --app-api <url> --chains <chains.toml> [--api <url>]".into()),
+            _ => Err("usage: seo --dist <dir> --base-url <url> --app-api <url> --chains <chains.toml> --network <name> [--api <url>]".into()),
         }
     }
 
@@ -258,6 +262,7 @@ mod native {
              <meta name=\"twitter:image\" content=\"{image}\" />\n\
              <meta name=\"twitter:image:alt\" content=\"{alt}\" />\n"
         );
+        out += &ui::social::head_html(app::route::SITE);
         match route.path() {
             Some(path) if route.is_indexable() => {
                 let url = escape(&format!("{base}{path}"));
@@ -327,7 +332,10 @@ mod native {
         if let Some(origin) = api::origin(&args.app_api) {
             connect.insert(origin);
         }
-        connect.extend(rpc_origins(&fs::read_to_string(&args.chains)?)?);
+        connect.extend(rpc_origins(
+            &fs::read_to_string(&args.chains)?,
+            &args.network,
+        )?);
         let policy = csp(&connect);
         fs::write(
             &path,
@@ -337,31 +345,49 @@ mod native {
         Ok(())
     }
 
+    /// Where Cloudflare's Web Analytics script is loaded from.
+    const ANALYTICS_SCRIPT: &str = "https://static.cloudflareinsights.com";
+    /// The one address the analytics beacon reports to.
+    const ANALYTICS_REPORT: &str = "https://cloudflareinsights.com/cdn-cgi/rum";
+
     /// The policy: everything from this origin; WebAssembly compiled; data only
     /// from the API and the chains' public endpoints; plus Cloudflare's
     /// cookieless Web Analytics script and beacon.
     fn csp(connect: &BTreeSet<String>) -> String {
         // Cloudflare Web Analytics (cookieless) is injected at the zone: its
-        // script and the beacon's report endpoint, and nothing broader.
-        let mut connect_src = String::from("'self' https://cloudflareinsights.com");
+        // script and the beacon's report address, and nothing broader.
+        let mut connect_src = format!("'self' {ANALYTICS_REPORT}");
         for origin in connect {
             connect_src.push(' ');
             connect_src.push_str(origin);
         }
         format!(
-            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com; style-src 'self'; font-src 'self'; \
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' {ANALYTICS_SCRIPT}; style-src 'self'; font-src 'self'; \
              img-src 'self' data:; connect-src {connect_src}; base-uri 'self'; form-action 'self'; \
              frame-ancestors 'none'; object-src 'none'"
         )
     }
 
-    /// Every public (https or wss) RPC origin in `config/chains.toml`. Local
-    /// endpoints are left out: a deployed page can never reach them.
-    fn rpc_origins(chains_toml: &str) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    /// Every public (https or wss) RPC origin of the chains `network` names
+    /// in `config/chains.toml`; another network's chains are left out. Local
+    /// endpoints are left out too: a deployed page can never reach them.
+    fn rpc_origins(chains_toml: &str, network: &str) -> Result<BTreeSet<String>, Box<dyn Error>> {
         let config: toml::Table = chains_toml.parse()?;
+        let keys: BTreeSet<&str> = config
+            .get("networks")
+            .and_then(|networks| networks.get(network))
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| format!("no network `{network}` in the chains config"))?
+            .values()
+            .filter_map(toml::Value::as_str)
+            .filter(|key| key.contains(':'))
+            .collect();
         let mut origins = BTreeSet::new();
         if let Some(chains) = config.get("chains").and_then(toml::Value::as_table) {
-            for chain in chains.values() {
+            for (key, chain) in chains {
+                if !keys.contains(key.as_str()) {
+                    continue;
+                }
                 for key in ["rpc", "ws", "logs_rpc"] {
                     let Some(urls) = chain.get(key).and_then(toml::Value::as_str) else {
                         continue;
@@ -391,11 +417,69 @@ mod native {
                 "script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com;"
             ));
             assert!(policy.contains(
-                "connect-src 'self' https://cloudflareinsights.com https://testnet-api.shonin.fi;"
+                "connect-src 'self' https://cloudflareinsights.com/cdn-cgi/rum https://testnet-api.shonin.fi;"
             ));
             assert!(policy.contains("style-src 'self';"));
             assert!(!policy.contains("unsafe-inline"));
             assert!(policy.contains("frame-ancestors 'none'"));
+        }
+
+        #[test]
+        fn the_analytics_beacon_may_report_only_to_its_one_address() {
+            let policy = csp(&BTreeSet::new());
+            let connect = policy
+                .split(';')
+                .map(str::trim)
+                .find_map(|directive| directive.strip_prefix("connect-src "))
+                .expect("a connect-src");
+            assert_eq!(
+                connect.split_whitespace().collect::<Vec<_>>(),
+                ["'self'", "https://cloudflareinsights.com/cdn-cgi/rum"]
+            );
+        }
+
+        #[test]
+        fn the_policy_names_only_the_endpoints_of_the_network_the_build_is_for() {
+            let toml = r#"
+                [chains."evm:84532"]
+                rpc = "https://sepolia.base.org"
+                [chains."evm:8453"]
+                rpc = "https://mainnet.base.org"
+                [chains."solana:mainnet-beta"]
+                rpc = "https://api.mainnet-beta.solana.com"
+                [networks.testnet]
+                base = "evm:84532"
+                root = "base"
+                [networks.mainnet]
+                base = "evm:8453"
+                solana = "solana:mainnet-beta"
+            "#;
+            assert_eq!(
+                rpc_origins(toml, "testnet")
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                ["https://sepolia.base.org"]
+            );
+            assert_eq!(
+                rpc_origins(toml, "mainnet")
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [
+                    "https://api.mainnet-beta.solana.com",
+                    "https://mainnet.base.org"
+                ]
+            );
+            assert!(rpc_origins(toml, "elsewhere").is_err());
+            // The repository's own config: a testnet build names no mainnet
+            // endpoint.
+            let ours = include_str!("../../../../../config/chains.toml");
+            let testnet = rpc_origins(ours, "testnet").unwrap();
+            assert!(testnet.contains("https://sepolia.base.org"));
+            for mainnet in rpc_origins(ours, "mainnet").unwrap() {
+                assert!(!testnet.contains(&mainnet), "{mainnet}");
+            }
         }
 
         #[test]
@@ -408,8 +492,12 @@ mod native {
                 [chains."solana:devnet"]
                 rpc = "https://api.devnet.solana.com"
                 ws = "wss://api.devnet.solana.com"
+                [networks.testnet]
+                local = "evm:31337"
+                base = "evm:84532"
+                solana = "solana:devnet"
             "#;
-            let origins = rpc_origins(toml).unwrap();
+            let origins = rpc_origins(toml, "testnet").unwrap();
             assert_eq!(
                 origins.into_iter().collect::<Vec<_>>(),
                 [
@@ -494,6 +582,57 @@ mod native {
                 Some((1200, 630))
             );
             assert!(SHARE_IMAGE.ends_with(ui::images::SHARE_APP.png.name));
+        }
+
+        #[test]
+        fn every_pre_rendered_page_names_the_x_account_and_every_place_shonin_is() {
+            let shell_html = format!("<head>{HEAD_START}{HEAD_END}</head><body>{BODY}</body>");
+            let base = "https://app.shonin.fi";
+            let mut pages: Vec<String> = Route::all_pages()
+                .iter()
+                .chain([&Route::NotFound])
+                .map(|route| render(&shell_html, base, route))
+                .collect();
+            pages.extend(
+                Route::shell_kinds()
+                    .iter()
+                    .map(|route| render_shell(&shell_html, base, route)),
+            );
+            for html in &pages {
+                assert_eq!(meta(html, "twitter:site"), Some("@ShoninFi"), "{html}");
+                assert_eq!(
+                    html.matches("<script type=\"application/ld+json\">")
+                        .count(),
+                    1
+                );
+                for place in [
+                    "https://x.com/ShoninFi",
+                    "https://discord.gg/2pabyT6rYJ",
+                    app::route::GITHUB,
+                ] {
+                    assert!(html.contains(&format!("\"{place}\"")), "{place}");
+                }
+            }
+        }
+
+        #[test]
+        fn every_page_is_kept_from_other_sites_windows_but_may_open_wallet_popups() {
+            let headers = include_str!("../../_headers");
+            assert!(headers.contains("/*\n"));
+            assert!(
+                headers.contains("  Cross-Origin-Opener-Policy: same-origin-allow-popups\n"),
+                "{headers}"
+            );
+        }
+
+        #[test]
+        fn the_loader_never_puts_the_apps_bindings_on_the_window() {
+            let index = include_str!("../../index.html");
+            let rust = index
+                .lines()
+                .find(|line| line.contains("data-trunk rel=\"rust\""))
+                .expect("the app's build line");
+            assert!(rust.contains(" data-wasm-no-import"), "{rust}");
         }
 
         #[test]

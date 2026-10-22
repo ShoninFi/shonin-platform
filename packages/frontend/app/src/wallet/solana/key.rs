@@ -1,14 +1,16 @@
 //! The recovery-phrase wallet on Solana: an ed25519 key derived from a
 //! BIP-39 phrase along `m/44'/501'/<account>'/0'` (SLIP-10, every step
 //! hardened, as Phantom and Solflare derive an account), held in this page's
-//! memory only and signing here. Nothing of it is stored, logged or sent:
-//! the key's bytes are wiped when it is dropped, and only what it signs
-//! leaves the page.
+//! memory only and signing here. Nothing of it is stored, logged or sent,
+//! and only what it signs leaves the page. The key's bytes, the seed and
+//! the app's own copies of the phrase are wiped; the BIP-39 library's own
+//! short-lived copies are not (see `wallet::phrase`).
 
 use alloy_signer_local::coins_bip39::{English, Mnemonic};
 use chain::solana_ix::Pubkey;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use sha2::{Digest, Sha512};
+use zeroize::Zeroizing;
 
 use crate::wallet::phrase::BadPhrase;
 
@@ -30,17 +32,11 @@ impl SolKey {
     /// wallet's first account is 0). Spaces and case don't matter; the
     /// words and their checksum do.
     pub fn from_phrase(phrase: &str, account: u32) -> Result<Self, BadPhrase> {
-        let words: Vec<String> = phrase
-            .split_whitespace()
-            .map(|word| word.to_lowercase())
-            .collect();
-        if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
-            return Err(BadPhrase);
-        }
-        let mnemonic =
-            Mnemonic::<English>::new_from_phrase(&words.join(" ")).map_err(|_| BadPhrase)?;
-        let seed = mnemonic.to_seed(None).map_err(|_| BadPhrase)?;
-        let secret = derive(&seed, &[44, 501, account, 0]);
+        let words = crate::wallet::phrase::normalized(phrase)?;
+        let mnemonic = Mnemonic::<English>::new_from_phrase(&words)
+            .map_err(crate::wallet::phrase::wipe_refusal)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(None).map_err(|_| BadPhrase)?);
+        let secret = Zeroizing::new(derive(&*seed, &[44, 501, account, 0]));
         Ok(Self {
             signing: SigningKey::from_bytes(&secret),
         })

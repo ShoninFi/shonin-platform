@@ -228,7 +228,10 @@ fn pages_run_only_the_hashed_boot_script_and_carry_no_inline_styles() {
         assert!(!html.contains(" style=\""), "{page} has an inline style");
         assert!(!html.contains("<style"), "{page} has a style element");
         assert_eq!(
-            html.matches("<script").count(),
+            html.matches("<script").count()
+                - html
+                    .matches("<script type=\"application/ld+json\">")
+                    .count(),
             2,
             "{page}: the boot script and the site script"
         );
@@ -285,6 +288,42 @@ fn every_page_previews_with_the_share_image_at_its_full_address() {
     assert!(
         headers.contains("/share/*\n  Cache-Control: public, max-age=86400\n"),
         "the share image is cached, briefly, at an address that never changes"
+    );
+}
+
+#[test]
+fn every_page_names_the_x_account_and_every_place_shonin_is() {
+    let files = files();
+    let pages = pages(&files);
+    assert!(pages.len() >= 5);
+    for (page, html) in pages {
+        assert_eq!(meta(&html, "twitter:site"), Some("@ShoninFi"), "{page}");
+        let start = "<script type=\"application/ld+json\">";
+        assert_eq!(html.matches(start).count(), 1, "{page}");
+        let at = html.find(start).unwrap() + start.len();
+        let data = &html[at..at + html[at..].find("</script>").unwrap()];
+        assert!(data.contains("\"@type\":\"Organization\""), "{page}");
+        assert!(data.contains("\"url\":\"https://shonin.fi\""), "{page}");
+        assert!(
+            data.contains(
+                "\"sameAs\":[\"https://x.com/ShoninFi\",\"https://discord.gg/2pabyT6rYJ\",\"https://github.com/ShoninFi\"]"
+            ),
+            "{page}: {data}"
+        );
+        // The footer links the same GitHub address the data names.
+        assert!(
+            html.contains("href=\"https://github.com/ShoninFi\""),
+            "{page}"
+        );
+    }
+}
+
+#[test]
+fn every_page_is_kept_from_other_sites_windows_but_may_open_popups() {
+    let headers = String::from_utf8(files()["_headers"].clone()).unwrap();
+    assert!(
+        headers.contains("  Cross-Origin-Opener-Policy: same-origin-allow-popups\n"),
+        "{headers}"
     );
 }
 

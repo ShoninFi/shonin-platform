@@ -166,6 +166,10 @@ pub struct Review {
     pub report_hash: String,
     /// What the review could not see, said plainly.
     pub limits: Vec<String>,
+    /// The transaction that recorded the review on the chain, where the
+    /// indexer knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_tx: Option<String>,
 }
 
 impl Review {

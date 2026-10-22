@@ -115,7 +115,9 @@
 .ag-card__foot { display: flex; flex-direction: column; gap: var(--space-2); padding-top: var(--space-4); border-top: var(--border-hairline) solid var(--line); }
 .ag-card--flush { padding: 0; gap: 0; overflow: hidden; }
 .ag-card__head--pad { padding: 20px var(--space-5); }
-.ag-card--flush-table .ag-scroll { margin: 0 calc(-1 * var(--space-5)); }
+/* A flush table runs to the card's edges: past its padding on both sides,
+   so it is never held to the content's width. */
+.ag-card--flush-table .ag-scroll { margin: 0 calc(-1 * var(--space-5)); max-width: none; }
 .ag-section-title { font: var(--type-heading); letter-spacing: var(--track-heading); }
 .ag-muted { font: var(--type-body-s); color: var(--ink-muted); }
 .ag-note { font: var(--type-body-s); color: var(--ink-muted); }
@@ -299,6 +301,7 @@
 .ag-mini-exit__price { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
 .ag-mini-exit__figure { font: var(--type-figure-l); letter-spacing: var(--track-figure-l); font-variant-numeric: tabular-nums; }
 .ag-mini-exit__buttons { display: flex; flex-direction: column; gap: 10px; }
+.ag-mini-exit__primary { display: flex; flex-direction: column; }
 .ag-way__head { display: flex; align-items: center; gap: var(--space-3); }
 .ag-way__icon { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: var(--radius-m); background: var(--gain-soft); color: var(--gain); flex: none; }
 .ag-way__title { font: var(--type-subheading); }
@@ -327,6 +330,9 @@
 .ag-counts__tile--some .ag-counts__word { color: var(--caution); }
 .ag-counts__tile--serious { background: var(--loss-soft); }
 .ag-counts__tile--serious .ag-counts__word { color: var(--loss); }
+.ag-counts__tile--fine .ag-counts__word { color: var(--gain); }
+.ag-counts__tile--some .ag-counts__n, .ag-counts__tile--serious .ag-counts__n { color: var(--ink); }
+.ag-counts__tile--none .ag-counts__n strong { color: var(--ink-muted); }
 .ag-says { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: var(--space-4); padding-top: var(--space-4); border-top: var(--border-hairline) solid var(--line); }
 .ag-says__text { font: var(--type-body-l); overflow-wrap: anywhere; }
 .ag-says__verdict { display: flex; gap: var(--space-2); margin-top: var(--space-2); font: var(--type-body-s); color: var(--ink-muted); }
@@ -470,6 +476,28 @@
 .ag-spell--reveal > span:nth-child(n+12) { animation-delay: 660ms; }
 @keyframes ag-char { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .ag-keys th[scope="row"] { display: table-cell; }
+/* A cell still loading: the shape where the figure lands. */
+.ag-loading { display: inline-flex; vertical-align: middle; }
+/* Phone: the verify page's tables read as one block per row, the row's
+   name first and each other column as a label and its value, never a
+   table that scrolls sideways. */
+@media (max-width: 599px) {
+  .ag-scroll:has(> .ag-stack) { overflow: visible; }
+  .ag-scroll .sh-table.ag-stack { min-width: 0; }
+  .ag-stack, .ag-stack tbody { display: block; }
+  .ag-stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+  .ag-stack tr { display: flex; flex-direction: column; gap: var(--space-2); padding: 14px var(--space-4); border-bottom: var(--border-hairline) solid var(--line); }
+  .ag-stack tbody tr:last-child { border-bottom: 0; }
+  .ag-stack th, .ag-stack td, .ag-keys.ag-stack th[scope="row"] { display: block; padding: 0 !important; border: 0 !important; }
+  .ag-stack th[scope="row"] { font-weight: 600; }
+  .ag-stack td[data-label] { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); text-align: right; }
+  .ag-stack td[data-label]::before { content: attr(data-label); flex: none; font: var(--type-body-s); color: var(--ink-muted); text-align: left; }
+  /* The day an image counts from, at the size of the row's other values. */
+  .ag-stack td.ag-since { font: var(--type-body-s); }
+  .ag-stack .ag-keys__day, .ag-stack .ag-keys__left { display: inline; }
+  .ag-stack .ag-keys__left::before { content: " · "; }
+}
+
 .ag-keys__role, .ag-keys__left { display: block; font: 400 12px/16px var(--font-sans); color: var(--ink-muted); }
 .ag-keys__day { display: block; white-space: nowrap; }
 .ag-keys__expired { color: var(--ink-muted); }
@@ -567,6 +595,11 @@
   }
   .ag-actionbar__buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
   .ag-actionbar .sh-btn { height: 48px; }
+  .ag-actionbar__primary { display: grid; min-width: 0; }
+  .ag-actionbar__primary .sh-btn { width: 100%; min-width: 0; }
+  /* A long label ("Connect a Solana wallet") takes two lines on the
+     narrowest phones rather than spilling out of its button. */
+  .ag-actionbar__primary .sh-btn { padding-left: var(--space-3); padding-right: var(--space-3); white-space: normal; line-height: 1.2; text-align: center; }
   .sh-app:has(.ag-actionbar) { padding-bottom: calc(118px + env(safe-area-inset-bottom)); }
 }
 
@@ -680,10 +713,13 @@
 .ag-src__gutter { padding-left: var(--space-3); padding-right: var(--space-3); text-align: right; color: var(--ink-muted); background: var(--paper); border-right: var(--border-hairline) solid var(--line); user-select: none; }
 .ag-src__code { padding-left: var(--space-4); padding-right: var(--space-4); overflow-x: auto; color: var(--ink); }
 .ag-src__code:focus-visible { outline-offset: -2px; }
+/* Below desktop the file rows are touch targets: 44px. */
+@media (max-width: 1023px) {
+  .ag-src__link { min-height: 44px; align-items: center; }
+}
 @media (max-width: 599px) {
   .ag-src-head__row { align-items: stretch; flex-direction: column; }
   .ag-src__nav { max-height: 320px; overflow-y: auto; }
-  .ag-src__link { min-height: 44px; align-items: center; }
   .ag-src__gutter { padding-left: var(--space-2); padding-right: var(--space-2); }
   .ag-src__code { padding-left: var(--space-3); padding-right: var(--space-3); }
 }

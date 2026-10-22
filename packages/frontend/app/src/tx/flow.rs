@@ -64,6 +64,14 @@ pub enum Prompt {
     /// The second step: settle what the valuation priced. Optional: the
     /// keeper sends it with the valuation, and anyone may.
     Finish,
+    /// The second step, its prompt still open in the wallet, for a request
+    /// the vault reports settled meanwhile: approving it sends a settle that
+    /// does nothing for the request and only costs its fee.
+    FinishNoLongerNeeded,
+    /// The second step, signed in the page and on its way to the network:
+    /// nothing is left to approve, decline or skip, and its answer is
+    /// awaited.
+    FinishSigned,
     SettleClaim {
         claim: U256,
     },
@@ -167,9 +175,20 @@ pub enum Outcome {
         shares: U256,
         hash: B256,
     },
-    /// A request someone else had settled before the app asked anything:
-    /// nothing was sent, and this is how it settled.
+    /// A request someone else had settled before the app asked anything,
+    /// or while the wallet was asked and the wallet declined: nothing was
+    /// sent, and this is how it settled.
     SettledBefore(Box<Outcome>),
+    /// A request the vault reported settled while the wallet was asked, and
+    /// the wallet sent the app's settle anyway (`sent`). `how` is how it
+    /// settled, and `by` what the vault's record says of who settled it.
+    /// The record naming the app's own settle is no `SentAfterSettled` at
+    /// all.
+    SentAfterSettled {
+        sent: B256,
+        how: Box<Outcome>,
+        by: SettledBy,
+    },
     /// A claim settled: it pays `owner`, whoever sent it.
     Claim {
         claim: U256,
@@ -188,6 +207,96 @@ pub enum Outcome {
     ClaimMade { claim: U256, hash: B256 },
     /// Units' or held dollars collected.
     Collected { assets: U256, hash: B256 },
+}
+
+impl Outcome {
+    /// The transaction that settled it, when one is named.
+    pub fn hash(&self) -> Option<B256> {
+        match self {
+            Self::Deposited { hash, .. }
+            | Self::Refunded { hash, .. }
+            | Self::Paid { hash, .. }
+            | Self::Booked { hash, .. }
+            | Self::Claim { hash, .. }
+            | Self::TookCash { hash, .. }
+            | Self::ClaimMade { hash, .. }
+            | Self::Collected { hash, .. } => Some(*hash),
+            Self::SettledBefore(how) | Self::SentAfterSettled { how, .. } => how.hash(),
+        }
+    }
+
+    /// The same outcome, linking `to` instead of the transaction it names.
+    pub fn linked(self, to: B256) -> Self {
+        match self {
+            Self::Deposited {
+                assets, shares, at, ..
+            } => Self::Deposited {
+                assets,
+                shares,
+                at,
+                hash: to,
+            },
+            Self::Refunded {
+                assets, to: wallet, ..
+            } => Self::Refunded {
+                assets,
+                to: wallet,
+                hash: to,
+            },
+            Self::Paid {
+                shares, assets, at, ..
+            } => Self::Paid {
+                shares,
+                assets,
+                at,
+                hash: to,
+            },
+            Self::Booked { claim, shares, .. } => Self::Booked {
+                claim,
+                shares,
+                hash: to,
+            },
+            Self::Claim {
+                claim,
+                owner,
+                state,
+                paid,
+                ..
+            } => Self::Claim {
+                claim,
+                owner,
+                state,
+                paid,
+                hash: to,
+            },
+            Self::TookCash { assets, units, .. } => Self::TookCash {
+                assets,
+                units,
+                hash: to,
+            },
+            Self::ClaimMade { claim, .. } => Self::ClaimMade { claim, hash: to },
+            Self::Collected { assets, .. } => Self::Collected { assets, hash: to },
+            Self::SettledBefore(how) => Self::SettledBefore(Box::new(how.linked(to))),
+            Self::SentAfterSettled { sent, how, by } => Self::SentAfterSettled {
+                sent,
+                how: Box::new(how.linked(to)),
+                by,
+            },
+        }
+    }
+}
+
+/// What the vault's record says of who settled a request the app's settle
+/// was sent for after it read settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettledBy {
+    /// Another transaction than the app's settle, for every kind of
+    /// wallet: who sent it is not inferred, and the outcome says only what
+    /// is true either way.
+    Unsure,
+    /// No transaction: the app's settle may or may not be the one that
+    /// settled it.
+    NoneNamed,
 }
 
 /// How often and how long a flow waits. The browser uses [`Pace::LIVE`];
@@ -211,6 +320,15 @@ pub struct Pace {
     /// Polls the app's own second step is watched for once sent: briefly,
     /// since it is optional and the keeper settles the request anyway.
     pub finish_watch: u32,
+    /// Looks given to the wallet's answer once the request reads settled
+    /// while it is asked for the second step: a page-signed send already on
+    /// the network answers within them, and only a prompt still open after
+    /// them is said to be no longer needed.
+    pub answer_grace: u32,
+    /// Looks the automatic second step keeps its prompt said to be no
+    /// longer needed, still taking the wallet's answer, before the flow
+    /// ends with the request settled.
+    pub unneeded_shown: u32,
     /// Polls before the flow stops watching (the request still stands).
     pub give_up_after: u32,
 }
@@ -223,6 +341,8 @@ impl Pace {
         replaced_after: 5,
         finish_after: 8,
         finish_watch: 60,
+        answer_grace: 2,
+        unneeded_shown: 8,
         give_up_after: 30 * 60,
     };
     pub const FAST: Self = Self {
@@ -232,6 +352,8 @@ impl Pace {
         replaced_after: 2,
         finish_after: 2,
         finish_watch: 8,
+        answer_grace: 2,
+        unneeded_shown: 2,
         give_up_after: 200,
     };
 }
@@ -353,6 +475,15 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         to: Address,
         data: Vec<u8>,
     ) -> Result<B256, TxError> {
+        let request = self.priced_request(to, data).await?;
+        self.guard().await?;
+        self.step(Step::Signing(prompt));
+        self.signer.send(&request).await
+    }
+
+    /// The transaction [`Self::send`] hands the wallet, simulated, its gas
+    /// set and its fee checked against the coin held.
+    async fn priced_request(&self, to: Address, data: Vec<u8>) -> Result<TxRequest, TxError> {
         let mut request = TxRequest {
             chain_id: self.chain_id,
             from: self.account,
@@ -372,10 +503,7 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
             }
         }
         request.gas = Some(gas);
-
-        self.guard().await?;
-        self.step(Step::Signing(prompt));
-        self.signer.send(&request).await
+        Ok(request)
     }
 
     /// Wait for a sent transaction to be mined, or say what became of it:
@@ -836,7 +964,7 @@ async fn follow<R: Reader, S: Signer, C: Clock>(
         .await
         .map_err(landed(receipt.hash, None))?;
     let landed = landed(countdown.hash, Some(countdown.request));
-    let at = priced(ctx, countdown, timers).await.map_err(&landed)?;
+    let (at, sent) = priced(ctx, countdown, timers).await.map_err(&landed)?;
     let request = read::Request {
         owner: ctx.account,
         kind,
@@ -845,16 +973,34 @@ async fn follow<R: Reader, S: Signer, C: Clock>(
         amount,
         reference: U256::ZERO,
     };
-    settled(
-        ctx,
-        countdown.request,
-        &request,
-        receipt.block,
-        at,
-        Some(countdown.hash),
-    )
-    .await
-    .map_err(&landed)
+    // One read of the vault's record: it names the transaction that settled
+    // the request, and the outcome then links the request's own.
+    let recorded = settled(ctx, countdown.request, &request, receipt.block, at, None)
+        .await
+        .map_err(&landed)?;
+    let by = recorded.hash().filter(|by| *by != B256::ZERO);
+    let how = recorded.linked(countdown.hash);
+    // The app's own second step went out: the record says whether it
+    // settled the request. Named as another transaction, it is said
+    // neutrally; named as nothing, it is said as sent after the request
+    // read settled only when the wallet answered after that.
+    let Some(sent) = sent else {
+        return Ok(how);
+    };
+    Ok(match by {
+        Some(by) if by == sent.hash => how,
+        None if !sent.after_settled => how,
+        None => Outcome::SentAfterSettled {
+            sent: sent.hash,
+            how: Box::new(how),
+            by: SettledBy::NoneNamed,
+        },
+        Some(_) => Outcome::SentAfterSettled {
+            sent: sent.hash,
+            how: Box::new(how),
+            by: SettledBy::Unsure,
+        },
+    })
 }
 
 /// How a settled request ended, from the vault's own events for that
@@ -1158,12 +1304,14 @@ async fn requested<R: Reader, S: Signer, C: Clock>(
 /// for it again ("Settle now"). Whatever becomes of it, the flow ends as soon
 /// as the vault reports the request settled, by anyone. A read that fails
 /// is one more look. When the long wait runs out the request still stands:
-/// [`TxError::Landed`] with nothing that stopped it.
+/// [`TxError::Landed`] with nothing that stopped it. With the time, the
+/// app's own second step when the wallet sent it after the request read
+/// settled.
 async fn priced<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     mut countdown: Countdown,
     timers: &Timers,
-) -> Result<u64, TxError> {
+) -> Result<(u64, Option<SentSecond>), TxError> {
     let earliest = countdown.slot;
     let mut priced_at: Option<u64> = None;
     let mut since_priced = 0u32;
@@ -1211,7 +1359,7 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
             });
         }
         if request.done {
-            return Ok(priced_at.unwrap_or(countdown.slot));
+            return Ok((priced_at.unwrap_or(countdown.slot), None));
         }
         match priced_at {
             Some(at) => {
@@ -1231,7 +1379,7 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
                         })
                     };
                     match second_step(ctx, countdown.request, &report).await {
-                        Second::Settled => return Ok(at),
+                        Second::Settled { sent_after } => return Ok((at, sent_after)),
                         Second::Open(unsent) => report(unsent, None),
                         // Sent and mined: said as sent, so the page never
                         // says the app will still send it.
@@ -1259,10 +1407,21 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
     })
 }
 
+/// The app's own second step, sent for a request the vault then reported
+/// settled.
+#[derive(Clone, Copy)]
+struct SentSecond {
+    hash: B256,
+    /// The wallet answered after the request read settled.
+    after_settled: bool,
+}
+
 /// Where the app's own second step left a priced request.
 enum Second {
-    /// The vault reports it settled, by anyone.
-    Settled,
+    /// The vault reports it settled, by anyone. `sent_after` is the app's
+    /// own step when the wallet sent it: the vault's record says whether it
+    /// was the one that settled the request.
+    Settled { sent_after: Option<SentSecond> },
     /// Not settled yet; why the app's own step wasn't sent or seen mined,
     /// if it wasn't.
     Open(Option<TxError>),
@@ -1297,6 +1456,144 @@ async fn while_asked<R: Reader, S: Signer, C: Clock>(
     }
 }
 
+/// What "Settle now" got from the wallet.
+struct Asked {
+    /// The wallet's answer: the hash it sent, or why it didn't.
+    sent: Result<B256, TxError>,
+    /// The vault reported the request settled while the prompt was open.
+    settled_meanwhile: bool,
+}
+
+/// The second step on its own, as [`Ctx::send`] sends it, but with the
+/// request read again just before the guard: `None`, and nothing asked,
+/// if the vault already reports it settled. A failed read lets it carry
+/// on: the guard and the vault decide. Nothing is awaited between the
+/// guard and the wallet's prompt. Once the wallet is asked, its answer is
+/// waited for; the request is read at every look meanwhile, and if it reads
+/// settled and the wallet hasn't answered within [`Pace::answer_grace`],
+/// the prompt is said to be no longer needed. A send signed in the page is
+/// awaited once signed, since it may be on the network; the request read
+/// settled before it is signed ends the step with `None`, nothing sent.
+async fn finish_unless_settled<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+) -> Result<Option<Asked>, TxError> {
+    let request = ctx.priced_request(ctx.vault, settle_call()).await?;
+    if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+        return Ok(None);
+    }
+    ctx.guard().await?;
+    ctx.step(Step::Signing(Prompt::Finish));
+    let in_page = ctx.signer.signs_in_page();
+    let mut send = std::pin::pin!(ctx.signer.send(&request));
+    let mut meanwhile = std::pin::pin!(settled_meanwhile(ctx, id));
+    // A page-signed send is awaited once it is signed: it may be on the
+    // network. Settled before then, it is dropped unsigned, having sent
+    // nothing.
+    let said = std::cell::Cell::new(false);
+    let first = std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(sent) = send.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(sent));
+        }
+        if in_page && ctx.signer.signed_yet() {
+            say_signed(ctx, &said);
+            return std::task::Poll::Pending;
+        }
+        meanwhile.as_mut().poll(cx).map(|()| None)
+    })
+    .await;
+    if first.is_none() && in_page {
+        return Ok(None);
+    }
+    Ok(Some(match first {
+        Some(sent) => Asked {
+            sent,
+            settled_meanwhile: false,
+        },
+        // A send already made answers within a look or two; only a prompt
+        // still open after them is said to be no longer needed.
+        None => match within(ctx, send.as_mut(), ctx.pace.answer_grace).await {
+            Some(sent) => Asked {
+                sent,
+                settled_meanwhile: true,
+            },
+            None => {
+                ctx.step(Step::Signing(Prompt::FinishNoLongerNeeded));
+                Asked {
+                    sent: send.await,
+                    settled_meanwhile: true,
+                }
+            }
+        },
+    }))
+}
+
+/// Once, as a second step signed in the page is signed: from then on there
+/// is nothing to skip.
+fn say_signed<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    said: &std::cell::Cell<bool>,
+) {
+    if !said.replace(true) {
+        ctx.step(Step::Signing(Prompt::FinishSigned));
+    }
+}
+
+/// `answer`, if it is ready within `looks` looks; `None` otherwise, the
+/// future left as it is.
+async fn within<R: Reader, S: Signer, C: Clock, T>(
+    ctx: &Ctx<'_, R, S, C>,
+    mut answer: std::pin::Pin<&mut impl Future<Output = T>>,
+    looks: u32,
+) -> Option<T> {
+    let mut waited = std::pin::pin!(async {
+        for _ in 0..looks {
+            ctx.clock.sleep(ctx.pace.poll_millis).await;
+        }
+    });
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(answer) = answer.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(answer));
+        }
+        waited.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// As [`within`], but "Skip" ([`Ctx::skip_second`]), checked at every look,
+/// ends the wait early with `None`.
+async fn within_unless_skipped<R: Reader, S: Signer, C: Clock, T>(
+    ctx: &Ctx<'_, R, S, C>,
+    mut answer: std::pin::Pin<&mut impl Future<Output = T>>,
+    looks: u32,
+) -> Option<T> {
+    let mut waited = std::pin::pin!(async {
+        for _ in 0..looks {
+            if ctx.skip_second.take() {
+                return;
+            }
+            ctx.clock.sleep(ctx.pace.poll_millis).await;
+        }
+    });
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(answer) = answer.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(answer));
+        }
+        waited.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Ends once the vault reports the request settled, read at every look.
+async fn settled_meanwhile<R: Reader, S: Signer, C: Clock>(ctx: &Ctx<'_, R, S, C>, id: U256) {
+    loop {
+        if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+            return;
+        }
+        ctx.clock.sleep(ctx.pace.poll_millis).await;
+    }
+}
+
 /// The settling call the second step sends: open to anyone.
 fn settle_call() -> Vec<u8> {
     IVault::settleCall {
@@ -1315,15 +1612,62 @@ async fn second_step<R: Reader, S: Signer, C: Clock>(
     report: &dyn Fn(Option<TxError>, Option<B256>),
 ) -> Second {
     if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
-        return Second::Settled;
+        return Second::Settled { sent_after: None };
     }
     // A "Skip" pressed before this step was asked for is not for it.
     ctx.skip_second.take();
     // The request is read while the wallet is asked: a wallet that never
     // answers doesn't hold a request the vault has settled, and "Skip" lets
     // only this step go.
-    let hash = {
-        let mut send = std::pin::pin!(ctx.send(Prompt::Finish, ctx.vault, settle_call()));
+    let request = match ctx.priced_request(ctx.vault, settle_call()).await {
+        Ok(request) => request,
+        Err(why) => return Second::Open(Some(why)),
+    };
+    // Read again before the guard: the keeper may have settled it while the
+    // step was simulated. Nothing is awaited between the guard and the
+    // wallet's prompt, so the wallet is asked on the chain and account the
+    // guard checked.
+    if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+        return Second::Settled { sent_after: None };
+    }
+    if let Err(why) = ctx.guard().await {
+        return Second::Open(Some(why));
+    }
+    ctx.step(Step::Signing(Prompt::Finish));
+    let hash = if ctx.signer.signs_in_page() {
+        // Signed in the page, with no prompt: until it is signed nothing has
+        // left, and "Skip" or the request read settled ends the step. Once
+        // signed, the send may be on the network, so its answer is always
+        // awaited (the endpoint's requests bound it) and followed, and the
+        // record says who settled. A send that fails sent nothing.
+        let mut send = std::pin::pin!(ctx.signer.send(&request));
+        let mut meanwhile = std::pin::pin!(while_asked(ctx, id));
+        let said = std::cell::Cell::new(false);
+        let first = std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(sent) = send.as_mut().poll(cx) {
+                return std::task::Poll::Ready(Ok(sent));
+            }
+            if ctx.signer.signed_yet() {
+                say_signed(ctx, &said);
+                return std::task::Poll::Pending;
+            }
+            meanwhile.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        match first {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(why)) => {
+                if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done)
+                {
+                    return Second::Settled { sent_after: None };
+                }
+                return Second::Open(Some(why));
+            }
+            Err(Meanwhile::Settled) => return Second::Settled { sent_after: None },
+            Err(Meanwhile::Skipped) => return Second::Open(Some(TxError::Cancelled)),
+        }
+    } else {
+        let mut send = std::pin::pin!(ctx.signer.send(&request));
         let mut meanwhile = std::pin::pin!(while_asked(ctx, id));
         let first = std::future::poll_fn(|cx| {
             if let std::task::Poll::Ready(sent) = send.as_mut().poll(cx) {
@@ -1335,13 +1679,41 @@ async fn second_step<R: Reader, S: Signer, C: Clock>(
         match first {
             Ok(Ok(hash)) => hash,
             Ok(Err(why)) => return Second::Open(Some(why)),
-            Err(Meanwhile::Settled) => return Second::Settled,
+            Err(Meanwhile::Settled) => {
+                // Settled while the wallet is asked. A send already made
+                // answers within a look or two and is followed; a prompt
+                // still open is said to be no longer needed, and its answer
+                // taken for a few looks more. The flow then ends with the
+                // request settled, whether the wallet answered or not.
+                // "Skip" ends that wait at once.
+                let mut sent_after = within(ctx, send.as_mut(), ctx.pace.answer_grace).await;
+                if sent_after.is_none() {
+                    ctx.step(Step::Signing(Prompt::FinishNoLongerNeeded));
+                    sent_after =
+                        within_unless_skipped(ctx, send.as_mut(), ctx.pace.unneeded_shown).await;
+                }
+                let sent_after = sent_after.and_then(Result::ok).map(|hash| SentSecond {
+                    hash,
+                    after_settled: true,
+                });
+                if let Some(sent) = sent_after {
+                    report(None, Some(sent.hash));
+                }
+                return Second::Settled { sent_after };
+            }
             Err(Meanwhile::Skipped) => return Second::Open(Some(TxError::Cancelled)),
         }
     };
     report(None, Some(hash));
     match watch_second(ctx, id, hash).await {
-        Watched::Settled => Second::Settled,
+        // Settled, by this step or by another transaction: the vault's
+        // record says which.
+        Watched::Settled => Second::Settled {
+            sent_after: Some(SentSecond {
+                hash,
+                after_settled: false,
+            }),
+        },
         // Mined, and the request not among those it settled: the keeper
         // settles it.
         Watched::Mined => Second::Mined(hash),
@@ -1526,8 +1898,10 @@ async fn redeem_closed<R: Reader, S: Signer, C: Clock>(
 /// claim's own request (which pays its claim); a tank fill is the author's.
 /// It ends as the request settled, read from the vault's events for it
 /// wherever it was settled: if someone else settled it first, before the
-/// wallet was asked, nothing is sent and that is said
-/// ([`Outcome::SettledBefore`]). The step is watched briefly: it is
+/// wallet was asked or while it was and the wallet declined, nothing is
+/// sent and that is said ([`Outcome::SettledBefore`]); if the wallet sent
+/// it anyway, that is said too, with what it sent
+/// ([`Outcome::SentAfterSettled`]). The step is watched briefly: it is
 /// optional, and the keeper settles the request anyway.
 pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
@@ -1561,7 +1935,29 @@ pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
     if read::request(ctx.reader, ctx.vault, id).await?.done {
         return Ok(Outcome::SettledBefore(Box::new(outcome(None).await?)));
     }
-    let hash = ctx.send(Prompt::Finish, ctx.vault, settle_call()).await?;
+    let (hash, meanwhile) = match finish_unless_settled(ctx, id).await? {
+        None => return Ok(Outcome::SettledBefore(Box::new(outcome(None).await?))),
+        Some(Asked {
+            sent: Ok(hash),
+            settled_meanwhile,
+        }) => (hash, settled_meanwhile),
+        // Settled while the wallet was asked, and the wallet declined:
+        // nothing was sent.
+        Some(Asked {
+            sent: Err(TxError::Rejected),
+            settled_meanwhile: true,
+        }) => return Ok(Outcome::SettledBefore(Box::new(outcome(None).await?))),
+        // A page-signed send that fails sent nothing: if the request has
+        // settled meanwhile, that is how it ends.
+        Some(Asked { sent: Err(why), .. }) if ctx.signer.signs_in_page() => {
+            if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done)
+            {
+                return Ok(Outcome::SettledBefore(Box::new(outcome(None).await?)));
+            }
+            return Err(why);
+        }
+        Some(Asked { sent: Err(why), .. }) => return Err(why),
+    };
     ctx.step(Step::Sent {
         prompt: Prompt::Finish,
         hash,
@@ -1569,8 +1965,28 @@ pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
     });
     let landed = landed(hash, Some(id));
     match watch_second(ctx, id, hash).await {
-        // Whoever settled it, its events say how.
-        Watched::Settled => outcome(None).await.map_err(&landed),
+        // Whoever settled it, its events say how; settled by another
+        // transaction the record names, it is said neutrally. A record
+        // that names no transaction is taken as is,
+        // unless the request read settled before the wallet answered: the
+        // send is then said as made after it read settled.
+        Watched::Settled => {
+            let how = outcome(None).await.map_err(&landed)?;
+            let by = how.hash().filter(|by| *by != B256::ZERO);
+            Ok(match by {
+                Some(by) if by != hash => Outcome::SentAfterSettled {
+                    sent: hash,
+                    how: Box::new(how),
+                    by: SettledBy::Unsure,
+                },
+                None if meanwhile => Outcome::SentAfterSettled {
+                    sent: hash,
+                    how: Box::new(how),
+                    by: SettledBy::NoneNamed,
+                },
+                _ => how,
+            })
+        }
         // Mined, and this request not among those it settled: it still
         // stands, and the keeper settles it.
         Watched::Mined => Err(TxError::Landed {

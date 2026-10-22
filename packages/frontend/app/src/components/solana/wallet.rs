@@ -162,6 +162,7 @@ fn connect(id: SolWalletId) {
         body: body.into(),
         foot: None,
         wide: false,
+        alert: None,
     });
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move { session.connect(id).await });

@@ -6,20 +6,22 @@
    connecting draws the traced hexagon. The wrong-network bar sits under the
    header, caution-soft, 48px. */
 .sh-walletctl { display: flex; align-items: center; gap: var(--space-2); }
-.sh-netchip {
-  display: inline-flex; align-items: center; gap: var(--space-2);
-  height: 36px; padding: 0 var(--space-3) 0 6px; border-radius: var(--radius-full);
-  border: var(--border-hairline) solid var(--line); background: var(--paper); color: var(--ink);
-  font: 600 14px/20px var(--font-sans); white-space: nowrap; cursor: pointer;
-}
-@media (hover: hover) { .sh-netchip:hover { background: var(--row-hover); } }
-.sh-netchip > .sh-chainmark:first-child { margin-left: 4px; }
-.sh-netchip .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-full); }
-/* Where the page acts on a vault on another chain: caution-soft and the
-   triangle, as the panel's own wrong-network state says it. */
-.sh-netchip--other { padding-left: 10px; border-color: transparent; background: var(--caution-soft); color: var(--caution); }
-@media (hover: hover) { .sh-netchip--other:hover { background: var(--caution-soft); } }
+/* The network chip: a ghost button with the chain's tile, its name and a
+   chevron; it opens the chain switcher. */
+.sh-netchip { gap: 6px; padding: 0 10px 0 var(--space-2); white-space: nowrap; font-weight: 600; }
+.sh-netchip > .sh-chainmark:first-child { margin-left: 2px; }
+.sh-netchip .sh-tile { width: 20px; height: 20px; font-size: 11px; line-height: 20px; border-radius: var(--radius-s); }
+.sh-netchip > .sh-icon:last-child { flex: none; color: var(--ink-muted); }
+/* Where the page acts on a vault on another chain: caution-soft, the
+   triangle and the words "Wrong network". */
+.sh-netchip--other { background: var(--caution-soft); color: var(--caution); }
+@media (hover: hover) { .sh-netchip--other:hover { background: var(--caution-soft); color: var(--caution); } }
 .sh-netchip--other > .sh-icon { flex: none; }
+.sh-netchip--other > .sh-icon:last-child { color: var(--caution); }
+/* The switcher's row for the chain the wallet is on. */
+.sh-walletopt--current { cursor: default; border-color: var(--brand); }
+.sh-walletopt--current > .sh-icon:last-child { color: var(--brand); }
+@media (hover: hover) { .sh-walletopt--current:hover { background: var(--paper-raised); } }
 /* A wallet's chain family, beside its address or its network. */
 .sh-chainmark {
   flex: none; display: inline-block; padding: 1px 5px; border-radius: var(--radius-s);
@@ -69,20 +71,88 @@
 .sh-hexring .sh-btn__hex { width: 48px; height: 48px; }
 
 .sh-wrongnet { background: var(--caution-soft); border-bottom: var(--border-hairline) solid var(--line); }
-.sh-wrongnet__inner { display: flex; align-items: center; gap: var(--space-3); min-height: 48px; padding: 6px 0; font: var(--type-body); }
+.sh-wrongnet__inner { display: flex; align-items: center; gap: var(--space-3); min-height: 52px; padding: var(--space-2) 0; font: var(--type-body); }
 .sh-wrongnet__inner > .sh-icon { color: var(--caution); flex: none; }
 .sh-wrongnet__inner p { flex: 1; min-width: 0; }
+.sh-wrongnet__inner strong { font-weight: 650; }
+.sh-wrongnet__inner > .sh-btn { flex: none; }
+/* A screen that signs only through the phone's action bar shows the bar
+   only where that action bar is shown. */
+@media (min-width: 600px) { .sh-wrongnet-slot--phone { display: none; } }
+/* The wallet's wrong-network state: the vault's chain and the wallet's,
+   the move between them on a sunk strip, then the switch and Cancel. */
+.sh-wrongsheet { gap: var(--space-4); }
+.sh-wrongsheet__lead { font: var(--type-body); color: var(--ink-muted); }
+.sh-wrongsheet__move {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4); border-radius: var(--radius-m);
+  background: var(--paper-sunk); font: 500 14px/20px var(--font-sans);
+}
+.sh-wrongsheet__move > .sh-icon { flex: none; color: var(--ink-muted); }
+.sh-wrongsheet__chain { display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.sh-wrongsheet__chain .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-s); background: var(--paper-raised); }
+.sh-wrongsheet__chain--to { font-weight: 650; }
+.sh-wrongsheet__actions { display: flex; gap: var(--space-3); }
+.sh-wrongsheet__switch { flex: 1; min-width: 0; }
+.sh-wrongsheet__leave { align-self: flex-start; }
+/* The Solana wallet, still reachable while the EVM wallet is elsewhere. */
+.sh-wrongsheet__other { display: flex; flex-direction: column; gap: var(--space-2); padding-top: var(--space-4); border-top: var(--border-hairline) solid var(--line); }
+.sh-wrongsheet__other .sh-walletsheet__actions, .sh-wrongsheet__other > .sh-btn { align-self: flex-start; }
 
+/* Below desktop the chip drops the EVM mark (the account button says which
+   wallet is which). From 900 it keeps the tile, the network's name (cut
+   short past 96px) or "Wrong network" after the triangle, and the
+   chevron. Below 900 the network's name doesn't fit beside the nav, so
+   the chip is the tile and the chevron in a bordered button, still read
+   as a control, tightened below 768; where it would caution below 820,
+   the account button says "Wrong network" instead. */
+.sh-walletbtn__wrong { display: none; align-items: center; gap: 4px; color: var(--caution); font: 600 12px/16px var(--font-sans); }
+.sh-walletbtn__wrong .sh-icon { flex: none; }
+@media (min-width: 600px) and (max-width: 1279px) {
+  .sh-netchip > .sh-chainmark:not(:first-child) { display: none; }
+  .sh-netchip__name { max-width: 96px; overflow: hidden; text-overflow: ellipsis; }
+  .sh-netchip--other .sh-netchip__name { max-width: none; }
+}
+@media (min-width: 600px) and (max-width: 899px) {
+  .sh-netchip { gap: 4px; padding: 0 6px 0 var(--space-2); border: var(--border-hairline) solid var(--line); }
+  .sh-netchip__name { display: none; }
+}
+/* From 820 (measured: the lockup, the sections and Docs end by 440 at
+   834; the caution chip is 152 and one or both wallets' button at most
+   160) the chip keeps "Wrong network" in words; below it the account
+   button says it instead. */
+@media (min-width: 820px) and (max-width: 899px) {
+  .sh-netchip--other { gap: 6px; padding: 0 10px 0 var(--space-2); border: 0; }
+  .sh-netchip--other .sh-netchip__name { display: inline; }
+}
+@media (min-width: 600px) and (max-width: 819px) {
+  .sh-netchip--other { display: none; }
+  .sh-walletbtn--wrong { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; height: auto; min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
+  .sh-walletbtn--wrong .sh-walletbtn__sep { display: none; }
+  .sh-walletbtn--wrong .sh-walletbtn__wrong { display: inline-flex; }
+}
+@media (min-width: 600px) and (max-width: 767px) {
+  .sh-walletctl { gap: 4px; }
+  .sh-netchip { gap: 2px; padding: 0 4px; }
+  .sh-netchip > .sh-icon:last-child { width: 14px; height: 14px; }
+  .sh-walletbtn__one { gap: 4px; }
+}
 @media (max-width: 599px) {
-  /* A phone shows the network in the wallet sheet; the chip stays only to
-     caution, as the triangle alone. */
+  /* A phone shows the network in the wallet sheet; where it cautions, the
+     account button says "Wrong network" in words, under its address. */
   .sh-netchip { display: none; }
-  .sh-netchip--other { display: inline-flex; padding: 0 10px; }
-  .sh-netchip__name, .sh-netchip .sh-chainmark { display: none; }
-  /* Two wallets stack, smaller, so both fit at 320. */
+  .sh-walletbtn--wrong { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; height: auto; min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
+  .sh-walletbtn--wrong .sh-walletbtn__sep { display: none; }
+  .sh-walletbtn--wrong .sh-walletbtn__wrong { display: inline-flex; }
+  /* The bar stays one row: the first sentence beside the switch, which
+     names the chain the rest of the sentence would. */
+  .sh-wrongnet__more { display: none; }
+}
+/* Below desktop two wallets stack in the one account button, smaller, so
+   both fit at 320 and every section stays beside them on a tablet. */
+@media (max-width: 1023px) {
   .sh-walletbtn--both { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; height: auto; min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
   .sh-walletbtn--both .sh-walletbtn__sep { display: none; }
   .sh-walletbtn--both .sh-mono { font-size: 12px; line-height: 16px; }
   .sh-walletbtn--both .sh-chainmark { font-size: 9px; line-height: 12px; padding: 0 4px; }
-  .sh-wrongnet__inner { flex-wrap: wrap; }
 }

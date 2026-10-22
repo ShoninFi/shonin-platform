@@ -25,7 +25,7 @@ use crate::money::format as money;
 use crate::money::quote::ExitPath;
 use crate::money::{AmountError, Rounding, parse_units};
 use crate::tx::error::{Context, TxError};
-use crate::tx::flow::{Outcome, Prompt, Step};
+use crate::tx::flow::{Outcome, Prompt, SettledBy, Step};
 use crate::tx::read::{ClaimState, Holdings, State, VaultFigures};
 use crate::view::{El, View, el, text};
 use crate::wallet::config_cache::ConfigId;
@@ -59,6 +59,11 @@ enum Mode {
     Loading,
     Unavailable,
     SignedOut(Tab),
+    /// Signed out while a remembered wallet reconnects, as the header says.
+    Connecting(Tab),
+    /// Still loading while a remembered wallet reconnects: the reconnect
+    /// state from the start, never a Deposit that turns into it.
+    LoadingConnecting,
     WrongNetwork(u64),
     /// The form, drawn with the network read from this config.
     Form(Tab, ConfigId),
@@ -164,6 +169,7 @@ pub fn open_sheet(slug: &str, tab: Tab) {
         body: build(slug, tab, true),
         foot: None,
         wide: false,
+        alert: None,
     });
 }
 
@@ -179,9 +185,17 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
             let tab = panel.tab.signal(),
             let stage = panel.stage.signal(),
             let running = session.flow_signal(slug, EXIT).map(|running| running.map(|running| running.id)),
+            let restoring = session.restoring.signal(),
             let missing = panel.missing.signal() =>
             if *missing { Mode::Unavailable } else {
-                mode_of(connection, network.as_deref(), *figures, *tab, *stage, *running)
+                let reconnecting = *restoring
+                    && crate::wallet::session::remembers_wallet()
+                    && !matches!(connection, Connection::Connected { .. });
+                match mode_of(connection, network.as_deref(), *figures, *tab, *stage, *running) {
+                    Mode::SignedOut(tab) if reconnecting => Mode::Connecting(tab),
+                    Mode::Loading if reconnecting => Mode::LoadingConnecting,
+                    mode => mode,
+                }
             }
         }
         .dedupe()
@@ -210,7 +224,8 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
             async {}
         })
     };
-    // Another account (or none) gets the empty form.
+    // Another account (or none) gets the empty form, and nothing of the
+    // last account's holdings.
     let account_change = {
         let panel = panel.clone();
         let mut seen = None;
@@ -221,6 +236,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
             .for_each(move |account| {
                 if account_moved(&mut seen, account) {
                     panel.clear_form();
+                    panel.holdings.set(None);
                 }
                 async {}
             })
@@ -401,11 +417,14 @@ async fn follow(panel: Rc<Panel>) {
             }
             // What had landed before this read: the read shows it.
             let at = session.changed.get();
-            match session.account() {
+            // The account these holdings are read for.
+            let read_for = session.account();
+            match read_for {
                 Some(account) => {
                     if let Ok(held) =
                         read::holdings(&reader, vault.address, network.asset, account).await
                         && reads_with(&panel, network.config)
+                        && session.account() == Some(account)
                     {
                         panel.holdings.set(Some(held));
                         panel.holdings_at.set(at);
@@ -413,8 +432,9 @@ async fn follow(panel: Rc<Panel>) {
                 }
                 None => panel.holdings.set(None),
             }
-            // A flow that landed while reading is read again at once.
-            wait_or_retry_since(&panel, 10, at).await;
+            // A flow that landed, or an account switched to, while reading
+            // is read again at once.
+            wait_or_retry_since(&panel, 10, at, read_for).await;
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -425,13 +445,20 @@ async fn follow(panel: Rc<Panel>) {
 /// chain's settings change or the reader presses "Try again".
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry(panel: &Panel, seconds: u32) {
-    wait_or_retry_since(panel, seconds, crate::wallet::get().changed.get()).await;
+    let session = crate::wallet::get();
+    wait_or_retry_since(panel, seconds, session.changed.get(), session.account()).await;
 }
 
 /// The same, counting flows landed since `changed` (the session's count
-/// when the last read began).
+/// when the last read began) and any account other than `account` (the one
+/// the last read was for): either ends the wait at once.
 #[cfg(target_arch = "wasm32")]
-async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
+async fn wait_or_retry_since(
+    panel: &Panel,
+    seconds: u32,
+    changed: u64,
+    account: Option<alloy_primitives::Address>,
+) {
     let session = crate::wallet::get();
     let config = || {
         panel
@@ -440,9 +467,8 @@ async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
             .as_ref()
             .map(|network| network.config)
     };
-    let seen = (changed, session.account(), panel.retry.get(), config());
+    let seen = (changed, account, panel.retry.get(), config());
     for _ in 0..seconds {
-        gloo_timers::future::TimeoutFuture::new(1_000).await;
         if (
             session.changed.get(),
             session.account(),
@@ -452,6 +478,7 @@ async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
         {
             break;
         }
+        gloo_timers::future::TimeoutFuture::new(1_000).await;
     }
 }
 
@@ -487,6 +514,34 @@ pub(crate) fn placeholder() -> View {
                 .build(),
         )
         .into()
+}
+
+/// The panel loading while a remembered wallet reconnects: the reconnect
+/// state's words and busy button under the skeleton.
+fn placeholder_connecting() -> View {
+    el("div")
+        .class("sh-exit__body")
+        .attr("aria-busy", "true")
+        .child(crate::atoms::skeleton::skeleton_block("100%", 48))
+        .child(reconnect_lines())
+        .into()
+}
+
+/// "Reconnecting your wallet." and a busy "Connecting…" that does nothing.
+fn reconnect_lines() -> View {
+    View::Many(vec![
+        el("p")
+            .class("sh-muted")
+            .text("Reconnecting your wallet.")
+            .into(),
+        el("button")
+            .attr("type", "button")
+            .class("sh-btn sh-btn-secondary sh-btn-block")
+            .attr("aria-disabled", "true")
+            .attr("aria-busy", "true")
+            .text("Connecting…")
+            .into(),
+    ])
 }
 
 /// Where the flow a panel shows stands, as its tabs see it.
@@ -690,13 +745,17 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
                 ]),
             ))
             .into(),
+        Mode::Connecting(tab) => body
+            .child(form(panel, tab, false, reconnect_lines()))
+            .into(),
+        Mode::LoadingConnecting => placeholder_connecting(),
         Mode::WrongNetwork(chain_id) => {
             let session = crate::wallet::get();
             let on = session
                 .wallet_chain()
-                .map(networks::chain_name)
+                .map(crate::components::wallet::chain_label)
                 .unwrap_or_default();
-            let target = networks::chain_name(chain_id);
+            let target = crate::components::wallet::chain_label(chain_id);
             let title = panel
                 .vault
                 .lock_ref()
@@ -1867,7 +1926,9 @@ fn context_names(
             .as_ref()
             .map(|n| n.label.clone())
             .unwrap_or_default(),
-        session.wallet_chain().map(networks::chain_name),
+        session
+            .wallet_chain()
+            .map(crate::components::wallet::chain_label),
         network
             .as_ref()
             .map(|n| n.asset_symbol.clone())
@@ -1975,6 +2036,45 @@ fn prompt_words(
     )
 }
 
+/// The small print under a wallet prompt: where to find the prompt, for a
+/// wallet that shows one (`keeps_activity`), and what skipping or approving
+/// leaves, for the step and its state.
+pub fn small_print(prompt: &Prompt, wallet: &str, keeps_activity: bool) -> String {
+    match (prompt, keeps_activity) {
+        (Prompt::Finish, true) => {
+            format!("Don’t see it? Open {wallet}, or skip it: your request stands either way.")
+        }
+        (Prompt::Finish, false) => {
+            "It’s optional: skip it and your request still stands.".to_string()
+        }
+        (Prompt::FinishNoLongerNeeded, true) => {
+            format!("Decline it in {wallet}, or skip it here: your request is already settled.")
+        }
+        (Prompt::FinishNoLongerNeeded, false) => {
+            "Skip it here: your request is already settled.".to_string()
+        }
+        // Signed in the page: nothing to skip or look for.
+        (Prompt::FinishSigned, _) => String::new(),
+        (_, true) => format!(
+            "Don’t see it? Open {wallet}. Once you approve, the request can’t be cancelled."
+        ),
+        (_, false) => "Once you approve, the request can’t be cancelled.".to_string(),
+    }
+}
+
+/// What a settle sent after the request read settled did, in a sentence,
+/// from what the vault's record says of who settled it.
+pub(crate) fn sent_after_settled_line(by: SettledBy) -> &'static str {
+    match by {
+        SettledBy::Unsure => {
+            "It’s settled. If a settle of yours also goes out, it won’t settle this request again, and it costs its network fee."
+        }
+        SettledBy::NoneNamed => {
+            "It settled while your wallet was asked. A settle of yours may also have gone out: unless it was the one that settled it, it only cost its fee."
+        }
+    }
+}
+
 /// What the wallet is asked, in the panel's words.
 fn prompt_lines(
     prompt: &Prompt,
@@ -2019,6 +2119,14 @@ fn prompt_lines(
             format!("Approve the optional second step in {wallet}"),
             "Your request is priced. This settles it at that price; anyone may send it, and nobody had yet. It’s optional: your request stands either way, and the keeper settles it if you don’t."
                 .to_string(),
+        ),
+        Prompt::FinishSigned => (
+            "Sending the second step".to_string(),
+            "It’s signed and on its way to the network. It’s optional: your request stands either way.".to_string(),
+        ),
+        Prompt::FinishNoLongerNeeded => (
+            format!("It’s already settled: decline in {wallet}"),
+            format!("Your request is settled. The prompt still open in {wallet} is no longer needed: approving it sends a settle that won’t settle this request again and costs its network fee."),
         ),
         Prompt::SettleClaim { .. } => (
             format!("Approve settling in {wallet}"),
@@ -2084,25 +2192,25 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
             .into(),
         Step::Signing(prompt) => {
             let (title, line) = prompt_words(prompt, &wallet, &vault_title, &symbol, decimals);
+            let small = small_print(prompt, &wallet, sender.keeps_activity);
             let running = running.clone();
             // The second step settles a request already on the chain: there
             // is nothing to cancel, and declining or skipping it is fine.
-            let second = *prompt == Prompt::Finish;
+            let second = matches!(prompt, Prompt::Finish | Prompt::FinishNoLongerNeeded);
             el("div")
                 .class("sh-exit__wait")
                 .child(hex_ring())
                 .child(el("p").class("sh-exit__title").text(title.clone()))
                 .child(el("p").text(line))
-                .child(el("p").class("sh-muted sh-exit__small").text(if second {
-                    format!(
-                        "Don’t see it? Open {wallet}, or skip it: your request stands either way."
-                    )
+                .child(if small.is_empty() {
+                    View::Empty
                 } else {
-                    format!(
-                        "Don’t see it? Open {wallet}. Once you approve, the request can’t be cancelled."
-                    )
-                }))
-                .child(if second {
+                    el("p").class("sh-muted sh-exit__small").text(small).into()
+                })
+                .child(if *prompt == Prompt::FinishSigned {
+                    // Signed in the page and on its way: nothing to skip.
+                    View::Empty
+                } else if second {
                     // Lets only this step go; the flow keeps watching the
                     // request, and "Settle now" asks for it again.
                     View::from(on_click(
@@ -2828,8 +2936,19 @@ fn done_view(
             *hash,
             again.into(),
         ),
-        // Someone else settled it before anything was asked: how it settled.
+        // Settled before anything was sent: how it settled.
         Outcome::SettledBefore(how) => done_view(panel, running, how, chain_id, decimals),
+        // Settled while the wallet was asked; the wallet sent the app's
+        // settle after it read settled.
+        Outcome::SentAfterSettled { sent, how, by } => el("div")
+            .child(done_view(panel, running, how, chain_id, decimals))
+            .child(
+                el("p")
+                    .class("sh-muted sh-exit__small")
+                    .text(sent_after_settled_line(*by)),
+            )
+            .child(tx_link(chain_id, *sent, "Your settle"))
+            .into(),
     }
 }
 
@@ -3196,6 +3315,28 @@ mod tests {
         assert!(html.contains("(SANCTIONED,US)"), "{html}");
         let open = statement_notice(Statement::Solana(&[])).html();
         assert!(open.contains("Open to everyone"), "{open}");
+    }
+
+    /// The second step signed in the page offers no "Skip" and no small
+    /// print about skipping; before it is signed, both are there.
+    #[test]
+    fn a_second_step_signed_in_the_page_offers_nothing_to_skip() {
+        let panel = Rc::new(Panel::new("base-4", Tab::Deposit, false));
+        panel.network.set(Some(Rc::new(network())));
+        let running = Running::new(
+            Action::Deposit {
+                amount: U256::from(11_000_000u64),
+                shown: "SANCTIONED,US".to_string(),
+            },
+            Rc::new(network()),
+        );
+        let signed = step_view(&panel, &running, &Step::Signing(Prompt::FinishSigned)).html();
+        assert!(!signed.contains(">Skip<"), "{signed}");
+        assert!(!signed.contains("skip it"), "{signed}");
+        assert!(!signed.contains("sh-exit__small"), "{signed}");
+        let asked = step_view(&panel, &running, &Step::Signing(Prompt::Finish)).html();
+        assert!(asked.contains(">Skip<"), "{asked}");
+        assert!(asked.contains("skip it"), "{asked}");
     }
 
     /// A deposit flow shown on the panel for `account`, at `step`.

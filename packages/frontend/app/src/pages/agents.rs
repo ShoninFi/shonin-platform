@@ -782,6 +782,7 @@ fn filters_button(board: &Rc<Board>) -> El {
                     .into(),
                 ])),
                 wide: false,
+                alert: None,
             });
         })
     })
@@ -847,6 +848,7 @@ fn sort_button(board: &Rc<Board>) -> El {
                     on_click(Button::new(Kind::Primary, "Done").build(), dialog::close).into(),
                 ),
                 wide: false,
+                alert: None,
             });
         })
     })
