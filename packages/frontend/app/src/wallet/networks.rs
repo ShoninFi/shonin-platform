@@ -226,9 +226,135 @@ pub fn is_usable_endpoint(url: &str) -> bool {
     false
 }
 
+/// The chain config file, compiled in: the endpoints it lists for each
+/// chain are the only ones a wallet is ever asked to add. Nothing in it is
+/// secret; keyed endpoints are only ever set in the environment.
+const CHAINS_TOML: &str = include_str!("../../../../../config/chains.toml");
+
+/// The endpoints `chains_toml` lists for the EVM chain `chain_id`
+/// (`rpc` and `logs_rpc`), in order.
+fn listed_endpoints(chains_toml: &str, chain_id: u64) -> Vec<String> {
+    let Ok(config) = chains_toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(chain) = config
+        .get("chains")
+        .and_then(|chains| chains.get(format!("evm:{chain_id}").as_str()))
+    else {
+        return Vec::new();
+    };
+    ["rpc", "logs_rpc"]
+        .iter()
+        .filter_map(|key| chain.get(*key).and_then(toml::Value::as_str))
+        .flat_map(str::split_whitespace)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `rpc`, an endpoint the API named for `chain_id`, may be handed
+/// to a wallet to add the chain: a usable endpoint the chain config lists
+/// for that very chain, never one on this machine (a local chain's) except
+/// in a development build, which may also hand on the local chain's
+/// endpoint as this machine runs it. Anything else is never handed on.
+pub fn may_add_endpoint(chain_id: u64, rpc: &str) -> bool {
+    let dev_build = cfg!(feature = "dev-wallet");
+    may_add_listed(CHAINS_TOML, chain_id, rpc, dev_build)
+        || (is_usable_endpoint(rpc) && super::dev::local_rpc(chain_id) == Some(rpc))
+}
+
+/// [`may_add_endpoint`]'s check against the chain config: listed for
+/// `chain_id`, and on this machine only when `local_allowed`.
+fn may_add_listed(chains_toml: &str, chain_id: u64, rpc: &str, local_allowed: bool) -> bool {
+    endpoint_listed(chains_toml, chain_id, rpc) && (local_allowed || !is_local_endpoint(rpc))
+}
+
+/// Whether a usable endpoint is on this machine: plain http, which
+/// [`is_usable_endpoint`] takes only for the local chains.
+fn is_local_endpoint(url: &str) -> bool {
+    url.starts_with("http://")
+}
+
+fn endpoint_listed(chains_toml: &str, chain_id: u64, rpc: &str) -> bool {
+    let same = |listed: &str| listed.trim_end_matches('/') == rpc.trim_end_matches('/');
+    is_usable_endpoint(rpc)
+        && listed_endpoints(chains_toml, chain_id)
+            .iter()
+            .any(|listed| same(listed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wallet_is_asked_to_add_only_an_endpoint_the_chain_config_lists_for_that_chain() {
+        let toml = r#"
+            [chains."evm:84532"]
+            rpc = "https://sepolia.base.org https://base-sepolia.drpc.org"
+            logs_rpc = "https://logs.example.org"
+            [chains."evm:8453"]
+            rpc = "https://mainnet.base.org"
+        "#;
+        assert!(endpoint_listed(toml, 84532, "https://sepolia.base.org"));
+        assert!(endpoint_listed(toml, 84532, "https://sepolia.base.org/"));
+        assert!(endpoint_listed(
+            toml,
+            84532,
+            "https://base-sepolia.drpc.org"
+        ));
+        assert!(endpoint_listed(toml, 84532, "https://logs.example.org"));
+        // Another chain's endpoint, an unlisted one, or a lookalike: never.
+        assert!(!endpoint_listed(toml, 84532, "https://mainnet.base.org"));
+        assert!(!endpoint_listed(toml, 84532, "https://evil.example.org"));
+        assert!(!endpoint_listed(
+            toml,
+            84532,
+            "https://sepolia.base.org.evil.example"
+        ));
+        assert!(!endpoint_listed(
+            toml,
+            84532,
+            "https://sepolia.base.org/key"
+        ));
+        assert!(!endpoint_listed(toml, 1, "https://sepolia.base.org"));
+        // The compiled-in config: each testnet's first endpoint, as the API
+        // names it, and no other chain's.
+        assert!(may_add_endpoint(84532, "https://sepolia.base.org"));
+        assert!(may_add_endpoint(
+            46630,
+            "https://rpc.testnet.chain.robinhood.com"
+        ));
+        assert!(!may_add_endpoint(84532, "https://mainnet.base.org"));
+        assert!(!may_add_endpoint(84532, "https://rpc.example.com"));
+    }
+
+    #[test]
+    fn a_local_chains_listed_endpoint_is_handed_to_a_wallet_only_by_a_development_build() {
+        let toml = r#"
+            [chains."evm:31337"]
+            rpc = "http://127.0.0.1:19100"
+            [chains."evm:84532"]
+            rpc = "https://sepolia.base.org"
+        "#;
+        assert!(!may_add_listed(
+            toml,
+            31337,
+            "http://127.0.0.1:19100",
+            false
+        ));
+        assert!(may_add_listed(toml, 31337, "http://127.0.0.1:19100", true));
+        assert!(may_add_listed(
+            toml,
+            84532,
+            "https://sepolia.base.org",
+            false
+        ));
+        // The compiled-in config lists local chains; a test build is not a
+        // development build.
+        if !cfg!(feature = "dev-wallet") {
+            assert!(!may_add_endpoint(31337, "http://127.0.0.1:19100"));
+        }
+    }
 
     #[test]
     fn a_chain_a_wallet_doesnt_know_is_added_with_its_public_endpoint_explorer_and_coin() {

@@ -249,7 +249,7 @@ fn header(agent: &Rc<Agent>, tab: AgentTab) -> El {
                 Some(match key {
                     Some(key) => app_link(format!("/agents?author={}", crate::route::encode(key)))
                         .class("sh-mono")
-                        .attr("aria-label", format!("Agents by {address}"))
+                        .attr("aria-label", format!("{short}, agents by {address}"))
                         .text(short)
                         .into(),
                     None => el("span").class("sh-mono").text(short).into(),
@@ -849,13 +849,49 @@ fn tabs(slug: &str, current: AgentTab) -> El {
 }
 
 /// The phone's action bar: Withdraw and Deposit, which open the Exit sheet
-/// on the matching side. It takes the tab bar's place on this page.
+/// on the matching side; while a browser wallet is on another chain than
+/// the vault's, the primary action is "Switch to <chain>" instead, and on a
+/// Solana vault with only an EVM wallet connected it is "Connect a Solana
+/// wallet", as the Exit panel says. It takes the tab bar's place on this
+/// page.
 fn action_bar(slug: &str) -> El {
     let deposit = {
         let slug = slug.to_string();
-        on_click(Button::new(Kind::Primary, "Deposit").build(), move || {
-            exit::open_sheet(&slug, Tab::Deposit)
-        })
+        let solana_vault = crate::tx::solana::run::is_solana(&slug);
+        let needs_solana = futures_signals::map_ref! {
+            let evm = crate::wallet::get().connection.signal_ref(|connection| connection.account().is_some()),
+            let solana = crate::wallet::solana::get().connection.signal_ref(|connection| connection.account().is_some()) =>
+            solana_vault && *evm && !*solana
+        };
+        let wanted = futures_signals::map_ref! {
+            let wrong = crate::components::wallet::vault_wrong_signal(&slug),
+            let needs_solana = needs_solana => (*wrong, *needs_solana)
+        };
+        el("div").class("ag-actionbar__primary").child_signal(
+            None,
+            wanted.dedupe().map(move |(wrong, needs_solana)| {
+                Some(match wrong {
+                    Some((_, want)) => crate::components::wallet::switch_button(
+                        want,
+                        crate::atoms::button::Size::Medium,
+                    )
+                    .into(),
+                    None if needs_solana => on_click(
+                        Button::new(Kind::Primary, "Connect a Solana wallet").build(),
+                        crate::components::wallet::open_connect,
+                    )
+                    .attr("aria-haspopup", "dialog")
+                    .into(),
+                    None => {
+                        let slug = slug.clone();
+                        on_click(Button::new(Kind::Primary, "Deposit").build(), move || {
+                            exit::open_sheet(&slug, Tab::Deposit)
+                        })
+                        .into()
+                    }
+                })
+            }),
+        )
     };
     let withdraw = {
         let slug = slug.to_string();
@@ -1139,20 +1175,23 @@ mod tests {
     }
 
     #[test]
-    fn the_review_tab_leads_with_the_report_card() {
+    fn the_review_tab_leads_with_what_the_reviewer_found_then_the_report_card() {
         let html = tab_html("base-1", AgentTab::Review);
         let body = &html[html.find("ag-layout").expect("the tab is drawn")..];
-        let card = body.find("Report card").expect("the report card is drawn");
+        let card = body
+            .find(">Report card<")
+            .expect("the report card is drawn");
         let found = body
             .find("What the Reviewer found")
             .expect("the summary is drawn");
+        let tally = body.find("ag-counts").expect("the tally is drawn");
+        let says = body
+            .find("The Author says")
+            .expect("the Author's words are drawn");
         let areas = body.find("Area by area").expect("the areas are drawn");
-        assert!(card < found && found < areas);
+        assert!(found < tally && tally < says && says < card && card < areas);
         let first = body.find("<section").expect("a section");
-        assert!(
-            body[first..]
-                .starts_with("<section class=\"sh-card ag-card ag-card--flush ag-report-card\"")
-        );
+        assert!(body[first..].starts_with("<section class=\"sh-card ag-card ag-found\""));
     }
 
     #[test]

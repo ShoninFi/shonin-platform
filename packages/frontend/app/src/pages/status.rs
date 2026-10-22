@@ -91,7 +91,7 @@ fn kind_chip(kind: FeedKind) -> El {
 }
 
 /// When a proposed image counts: its timelock after it was proposed.
-fn counts_at(item: &FeedItem, timelock_days: Option<f64>) -> Option<PrimitiveDateTime> {
+pub(crate) fn counts_at(item: &FeedItem, timelock_days: Option<f64>) -> Option<PrimitiveDateTime> {
     if item.kind != FeedKind::ImageProposed {
         return None;
     }

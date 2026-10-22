@@ -341,18 +341,36 @@ pub async fn author_vault<R: Reader>(
     vault: Address,
     author_of: Address,
 ) -> Result<AuthorVault, TxError> {
-    let state: State = read(reader, vault, IVault::stateCall {}).await?.into();
-    let author = read(reader, vault, IVault::authorCall {}).await?;
-    let tank = read(reader, vault, IVault::tankCall {}).await?;
-    let allowances = read(reader, vault, IVault::allowancesCall {}).await?;
-    let floor = read(reader, vault, IVault::idleFloorCall {}).await?;
-    let shares = read(reader, vault, IVault::balanceOfCall { owner: author_of }).await?;
-    let share_price = read(reader, vault, IVault::sharePriceCall {}).await?;
-    let cash = read(reader, vault, IVault::cashCall {}).await?;
-    let fees = read(reader, vault, IVault::feesCall {}).await?;
-    let timers = read(reader, vault, IVault::timersCall {}).await?;
-    let ready_to_close = read(reader, vault, IVault::readyToCloseCall {}).await?;
-    let now = reader.chain_time().await?;
+    // The reads are independent: asked together, so the page waits for the
+    // slowest one rather than their sum.
+    let (
+        state,
+        author,
+        tank,
+        allowances,
+        floor,
+        shares,
+        share_price,
+        cash,
+        fees,
+        timers,
+        ready_to_close,
+        now,
+    ) = futures::try_join!(
+        read(reader, vault, IVault::stateCall {}),
+        read(reader, vault, IVault::authorCall {}),
+        read(reader, vault, IVault::tankCall {}),
+        read(reader, vault, IVault::allowancesCall {}),
+        read(reader, vault, IVault::idleFloorCall {}),
+        read(reader, vault, IVault::balanceOfCall { owner: author_of }),
+        read(reader, vault, IVault::sharePriceCall {}),
+        read(reader, vault, IVault::cashCall {}),
+        read(reader, vault, IVault::feesCall {}),
+        read(reader, vault, IVault::timersCall {}),
+        read(reader, vault, IVault::readyToCloseCall {}),
+        reader.chain_time(),
+    )?;
+    let state: State = state.into();
     Ok(AuthorVault {
         state,
         author,

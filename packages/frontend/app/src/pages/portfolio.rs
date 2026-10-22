@@ -26,7 +26,7 @@ use crate::tx::flow::{Fallback, Outcome, Prompt, Step, claim_door_open, claim_fa
 use crate::tx::read::{ClaimState, Holdings, State, VaultFigures};
 use crate::view::{El, View, el, text};
 use crate::wallet::machine::Connection;
-use crate::wallet::{Action, Network, Running, VaultRef, networks};
+use crate::wallet::{Action, Network, Running, VaultRef};
 use crate::web::app_link;
 
 /// One vault the wallet has something in.
@@ -586,7 +586,7 @@ async fn read_chain(
         .await
         .ok()?;
     loaded.balances.push(Balance {
-        chain: networks::chain_name(network.chain_id),
+        chain: network.label.clone(),
         dollars: money::dollars(balance, network.asset_decimals, Rounding::Down),
     });
     let now = reader.chain_time().await.unwrap_or_default();
@@ -1557,6 +1557,11 @@ fn done_line(outcome: &Outcome, network: &Network) -> String {
             "It was already settled, so nothing was sent. {}",
             done_line(how, network)
         ),
+        Outcome::SentAfterSettled { how, by, .. } => format!(
+            "{} {}",
+            crate::components::exit::sent_after_settled_line(*by),
+            done_line(how, network)
+        ),
         _ => "Done.".to_string(),
     }
 }
@@ -1583,6 +1588,12 @@ fn status(current: &Running, network: &Rc<Network>) -> View {
                 };
                 Some(match step? {
                     Step::Checking => el("p").attr("aria-live", "polite").text("Checking…").into(),
+                    Step::Signing(Prompt::FinishNoLongerNeeded) => el("p").attr("aria-live", "polite").text(if sender.keeps_activity {
+                        format!("It’s already settled. Decline the prompt in {wallet}: approving it only costs its fee.")
+                    } else {
+                        "It’s already settled. A settle already on its way only costs its fee.".to_string()
+                    }).into(),
+                    Step::Signing(Prompt::FinishSigned) => el("p").attr("aria-live", "polite").text("Sending the second step…").into(),
                     Step::Signing(_) => el("p").attr("aria-live", "polite").text(format!("Approve in {wallet}…")).into(),
                     Step::Sent { prompt: Prompt::Finish, .. } => el("p")
                         .attr("aria-live", "polite")
@@ -1613,7 +1624,7 @@ fn status(current: &Running, network: &Rc<Network>) -> View {
                             &error,
                             &sender,
                             &network.label,
-                            session.wallet_chain().map(networks::chain_name).as_deref(),
+                            session.wallet_chain().map(crate::components::wallet::chain_label).as_deref(),
                             &network.asset_symbol,
                             network.asset_decimals,
                             network.coin(),
@@ -1830,6 +1841,16 @@ fn claim_view(view: &ClaimView) -> View {
             view.now,
         );
     let mut actions = el("div").class("sh-claim__actions");
+    if door || fallback {
+        // Something here signs: the header's chip and the wrong-network bar
+        // compare the wallet's chain with the vault's.
+        let chain_id = view.network.chain_id;
+        actions = actions.hook(move |dom| {
+            dom.future(crate::components::wallet::acting_on(
+                futures_signals::signal::always(Some(chain_id)),
+            ))
+        });
+    }
     if door && closed {
         actions = actions
             .child(el("p").text(

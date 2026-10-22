@@ -16,6 +16,11 @@ pub const PHRASE: Option<&str> = option_env!("SHONIN_DEV_WALLET_MNEMONIC");
 #[cfg(not(feature = "dev-wallet"))]
 pub const PHRASE: Option<&str> = None;
 
+/// Whether this build offers the development wallet at all: only a build
+/// with the `dev` or `dev-wallet` feature, and the crate's own tests. A
+/// release build never offers it, whatever account an API's config names.
+pub const DEV_WALLET: bool = cfg!(any(test, feature = "dev", feature = "dev-wallet"));
+
 /// Whether this build offers the recovery-phrase wallet: only a build that
 /// names a test network (`SHONIN_APP_NETWORK=testnet` or `local` at build
 /// time), a development build, and the crate's own tests. Any other build,

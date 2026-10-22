@@ -15,10 +15,17 @@
   animation: sh-dialog var(--dur-panel) var(--ease-emph) both;
 }
 .sh-dialog--wide { width: min(560px, 100vw - 32px); }
+/* The connect dialog: a list of wallets, 440 wide; a full-width sheet on a
+   phone, as every sheet is. */
+@media (min-width: 600px) {
+  .sh-dialog:has(> .sh-dialog__body > .sh-connect) { width: min(440px, 100vw - 32px); }
+}
 .sh-dialog__head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-4); }
 .sh-dialog__title { font: var(--type-heading); letter-spacing: var(--track-heading); }
 .sh-dialog__title:focus { outline: none; }
 .sh-dialog__close { margin: -10px -10px 0 0; }
+/* An alert: its chip above the title, no close button. */
+.sh-dialog__head--alert { flex-direction: column; justify-content: flex-start; }
 .sh-dialog__body { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-dialog__foot { display: flex; justify-content: flex-end; gap: var(--space-3); padding-top: 4px; flex-wrap: wrap; }
 
@@ -37,8 +44,12 @@
     display: block; position: absolute; top: var(--space-2); left: 50%; width: 36px; height: 4px; margin-left: -18px;
     border-radius: var(--radius-full); background: var(--line-control);
   }
-  .sh-dialog__head { align-items: center; touch-action: none; }
-  .sh-dialog__close { margin: 0 -10px 0 0; }
+  /* The close button sits at the head's top, inset 8 from the sheet's
+     edge; the title's first line sits 4 below its top, however many lines
+     the title takes. */
+  .sh-dialog__head { align-items: flex-start; touch-action: none; }
+  .sh-dialog__title { padding-top: 4px; }
+  .sh-dialog__close { margin: 0 calc(var(--space-2) * -1) 0 0; }
   .sh-dialog__foot { flex-direction: column-reverse; }
   .sh-dialog__foot .sh-btn { width: 100%; }
   .sh-dialog[data-dragging] { animation: none; transition: none; }

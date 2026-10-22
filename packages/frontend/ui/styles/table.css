@@ -4,7 +4,7 @@
    td padding 14 16, hairline rows · numbers right-aligned and tabular ·
    row hover row-hover · first and last cells pad 24. Wide tables scroll
    inside their card with the first column sticky. */
-.sh-table-wrap { overflow-x: auto; background: var(--paper-raised); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l); }
+.sh-table-wrap { overflow-x: auto; position: relative; background: var(--paper-raised); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l); }
 .sh-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .sh-table caption { text-align: left; }
 .sh-table th, .sh-table td { padding: 14px var(--space-4); border-bottom: var(--border-hairline) solid var(--line); vertical-align: middle; text-align: left; }

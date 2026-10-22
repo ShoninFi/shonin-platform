@@ -1,6 +1,7 @@
 //! The app header: 64px on tablet and desktop, sticky, with the lockup (to
 //! shonin.fi), the sections and Docs, and the wallet control on the right.
-//! Under 600px it is the 56px phone header: the lockup on /agents, else the
+//! Below desktop the header tightens so the wallet control never meets
+//! the sections (see `header.css`). Under 600px it is the 56px phone header: the lockup on /agents, else the
 //! mark and the page's title; Docs moves to the footer.
 
 use ui::icons::Icon;
@@ -28,7 +29,7 @@ pub fn header(route: &Route) -> View {
                 .class("sh-nav")
                 .class("sh-nav--offsite")
                 .attr("href", DOCS)
-                .text("Docs")
+                .child(el("span").class("sh-nav__label").text("Docs"))
                 .child(icon(Icon::External, 16))
                 .child(el("span").class("sh-vh").text("(opens the docs site)")),
         );

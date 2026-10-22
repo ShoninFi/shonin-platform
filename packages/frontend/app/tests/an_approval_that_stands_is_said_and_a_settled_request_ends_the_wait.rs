@@ -1,7 +1,8 @@
 //! What the author's flows say and leave standing when a payment or a
 //! top-up stops after its approval was mined, and that a deposit the vault
 //! settles while the wallet is still asked for the second step ends on its
-//! own, however long the wallet takes. Each test runs a flow over a small
+//! own, however long the wallet takes, saying whether the app's own settle
+//! settled it or only cost its fee. Each test runs a flow over a small
 //! simulated chain and wallet through the flows' public ports, the way the
 //! crate's own tests do.
 
@@ -709,7 +710,7 @@ mod depositor {
     use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::{SolCall, SolEvent, SolValue};
     use app::tx::TxError;
-    use app::tx::flow::{self, Cancel, Ctx, Nudge, Outcome, Pace, Prompt, Step};
+    use app::tx::flow::{self, Cancel, Ctx, Nudge, Outcome, Pace, Prompt, SettledBy, Step};
     use app::tx::port::{
         Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest,
     };
@@ -762,6 +763,27 @@ mod depositor {
         /// answers (declining) after a great many.
         prompt_polls: u32,
         skip: Option<Nudge>,
+        /// Reads of the request in all; the keeper settles at this one
+        /// (counted from 1), before the wallet is asked or not.
+        settles_at_any_read: Option<u32>,
+        reads: u32,
+        /// Every second step the wallet was asked to sign, as handed to it.
+        asked: Vec<TxRequest>,
+        /// The wallet signs the second step in the page and hands it to the
+        /// network at once, answering a few polls later.
+        signs_in_page: bool,
+        /// Second steps the wallet handed to the network.
+        broadcast: Vec<B256>,
+        /// The transaction the vault's record names for logs written now.
+        log_tx: Option<B256>,
+        /// The wallet answers the second step with `OWN` after this many
+        /// polls; `true`: its settle runs on the chain as it is handed over.
+        settle_mode: Option<(u32, bool)>,
+        /// "Skip" is pressed at this poll of that prompt.
+        skip_at_prompt_poll: Option<u32>,
+        /// Looks the flow keeps a prompt said to be no longer needed; set,
+        /// the deposit runs on a clock that yields at every look.
+        unneeded_shown: Option<u32>,
     }
 
     type Sim = Rc<RefCell<Chain>>;
@@ -811,6 +833,15 @@ mod depositor {
                 skip_at_read: None,
                 prompt_polls: 0,
                 skip: None,
+                settles_at_any_read: None,
+                reads: 0,
+                asked: Vec::new(),
+                signs_in_page: false,
+                broadcast: Vec::new(),
+                log_tx: None,
+                settle_mode: None,
+                skip_at_prompt_poll: None,
+                unneeded_shown: None,
             };
             Self {
                 sim: Rc::new(RefCell::new(chain)),
@@ -828,10 +859,59 @@ mod depositor {
         }
 
         fn deposit(&self, dollars: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
+            if self.sim.borrow().unneeded_shown.is_some() {
+                return self.deposit_with(dollars, &Yielding);
+            }
+            self.deposit_with(dollars, &NoWait)
+        }
+
+        fn deposit_with(
+            &self,
+            dollars: u64,
+            clock: &impl Clock,
+        ) -> (Result<Outcome, TxError>, Vec<Step>) {
             let steps = RefCell::new(Vec::new());
             let on_step = |step: Step| steps.borrow_mut().push(step);
             let skip_second = Nudge::new();
             self.sim.borrow_mut().skip = Some(skip_second.clone());
+            let reader = SimReader(self.sim.clone());
+            let wallet = SimWallet {
+                sim: self.sim.clone(),
+                key: self.key.clone(),
+            };
+            let ctx = Ctx {
+                reader: &reader,
+                signer: &wallet,
+                clock,
+                chain_id: CHAIN,
+                vault: vault(),
+                asset: asset(),
+                account: self.account(),
+                cancel: Cancel::new(),
+                settle_now: Nudge::new(),
+                skip_second,
+                pace: Pace {
+                    unneeded_shown: self
+                        .sim
+                        .borrow()
+                        .unneeded_shown
+                        .unwrap_or(Pace::FAST.unneeded_shown),
+                    ..Pace::FAST
+                },
+                on_step: &on_step,
+            };
+            let result = block_on(flow::deposit(
+                &ctx,
+                U256::from(dollars * USD),
+                "SANCTIONED,US",
+            ));
+            (result, steps.into_inner())
+        }
+
+        /// "Settle now" on request `id`, as the portfolio's button runs it.
+        fn settle_now(&self, id: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
+            let steps = RefCell::new(Vec::new());
+            let on_step = |step: Step| steps.borrow_mut().push(step);
             let reader = SimReader(self.sim.clone());
             let wallet = SimWallet {
                 sim: self.sim.clone(),
@@ -847,22 +927,47 @@ mod depositor {
                 account: self.account(),
                 cancel: Cancel::new(),
                 settle_now: Nudge::new(),
-                skip_second,
+                skip_second: Nudge::new(),
                 pace: Pace::FAST,
                 on_step: &on_step,
             };
-            let result = block_on(flow::deposit(
-                &ctx,
-                U256::from(dollars * USD),
-                "SANCTIONED,US",
-            ));
+            let result = block_on(flow::settle_request(&ctx, U256::from(id)));
             (result, steps.into_inner())
+        }
+
+        /// A deposit request of the person's, waiting to be settled.
+        fn waiting_request(&self) -> &Self {
+            let account = self.account();
+            self.with(|chain| {
+                chain
+                    .requests
+                    .push((account, 0, 1_010, false, U256::from(500 * USD)));
+            })
         }
     }
 
     struct NoWait;
     impl Clock for NoWait {
         async fn sleep(&self, _millis: u32) {}
+    }
+
+    /// A clock whose every wait yields once to the executor, so a future
+    /// raced against it is polled at each look.
+    struct Yielding;
+    impl Clock for Yielding {
+        async fn sleep(&self, _millis: u32) {
+            let mut yielded = false;
+            std::future::poll_fn(move |cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await
+        }
     }
 
     fn ok<T: SolValue>(value: T) -> Result<Bytes, TxError> {
@@ -887,6 +992,12 @@ mod depositor {
         /// The keeper, on each look at a request: prices its slot, and
         /// settles only when the scenario says.
         fn tick(&mut self) {
+            self.reads += 1;
+            if Some(self.reads) == self.settles_at_any_read {
+                self.log_tx = Some(KEEPER);
+                self.settle_all();
+                self.keepers_receipt();
+            }
             if let Some(request) = self.requests.iter().find(|r| !r.3) {
                 let earliest = request.2;
                 self.time = self.time.max(earliest + 1);
@@ -895,7 +1006,9 @@ mod depositor {
             if self.prompt_opened {
                 self.reads_since_prompt += 1;
                 if self.reads_since_prompt == self.keeper_settles_at_read {
+                    self.log_tx = Some(KEEPER);
                     self.settle_all();
+                    self.keepers_receipt();
                 }
                 if Some(self.reads_since_prompt) == self.skip_at_read
                     && let Some(skip) = &self.skip
@@ -903,6 +1016,21 @@ mod depositor {
                     skip.nudge();
                 }
             }
+        }
+
+        /// The keeper's settle, mined, sent by the keeper's own account.
+        fn keepers_receipt(&mut self) {
+            let block = self.block;
+            self.receipts.insert(
+                KEEPER,
+                Receipt {
+                    hash: KEEPER,
+                    from: Some(Address::repeat_byte(0x4e)),
+                    success: true,
+                    block,
+                    logs: Vec::new(),
+                },
+            );
         }
 
         /// Settle every waiting request at a dollar a share, in its own
@@ -936,7 +1064,7 @@ mod depositor {
                     address,
                     topics: data.topics().to_vec(),
                     data: data.data.clone(),
-                    transaction: None,
+                    transaction: self.log_tx,
                 },
             ));
         }
@@ -1148,10 +1276,70 @@ mod depositor {
         }
         async fn send(&self, request: &TxRequest) -> Result<B256, TxError> {
             let selector: [u8; 4] = request.data[..4].try_into().unwrap();
+            let mode = self.sim.borrow().settle_mode;
+            if selector == IVault::settleCall::SELECTOR
+                && let Some((after, runs)) = mode
+            {
+                {
+                    let mut sim = self.sim.borrow_mut();
+                    sim.prompt_opened = true;
+                    sim.asked.push(request.clone());
+                    sim.broadcast.push(OWN);
+                    if runs {
+                        sim.block += 1;
+                        sim.log_tx = Some(OWN);
+                        sim.settle_all();
+                    }
+                }
+                let sim = self.sim.clone();
+                let mut polls = 0u32;
+                std::future::poll_fn(move |cx| {
+                    polls += 1;
+                    let mut sim = sim.borrow_mut();
+                    sim.prompt_polls = polls;
+                    if Some(polls) == sim.skip_at_prompt_poll
+                        && let Some(skip) = &sim.skip
+                    {
+                        skip.nudge();
+                    }
+                    if polls >= after {
+                        Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                return Ok(OWN);
+            }
+            if selector == IVault::settleCall::SELECTOR && self.sim.borrow().signs_in_page {
+                // Handed to the network at once; the endpoint's reply comes
+                // a few polls later.
+                let hash = B256::repeat_byte(0x5e);
+                {
+                    let mut sim = self.sim.borrow_mut();
+                    sim.prompt_opened = true;
+                    sim.asked.push(request.clone());
+                    sim.broadcast.push(hash);
+                }
+                let mut polls = 0u32;
+                std::future::poll_fn(move |cx| {
+                    polls += 1;
+                    if polls >= 5 {
+                        Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                return Ok(hash);
+            }
             if selector == IVault::settleCall::SELECTOR {
                 // The prompt stays open in the wallet for a very long time,
                 // then is declined. Meanwhile the chain is read.
                 self.sim.borrow_mut().prompt_opened = true;
+                self.sim.borrow_mut().asked.push(request.clone());
                 let sim = self.sim.clone();
                 std::future::poll_fn(move |cx| {
                     let mut sim = sim.borrow_mut();
@@ -1175,6 +1363,7 @@ mod depositor {
             let hash = keccak256(sim.sent.len().to_be_bytes());
             sim.block += 1;
             let first = sim.logs.len();
+            sim.log_tx = Some(hash);
             sim.execute(request);
             let logs = sim.logs[first..]
                 .iter()
@@ -1195,6 +1384,11 @@ mod depositor {
             Ok(hash)
         }
     }
+
+    /// The keeper's settle, as the vault's record names it.
+    const KEEPER: B256 = B256::repeat_byte(0x4b);
+    /// The app's own settle, as the wallet answers it.
+    const OWN: B256 = B256::repeat_byte(0x77);
 
     /// Reads of the request past the flow's long wait (`give_up_after`
     /// looks at the fast pace), as the keeper settling after it.
@@ -1239,6 +1433,44 @@ mod depositor {
         );
     }
 
+    /// The wallet hands the second step to the network at once and answers
+    /// later; the keeper settles the deposit at the first look after the
+    /// wallet is asked. The deposit ends settled, and the send is not
+    /// dropped unsaid: its hash is shown, or the step still waiting on the
+    /// wallet is said to be no longer needed.
+    #[test]
+    fn a_deposit_settled_while_its_second_step_is_on_its_way_says_so_before_it_ends() {
+        let world = World::new();
+        world.with(|chain| {
+            chain.signs_in_page = true;
+            chain.keeper_settles_at_read = 1;
+        });
+        let (result, steps) = world.deposit(100);
+        let broadcast = world.sim.borrow().broadcast.clone();
+        assert_eq!(
+            broadcast.len(),
+            1,
+            "the signer sent the settle; steps {steps:?}"
+        );
+        assert!(
+            matches!(result, Ok(Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        let said = steps.iter().any(|step| match step {
+            Step::Signing(Prompt::FinishNoLongerNeeded) => true,
+            Step::Sent { hash, .. }
+            | Step::Priced {
+                sent: Some(hash), ..
+            } => *hash == broadcast[0],
+            _ => false,
+        });
+        assert!(
+            said,
+            "the settle the signer sent ({:?}) was dropped with nothing said of it; steps {steps:?}",
+            broadcast[0]
+        );
+    }
+
     /// "Skip" pressed after the flow's long wait on the wallet must still
     /// let the step go, as it does before it: the button is still shown.
     #[test]
@@ -1262,6 +1494,255 @@ mod depositor {
                 }
             )),
             "the skipped step is said as not sent: {steps:?}"
+        );
+    }
+
+    /// The second step on its own ("Settle now"): the keeper settles the
+    /// request after the app's first looks but before the wallet is asked.
+    /// The request is read again just before signing, so the wallet is
+    /// never asked for a request that is gone, and the flow ends with how
+    /// it settled.
+    #[test]
+    fn settle_now_reads_the_request_again_just_before_signing_and_never_asks_for_one_already_settled()
+     {
+        let world = World::new();
+        world.waiting_request();
+        // Its first two reads are the flow's opening looks; the third is
+        // the one just before the wallet would be asked.
+        world.with(|chain| chain.settles_at_any_read = Some(3));
+        let (result, steps) = world.settle_now(1);
+        assert!(
+            matches!(&result, Ok(Outcome::SettledBefore(how)) if matches!(**how, Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            !steps.contains(&Step::Signing(Prompt::Finish)),
+            "the wallet was asked for a settled request: {steps:?}"
+        );
+        assert!(!world.sim.borrow().prompt_opened, "the wallet was asked");
+        assert!(world.sim.borrow().sent.is_empty());
+    }
+
+    /// The keeper settles the request while the wallet's prompt for it is
+    /// open: the open prompt is said to be no longer needed, and the flow
+    /// still waits for the wallet's answer (a send it may already have
+    /// made is never dropped). The wallet declines: the request is said
+    /// settled, with how, and nothing was sent.
+    #[test]
+    fn settle_now_waits_for_an_open_prompt_the_keeper_made_unneeded_and_says_settled_once_declined()
+    {
+        let world = World::new();
+        world.waiting_request();
+        world.with(|chain| chain.keeper_settles_at_read = 1);
+        let (result, steps) = world.settle_now(1);
+        let asked = steps
+            .iter()
+            .position(|step| *step == Step::Signing(Prompt::Finish))
+            .unwrap_or_else(|| panic!("the wallet was asked: {steps:?}"));
+        let unneeded = steps
+            .iter()
+            .position(|step| *step == Step::Signing(Prompt::FinishNoLongerNeeded))
+            .unwrap_or_else(|| panic!("the prompt was said no longer needed: {steps:?}"));
+        assert!(asked < unneeded, "{steps:?}");
+        assert!(
+            matches!(&result, Ok(Outcome::SettledBefore(how)) if matches!(**how, Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            world.sim.borrow().prompt_polls >= WALLET_ANSWERS_AFTER_POLLS,
+            "the flow stopped waiting before the wallet answered"
+        );
+        assert!(world.sim.borrow().sent.is_empty());
+        // What the wallet was asked to sign is the settling call as ever:
+        // to the vault, from the person, settling up to 256 requests.
+        let asked = world.sim.borrow().asked.clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].to, vault());
+        assert_eq!(asked[0].from, world.account());
+        assert_eq!(
+            asked[0].data.to_vec(),
+            IVault::settleCall {
+                max: U256::from(256u32)
+            }
+            .abi_encode()
+        );
+    }
+
+    /// The deposit's own second step: the keeper settles the request after
+    /// the step's first look but before the wallet is asked. It is read
+    /// again just before signing: the wallet is never asked, and the
+    /// deposit ends done.
+    #[test]
+    fn the_deposits_second_step_is_not_asked_for_once_the_keeper_settles_before_signing() {
+        let world = World::new();
+        let (first, _) = {
+            // How many request reads a deposit makes up to its second
+            // step's first look, from a run where the keeper never settles
+            // before the wallet is asked.
+            let probe = World::new();
+            probe.with(|chain| chain.keeper_settles_at_read = 1);
+            let _ = probe.deposit(100);
+            let opened_at = probe.sim.borrow().reads - probe.sim.borrow().reads_since_prompt;
+            (opened_at, ())
+        };
+        // Settle at the last read before the wallet would be asked: the
+        // one just before signing.
+        world.with(|chain| chain.settles_at_any_read = Some(first));
+        let (result, steps) = world.deposit(100);
+        assert!(
+            matches!(result, Ok(Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            !steps.contains(&Step::Signing(Prompt::Finish)),
+            "the wallet was asked for a settled request: {steps:?}"
+        );
+        assert!(!world.sim.borrow().prompt_opened);
+    }
+
+    /// The wallet hands back the app's settle at once; the keeper's settle
+    /// lands first and the request reads settled at the first look after.
+    /// The record names the keeper's transaction: the deposit says its own
+    /// settle, if it goes out, only costs its fee, without inferring who
+    /// sent the keeper's.
+    #[test]
+    fn a_deposits_own_settle_mined_after_the_keepers_is_said_to_have_only_cost_its_fee() {
+        let world = World::new();
+        world.with(|chain| {
+            chain.settle_mode = Some((1, false));
+            chain.keeper_settles_at_read = 1;
+        });
+        let (result, steps) = world.deposit(100);
+        assert_eq!(world.sim.borrow().broadcast, vec![OWN], "{steps:?}");
+        assert!(
+            matches!(
+                &result,
+                Ok(Outcome::SentAfterSettled { sent, by: SettledBy::Unsure, .. }) if *sent == OWN
+            ),
+            "{result:?}; steps {steps:?}"
+        );
+    }
+
+    /// "Settle now" in the same race says the same.
+    #[test]
+    fn settle_now_mined_after_the_keepers_settle_is_said_to_have_only_cost_its_fee() {
+        let world = World::new();
+        world.waiting_request();
+        world.with(|chain| {
+            chain.settle_mode = Some((1, false));
+            chain.keeper_settles_at_read = 1;
+        });
+        let (result, steps) = world.settle_now(1);
+        assert!(
+            matches!(
+                &result,
+                Ok(Outcome::SentAfterSettled { sent, by: SettledBy::Unsure, .. }) if *sent == OWN
+            ),
+            "{result:?}; steps {steps:?}"
+        );
+    }
+
+    /// The wallet answers within the grace after the request read settled
+    /// and the record names the keeper's settle: said as sent after it read
+    /// settled, and never told to decline.
+    #[test]
+    fn a_deposits_settle_answered_in_the_grace_after_the_keeper_is_said_sent_after_it_settled() {
+        let world = World::new();
+        world.with(|chain| {
+            chain.settle_mode = Some((2, false));
+            chain.keeper_settles_at_read = 1;
+        });
+        let (result, steps) = world.deposit(100);
+        assert!(
+            matches!(
+                &result,
+                Ok(Outcome::SentAfterSettled { sent, by: SettledBy::Unsure, .. }) if *sent == OWN
+            ),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            !steps.contains(&Step::Signing(Prompt::FinishNoLongerNeeded)),
+            "{steps:?}"
+        );
+    }
+
+    /// The app's own settle settles the request as it is handed over, and
+    /// the wallet answers within the grace: the record names it, so the
+    /// deposit ends plainly deposited.
+    #[test]
+    fn a_deposit_its_own_settle_settled_ends_plainly_deposited() {
+        let world = World::new();
+        world.with(|chain| chain.settle_mode = Some((2, true)));
+        let (result, steps) = world.deposit(100);
+        assert!(
+            matches!(&result, Ok(Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            !steps.contains(&Step::Signing(Prompt::FinishNoLongerNeeded)),
+            "{steps:?}"
+        );
+    }
+
+    /// "Settle now" whose own settle settled it ends with its plain
+    /// outcome, linking its own transaction.
+    #[test]
+    fn settle_now_its_own_settle_settled_ends_with_its_plain_outcome() {
+        let world = World::new();
+        world.waiting_request();
+        world.with(|chain| chain.settle_mode = Some((2, true)));
+        let (result, steps) = world.settle_now(1);
+        assert!(
+            matches!(&result, Ok(Outcome::Deposited { hash, .. }) if *hash == OWN),
+            "{result:?}; steps {steps:?}"
+        );
+    }
+
+    /// The wallet answers only long after the prompt was said to be no
+    /// longer needed: the deposit still ends deposited, without it.
+    #[test]
+    fn a_deposit_ends_deposited_when_the_wallet_answers_after_the_unneeded_prompt_is_let_go() {
+        let world = World::new();
+        world.with(|chain| {
+            chain.settle_mode = Some((50, false));
+            chain.keeper_settles_at_read = 1;
+        });
+        let (result, steps) = world.deposit(100);
+        assert!(
+            matches!(&result, Ok(Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            steps.contains(&Step::Signing(Prompt::FinishNoLongerNeeded)),
+            "{steps:?}"
+        );
+    }
+
+    /// "Skip" pressed while the prompt is said to be no longer needed ends
+    /// the wait on the wallet at once: the deposit ends deposited well
+    /// before that wait would have run out.
+    #[test]
+    fn skip_ends_the_wait_on_a_prompt_said_to_be_no_longer_needed() {
+        let world = World::new();
+        world.with(|chain| {
+            chain.settle_mode = Some((u32::MAX, false));
+            chain.keeper_settles_at_read = 1;
+            chain.unneeded_shown = Some(100_000);
+            chain.skip_at_prompt_poll = Some(10);
+        });
+        let (result, steps) = world.deposit(100);
+        assert!(
+            matches!(&result, Ok(Outcome::Deposited { .. })),
+            "{result:?}; steps {steps:?}"
+        );
+        assert!(
+            steps.contains(&Step::Signing(Prompt::FinishNoLongerNeeded)),
+            "{steps:?}"
+        );
+        assert!(
+            world.sim.borrow().prompt_polls < 100,
+            "the wait ran on after Skip: {} polls",
+            world.sim.borrow().prompt_polls
         );
     }
 }

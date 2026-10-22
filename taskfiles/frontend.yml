@@ -76,13 +76,14 @@ tasks:
       # Pass API=<url> to pre-render the pages that need data from another API.
       # It also moves Trunk's inline loader into a file and writes _headers'
       # Content-Security-Policy, naming the compiled-in API origin and the
-      # public RPC origins from config/chains.toml.
+      # public RPC origins of the testnet's chains in config/chains.toml.
       - >-
         cargo run -q -p shonin-app --bin seo --
         --dist "{{.PATH_DIST_APP}}"
         --base-url "{{.URL_APP_PROD}}"
         --app-api "{{.URL_API_TESTNET}}/api"
         --chains "{{.PATH_CHAINS}}"
+        --network testnet
         {{.SEO_API_ARG}}
       # The development wallet's phrase is compiled in only by the
       # `dev-wallet` feature, which this build never turns on: refuse a dist

@@ -1938,6 +1938,7 @@ pub fn read_review(
         limits: report
             .map(|report| report.limits)
             .unwrap_or_else(|| vec![missing()]),
+        recorded_tx: None,
     }))
 }
 

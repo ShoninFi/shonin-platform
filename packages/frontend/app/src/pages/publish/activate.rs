@@ -198,6 +198,14 @@ fn live(form: &Kept) -> bool {
         .is_some_and(|running| running.is_live())
 }
 
+/// Whether a new read may be drawn now: always before the page is first
+/// drawn; once drawn, only while no flow is under way, so a wallet prompt
+/// and the status beside it stay still.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn may_redraw(load: &Mutable<Load>, form: &Kept) -> bool {
+    !matches!(&*load.lock_ref(), Load::Ready(_)) || !live(form)
+}
+
 /// A read that failed (`why`): said in place of the page on the first read.
 /// Once the page has been drawn, what it shows (the form, and a flow's
 /// status and links, finished or not) stays, and the read is tried again
@@ -270,6 +278,12 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>, form: Kept) {
                 })
                 .filter(|title| !title.trim().is_empty());
             let config = network.config;
+            // A read again (after a failed one, or a settings change) never
+            // redraws the page while the wallet is asked or a transaction is
+            // on its way: it waits for the flow to end.
+            while !may_redraw(&load, &form) {
+                gloo_timers::future::TimeoutFuture::new(1_000).await;
+            }
             load.set(Load::Ready(Rc::new(Info {
                 chain,
                 id,
@@ -1064,12 +1078,11 @@ fn summary(info: &Rc<Info>, form: &Rc<Form>, names: &Rc<Names>, can_activate: bo
 }
 
 fn start(info: &Rc<Info>, form: &Rc<Form>) {
-    if form
-        .running
-        .lock_ref()
-        .as_ref()
-        .is_some_and(Running::is_live)
-    {
+    // Nothing while one runs; and once one has activated the vault, its
+    // Done status and links stay: there is nothing left to activate.
+    if form.running.lock_ref().as_ref().is_some_and(|running| {
+        running.is_live() || matches!(running.step.lock_ref().as_ref(), Some(Step::Done(_)))
+    }) {
         return;
     }
     let Some(activation) = chosen(info, form) else {
@@ -1195,5 +1208,57 @@ mod tests {
             crate::tx::TxError::SettingsChanged.into(),
         )));
         assert!(!live(&kept));
+    }
+
+    #[test]
+    fn a_read_again_never_redraws_the_page_while_a_wallet_prompt_is_open() {
+        let kept = Kept::default();
+        let load = Mutable::new(Load::Loading);
+        assert!(may_redraw(&load, &kept), "the first read is drawn at once");
+        let shown = info(1, 6, false);
+        let _ = view(&shown, &kept).html();
+        load.set(Load::Ready(shown));
+        assert!(may_redraw(&load, &kept), "drawn, with nothing under way");
+        let form = kept.get().expect("the form").clone();
+        let running = Running::new();
+        running.step.set(Some(Step::Signing(Prompt::Statement)));
+        form.running.set(Some(running.clone()));
+        assert!(
+            !may_redraw(&load, &kept),
+            "the wallet is asked: the page keeps still"
+        );
+        running
+            .step
+            .set(Some(Step::Failed(crate::tx::TxError::Rejected.into())));
+        assert!(
+            may_redraw(&load, &kept),
+            "once the flow ends it may be drawn again"
+        );
+    }
+
+    #[test]
+    fn activate_after_a_finished_activation_keeps_its_done_status() {
+        let kept = Kept::default();
+        let shown = info(1, 6, false);
+        let _ = view(&shown, &kept).html();
+        let form = kept.get().expect("the form").clone();
+        form.tank.set("250".to_string());
+        let running = Running::new();
+        let done = Step::Done(crate::tx::author::flow::Outcome::Activated {
+            vault: Address::repeat_byte(0x5f),
+            hash: B256::repeat_byte(0x01),
+        });
+        running.step.set(Some(done.clone()));
+        form.running.set(Some(running.clone()));
+        start(&shown, &form);
+        let now = form.running.get_cloned().expect("a flow");
+        assert_eq!(now.step.get_cloned(), Some(done));
+        // The same flow, not a new one: they share their step.
+        running.step.set(Some(Step::Checking));
+        assert_eq!(
+            now.step.get_cloned(),
+            Some(Step::Checking),
+            "a new flow was started"
+        );
     }
 }

@@ -170,7 +170,7 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="{image}">
 <meta name="twitter:image:alt" content="{alt}">
-<link rel="icon" type="image/png" sizes="32x32" href="{{{{asset:icon-32}}}}">
+{social}<link rel="icon" type="image/png" sizes="32x32" href="{{{{asset:icon-32}}}}">
 <link rel="icon" type="image/png" sizes="512x512" href="{{{{asset:icon-512}}}}">
 <link rel="icon" type="image/svg+xml" href="{{{{asset:mark}}}}">
 <link rel="apple-touch-icon" href="{{{{asset:icon-180}}}}">
@@ -188,6 +188,7 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
         width = share.png.width,
         height = share.png.height,
         alt = esc(share.alt),
+        social = ui::social::head_html(&cx.links.site),
         stylesheet = esc(cx.stylesheet),
         boot = cx.boot,
         script = esc(cx.script),

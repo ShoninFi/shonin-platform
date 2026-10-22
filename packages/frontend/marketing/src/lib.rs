@@ -392,7 +392,7 @@ fn headers() -> String {
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
-  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Opener-Policy: same-origin-allow-popups
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
 /share/*

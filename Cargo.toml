@@ -133,6 +133,8 @@ lighters = { version = "0.1.1", default-features = false }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs"] }
 ed25519-dalek = "3.0.0"
 bs58 = "0.5.1"
+# Wiping secrets (a recovery phrase) from memory once they are used.
+zeroize = "1.9.0"
 # Account data and transactions travel in base64 between the web app and a
 # Solana node.
 base64 = "0.22.1"

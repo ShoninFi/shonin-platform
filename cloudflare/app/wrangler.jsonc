@@ -1,8 +1,8 @@
 {
   // app — the web app's static Trunk dist, served as Workers static assets at
   // app.shonin.fi. There is no Worker script (`main`); Cloudflare serves the
-  // files. Who may open it is decided by a Cloudflare Access policy on the
-  // hostname, set in the dashboard.
+  // files. It is public: anyone may open it, and nothing in front of it
+  // asks who they are.
   "$schema": "../../node_modules/wrangler/config-schema.json",
   // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name.
   "name": "shonin-app",

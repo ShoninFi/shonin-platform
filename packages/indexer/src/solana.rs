@@ -998,6 +998,7 @@ fn review_of(store: &Store, review: &publishing::state::Review) -> Review {
         limits: report
             .map(|report| report.limits)
             .unwrap_or_else(|| vec![missing()]),
+        recorded_tx: None,
     }
 }
 

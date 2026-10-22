@@ -514,6 +514,7 @@ fn overlays() -> El {
                         on_click(Button::new(Kind::Danger, "Retire agent").build(), dialog::close).into(),
                     ])),
                     wide: false,
+                    alert: None,
                 });
                     },
                 )],

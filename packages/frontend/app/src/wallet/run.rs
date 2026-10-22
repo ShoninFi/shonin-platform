@@ -234,7 +234,9 @@ pub fn outcome_words(outcome: &crate::tx::flow::Outcome, decimals: u8) -> String
         Outcome::Refunded { assets, .. } => format!("Sent back: {}", dollars(assets)),
         Outcome::Paid { assets, .. } => format!("Paid {}", dollars(assets)),
         Outcome::Booked { claim, .. } => format!("Booked as claim {claim}"),
-        Outcome::SettledBefore(how) => outcome_words(how, decimals),
+        Outcome::SettledBefore(how) | Outcome::SentAfterSettled { how, .. } => {
+            outcome_words(how, decimals)
+        }
         Outcome::Claim {
             state: ClaimState::Paid,
             paid,

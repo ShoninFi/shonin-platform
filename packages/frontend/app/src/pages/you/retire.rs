@@ -237,6 +237,7 @@ pub(crate) fn open(read: &Rc<Read>, slot: &Mutable<Option<Running>>, names: &Rc<
         body: body.into(),
         foot: Some(View::Many(vec![keep.into(), retire.into()])),
         wide: true,
+        alert: None,
     });
 }
 

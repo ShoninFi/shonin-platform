@@ -200,6 +200,19 @@ pub trait Signer {
     fn checks_fee(&self) -> bool {
         false
     }
+    /// Whether the send now under way has been signed. A signer that signs
+    /// in the page reads the chain first: until it signs, nothing has left,
+    /// and a send dropped then sends nothing. Any other signer, and one that
+    /// can't tell, answers `true`.
+    fn signed_yet(&self) -> bool {
+        true
+    }
+    /// Whether this signer signs in the page, with no prompt: its send is
+    /// on the network as soon as it is handed over, so the flow always
+    /// waits for its answer and follows what it sent.
+    fn signs_in_page(&self) -> bool {
+        false
+    }
 }
 
 /// Waiting, without a browser in the tests.

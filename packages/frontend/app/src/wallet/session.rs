@@ -14,7 +14,7 @@
 //!   `wallet_addEthereumChain` with the public endpoint and explorer if the
 //!   wallet doesn't know the chain.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -99,6 +99,11 @@ pub struct Session {
     texts: RefCell<BTreeMap<ConfigId, Rc<str>>>,
     /// Whether the API has been asked for every chain's config once.
     pub networks_tried: Mutable<bool>,
+    /// Whether a wallet this browser remembers may still reconnect on its
+    /// own: true from the page's start until that has been tried. A page
+    /// that differs for a connected wallet waits on it rather than drawing
+    /// the signed-out view first.
+    pub restoring: Mutable<bool>,
     /// Every vault by slug, from the latest snapshot this session read.
     pub vaults: Mutable<BTreeMap<String, Rc<super::run::VaultRef>>>,
     /// Rises when a flow lands, so pages read the chain again.
@@ -167,6 +172,7 @@ thread_local! {
         configs: RefCell::new(BTreeMap::new()),
         texts: RefCell::new(BTreeMap::new()),
         networks_tried: Mutable::new(false),
+        restoring: Mutable::new(cfg!(target_arch = "wasm32")),
         vaults: Mutable::new(BTreeMap::new()),
         changed: Mutable::new(0),
         running: Mutable::new(BTreeMap::new()),
@@ -213,6 +219,19 @@ fn remember(id: &str) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (REMEMBERED, PREVIOUS, id);
+}
+
+/// Whether a wallet is remembered for a silent reconnect on load.
+pub fn remembers_wallet() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::web::storage_get(REMEMBERED)
+            .as_deref()
+            .and_then(WalletId::from_remembered)
+            .is_some()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    false
 }
 
 /// The browser wallet this browser used for EVM before the one connected.
@@ -600,6 +619,7 @@ impl Session {
             session: self.clone(),
             network,
             sent: RefCell::default(),
+            signed_yet: Cell::new(true),
         }
     }
 }
@@ -611,6 +631,9 @@ pub struct SessionSigner {
     /// The transactions signed in the page and handed to the endpoint, by
     /// chain and account.
     sent: RefCell<Vec<(u64, Address, Sent)>>,
+    /// The send last begun in the page has been signed (it may be on the
+    /// network), or it has answered.
+    signed_yet: Cell<bool>,
 }
 
 impl SessionSigner {
@@ -626,10 +649,19 @@ impl SessionSigner {
         Session::reader(&self.network)
     }
 
-    /// The endpoint answers for the chain the transaction is signed for.
+    /// The endpoint answers for the chain the transaction is signed for,
+    /// within [`TURN_REQUEST_MILLIS`]: one that never answers ends the send
+    /// before anything is signed.
     async fn check_endpoint(&self, chain_id: u64) -> Result<RpcReader<Endpoint>, TxError> {
         let reader = self.endpoint();
-        let endpoint = reader.chain_id().await?;
+        let bounded = RpcReader {
+            transport: super::rpc::Bounded {
+                inner: &reader.transport,
+                clock: &Timer,
+                millis: TURN_REQUEST_MILLIS,
+            },
+        };
+        let endpoint = bounded.chain_id().await?;
         if endpoint != chain_id {
             return Err(TxError::WrongEndpoint {
                 endpoint,
@@ -645,6 +677,19 @@ impl SessionSigner {
         if key.address() != request.from {
             return Err(TxError::AccountChanged);
         }
+        self.signed_yet.set(false);
+        let sent = self.sign_local(key, request).await;
+        self.signed_yet.set(true);
+        let sent = sent?;
+        let hash = sent.hash;
+        self.sent
+            .borrow_mut()
+            .push((request.chain_id, request.from, sent));
+        Ok(hash)
+    }
+
+    /// [`Self::send_local`]'s checks, signing and send, noting when it signs.
+    async fn sign_local(&self, key: &LocalKey, request: &TxRequest) -> Result<Sent, TxError> {
         let endpoint = self.check_endpoint(request.chain_id).await?;
         // Every request is made while holding the send's turn, which other
         // tabs wait on: none may hang it.
@@ -655,12 +700,10 @@ impl SessionSigner {
                 millis: TURN_REQUEST_MILLIS,
             },
         };
-        let sent = sign_and_send(&reader, key, request, &self.session.signed, &Timer).await?;
-        let hash = sent.hash;
-        self.sent
-            .borrow_mut()
-            .push((request.chain_id, request.from, sent));
-        Ok(hash)
+        sign_and_send_noting(&reader, key, request, &self.session.signed, &Timer, &|| {
+            self.signed_yet.set(true)
+        })
+        .await
     }
 }
 
@@ -725,6 +768,19 @@ pub async fn sign_and_send<T: super::rpc::Transport, C: Clock>(
     request: &TxRequest,
     signed: &SignedSends,
     clock: &C,
+) -> Result<Sent, TxError> {
+    sign_and_send_noting(reader, key, request, signed, clock, &|| {}).await
+}
+
+/// [`sign_and_send`], calling `on_signed` as it signs: from then on the
+/// send may reach the network, and before then dropping it sends nothing.
+pub async fn sign_and_send_noting<T: super::rpc::Transport, C: Clock>(
+    reader: &RpcReader<T>,
+    key: &LocalKey,
+    request: &TxRequest,
+    signed: &SignedSends,
+    clock: &C,
+    on_signed: &dyn Fn(),
 ) -> Result<Sent, TxError> {
     let (chain_id, who) = (request.chain_id, request.from);
     let _turn = signed.turn(chain_id, who).await;
@@ -792,6 +848,7 @@ pub async fn sign_and_send<T: super::rpc::Transport, C: Clock>(
     if need > have {
         return Err(TxError::InsufficientGas { need, have });
     }
+    on_signed();
     let raw = key.sign_transaction(&Unsigned {
         chain_id,
         nonce,
@@ -1083,6 +1140,14 @@ impl Signer for SessionSigner {
         matches!(self.active(), Ok(Active::Phrase(_) | Active::DevPhrase(_)))
     }
 
+    fn signs_in_page(&self) -> bool {
+        matches!(self.active(), Ok(Active::Phrase(_) | Active::DevPhrase(_)))
+    }
+
+    fn signed_yet(&self) -> bool {
+        self.signed_yet.get()
+    }
+
     fn other_tries(&self, hash: B256) -> Vec<B256> {
         let sent = self.sent.borrow();
         let Some((chain_id, who, this)) = sent.iter().find(|(_, _, sent)| sent.hash == hash) else {
@@ -1217,6 +1282,7 @@ impl Session {
             gloo_timers::future::TimeoutFuture::new(300).await;
             session.refresh_wallets();
             session.restore().await;
+            session.restoring.set_neq(false);
         });
     }
 
@@ -1561,7 +1627,7 @@ impl Session {
             if !unknown {
                 return Err(error.into_tx_error());
             }
-            if !networks::is_usable_endpoint(&network.rpc) {
+            if !networks::may_add_endpoint(network.chain_id, &network.rpc) {
                 return Err(TxError::Network(
                     "this chain has no public endpoint to add".to_string(),
                 ));

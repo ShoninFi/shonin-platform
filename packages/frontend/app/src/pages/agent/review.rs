@@ -46,9 +46,13 @@ fn main(strategy: &Strategy) -> View {
             ))
             .into();
     };
+    // As the review board orders it: which report and when, what the
+    // Reviewer found (its words, the tally, what the Author says), then the
+    // report card.
     View::Many(vec![
-        report_card(strategy, review).into(),
+        report_line(strategy, review).into(),
         found(strategy, review).into(),
+        report_card(review).into(),
         areas(strategy, review).into(),
         claims(strategy, review),
         limits(review),
@@ -207,6 +211,7 @@ fn found(strategy: &Strategy, review: &Review) -> El {
                 .child(summary(&review.summary))
                 .child(byline),
         )
+        .child(tally(review))
         .child(View::from(sealed.then(|| {
             el("p")
                 .class("ag-sealed-note")
@@ -232,6 +237,69 @@ fn found(strategy: &Strategy, review: &Review) -> El {
                                 .text(verdict),
                         ),
                 ),
+        )
+}
+
+/// The ratings tallied: how many of the six areas got each of the four,
+/// and, for a concern, which areas.
+fn tally(review: &Review) -> El {
+    el("dl")
+        .class("ag-counts")
+        .attr("aria-label", "The six areas' ratings, counted")
+        .children(
+            [
+                Rating::LooksFine,
+                Rating::SomeConcerns,
+                Rating::SeriousConcerns,
+                Rating::CouldntTell,
+            ]
+            .into_iter()
+            .map(|rated| {
+                let areas: Vec<Area> = Area::ALL
+                    .into_iter()
+                    .filter(|area| review.rating(*area) == rated)
+                    .collect();
+                let count = areas.len();
+                let what = match rated {
+                    Rating::LooksFine => format!("of {} areas", Area::ALL.len()),
+                    _ => areas
+                        .iter()
+                        .map(|area| area.label())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                el("div")
+                    .class("ag-counts__tile")
+                    .class_if(count == 0, "ag-counts__tile--none")
+                    .class_if(
+                        count > 0 && rated == Rating::LooksFine,
+                        "ag-counts__tile--fine",
+                    )
+                    .class_if(
+                        count > 0 && rated == Rating::SomeConcerns,
+                        "ag-counts__tile--some",
+                    )
+                    .class_if(
+                        count > 0 && rated == Rating::SeriousConcerns,
+                        "ag-counts__tile--serious",
+                    )
+                    .child(
+                        el("dt")
+                            .class("ag-counts__word")
+                            .child(icon(rating_icon(rated), 16))
+                            .text(crate::model::rating_word(rated)),
+                    )
+                    .child(
+                        el("dd")
+                            .class("ag-counts__n")
+                            .child(el("strong").text(count.to_string()))
+                            .text(if count > 0 && !what.is_empty() {
+                                format!(" {what}")
+                            } else {
+                                String::new()
+                            }),
+                    )
+            }),
         )
 }
 
@@ -267,9 +335,29 @@ fn rated(review: &Review, area: Area) -> El {
         .child(View::from(note))
 }
 
-/// The six areas and their ratings: the first thing the tab says.
-fn report_card(strategy: &Strategy, review: &Review) -> El {
-    let sealed = sealed(strategy, review);
+/// Which report this is (public or sealed) and when it was made: the tab's
+/// first line.
+fn report_line(strategy: &Strategy, review: &Review) -> El {
+    el("div")
+        .class("ag-found__top")
+        .child(el("p").class("sh-label").text(if sealed(strategy, review) {
+            "AI review · sealed report"
+        } else {
+            "AI review · public report"
+        }))
+        .child(
+            el("p")
+                .class("ag-found__when")
+                .child(icon(Icon::Clock, 16))
+                .text(format!(
+                    "Reviewed {}, before the build",
+                    facts::full_day(review.reviewed)
+                )),
+        )
+}
+
+/// The six areas and their ratings.
+fn report_card(review: &Review) -> El {
     el("section")
         .class("sh-card")
         .class("ag-card")
@@ -279,24 +367,6 @@ fn report_card(strategy: &Strategy, review: &Review) -> El {
         .child(
             el("div")
                 .class("ag-report-card__head")
-                .child(
-                    el("div")
-                        .class("ag-found__top")
-                        .child(el("p").class("sh-label").text(if sealed {
-                            "AI review · sealed report"
-                        } else {
-                            "AI review · public report"
-                        }))
-                        .child(
-                            el("p")
-                                .class("ag-found__when")
-                                .child(icon(Icon::Clock, 16))
-                                .text(format!(
-                                    "Reviewed {}, before the build",
-                                    facts::full_day(review.reviewed)
-                                )),
-                        ),
-                )
                 .child(
                     el("div")
                         .class("ag-card__head")
@@ -511,19 +581,21 @@ fn areas(strategy: &Strategy, review: &Review) -> El {
                                                 el("p")
                                                     .class("ag-finding__where")
                                                     .child(match held {
-                                                        Some(file) => crate::web::app_link(
-                                                            format!(
+                                                        Some(file) => {
+                                                            crate::web::app_link(format!(
                                                                 "/agents/{}/source#{}",
                                                                 strategy.slug,
                                                                 super::source::file_id(file)
-                                                            ),
-                                                        )
-                                                        .class("ag-finding__file")
-                                                        .attr(
-                                                            "aria-label",
-                                                            format!("Open {file} in the source"),
-                                                        )
-                                                        .child(code),
+                                                            ))
+                                                            .class("ag-finding__file")
+                                                            // Named by what it shows, then where it goes.
+                                                            .child(code)
+                                                            .child(
+                                                                el("span").class("sh-vh").text(
+                                                                    ", open it in the source",
+                                                                ),
+                                                            )
+                                                        }
                                                         None => code,
                                                     })
                                                     .into()
@@ -666,7 +738,14 @@ fn about(strategy: &Strategy) -> View {
                 .child(row("Prompt", parts::chip(&review.prompt_hash, "prompt hash").into()))
                 .child(row("Reviewed", text(facts::full_day(review.reviewed))))
                 .child(row("Source it read", parts::chip(&strategy.bundle.source_hash, "source hash").into()))
-                .child(row("Report hash", parts::chip(&review.report_hash, "report hash").into())),
+                .child(row("Report hash", parts::chip(&review.report_hash, "report hash").into()))
+                .child(View::from(review.recorded_tx.as_ref().map(|tx| {
+                    row(
+                        "Recorded in",
+                        parts::tx_link_said(strategy.vault.chain, tx, "Report recorded in transaction", "tx ").into(),
+                    )
+                    .into()
+                }))),
         )
         .child(el("p").class("ag-note").text(
             "The chain ties this report to the source it read, and that source to the build now trading.",
@@ -761,6 +840,72 @@ mod tests {
             .findings
             .push(finding(Area::Security, Severity::Note, "A note"));
         assert!(!page(&quiet).contains("Its findings include"));
+    }
+
+    #[test]
+    fn the_tally_counts_each_rating_across_the_six_areas_and_names_the_areas_with_concerns() {
+        let mut strategy = reviewed();
+        let review = strategy.review.as_mut().expect("a review");
+        review.ratings[Area::Reliability.index()] = Rating::SomeConcerns;
+        let html = View::from(tally(strategy.review.as_ref().expect("a review"))).html();
+        let cell = |word: &str| {
+            let at = html.find(word).unwrap_or_else(|| panic!("{word}: {html}"));
+            let end = html[at..].find("</dd>").expect("the cell's end") + at;
+            html[at..end].to_string()
+        };
+        assert!(
+            cell("Looks fine").ends_with("<strong>5</strong> of 6 areas"),
+            "{html}"
+        );
+        assert!(
+            cell("Some concerns").ends_with("<strong>1</strong> Reliability"),
+            "{html}"
+        );
+        assert!(
+            cell("Serious concerns").ends_with("<strong>0</strong>"),
+            "{html}"
+        );
+        assert!(
+            cell(crate::model::rating_word(Rating::CouldntTell)).ends_with("<strong>0</strong>"),
+            "{html}"
+        );
+        assert!(html.contains("ag-counts__tile--some"), "{html}");
+        assert_eq!(html.matches("ag-counts__tile--none").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn the_report_names_the_transaction_that_recorded_it_on_the_vault_chains_explorer() {
+        let tx = format!("0x8a7e{}f301", "0".repeat(56));
+        let mut strategy = reviewed();
+        // Unknown: no row, never a made-up one.
+        let none = about(&strategy).html();
+        assert!(!none.contains("Recorded in"), "{none}");
+        assert!(
+            !super::side::facts_hashes(&strategy)
+                .iter()
+                .any(|(label, _)| *label == "Report recorded in")
+        );
+        strategy.review.as_mut().expect("a review").recorded_tx = Some(tx.clone());
+        crate::store::get()
+            .chains
+            .set(vec![crate::store::ChainRead {
+                chain: strategy.vault.chain,
+                key: "evm:84532".to_string(),
+                block: 1,
+                as_of: None,
+            }]);
+        let html = about(&strategy).html();
+        let row = &html[html.find(">Recorded in<").expect("the row")..];
+        assert!(
+            row.contains(&format!("href=\"https://sepolia.basescan.org/tx/{tx}\"")),
+            "{row}"
+        );
+        assert!(row.contains(">tx 0x8a7e…f301<"), "{row}");
+        assert!(row.contains("(opens the block explorer)"), "{row}");
+        assert!(
+            super::side::facts_hashes(&strategy).contains(&("Report recorded in", tx.clone())),
+            "the verify page's hashes carry it too"
+        );
     }
 
     #[test]

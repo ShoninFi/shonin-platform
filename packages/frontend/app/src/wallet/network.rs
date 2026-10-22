@@ -63,12 +63,7 @@ impl Network {
             .usd
             .parse()
             .map_err(|_| Unusable::Malformed("the dollar's address"))?;
-        let dev_account = config
-            .dev
-            .as_ref()
-            .map(|dev| dev.address.parse())
-            .transpose()
-            .map_err(|_| Unusable::Malformed("the development account"))?;
+        let dev_account = development_account(config, dev::DEV_WALLET)?;
         Ok(Self {
             chain: config.chain.chain,
             chain_id,
@@ -86,6 +81,20 @@ impl Network {
     pub fn coin(&self) -> &'static str {
         networks::coin(self.chain_id).symbol
     }
+}
+
+/// The development account a config names, if this build offers the
+/// development wallet (`offered`); a build that doesn't never takes it up.
+fn development_account(config: &Config, offered: bool) -> Result<Option<Address>, Unusable> {
+    if !offered {
+        return Ok(None);
+    }
+    config
+        .dev
+        .as_ref()
+        .map(|dev| dev.address.parse())
+        .transpose()
+        .map_err(|_| Unusable::Malformed("the development account"))
 }
 
 #[cfg(test)]
@@ -130,6 +139,27 @@ mod tests {
         assert_eq!(network.asset_decimals, 6);
         assert_eq!(network.dev_account, None);
         assert_eq!(network.coin(), "ETH");
+    }
+
+    #[test]
+    fn a_build_without_the_development_features_never_offers_the_development_wallet() {
+        let mut named = config("https://sepolia.base.org");
+        named.dev = serde_json::from_value(serde_json::json!({
+            "address": format!("0x{}", "f3".repeat(20)),
+            "label": "Development account",
+        }))
+        .unwrap();
+        assert_eq!(
+            development_account(&named, true).unwrap(),
+            Some(Address::repeat_byte(0xf3))
+        );
+        assert_eq!(development_account(&named, false).unwrap(), None);
+        // The crate's tests stand in for a development build; a release
+        // build turns neither feature on.
+        assert_eq!(
+            dev::DEV_WALLET,
+            cfg!(any(test, feature = "dev", feature = "dev-wallet"))
+        );
     }
 
     #[test]
