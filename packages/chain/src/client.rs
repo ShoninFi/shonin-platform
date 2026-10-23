@@ -2630,8 +2630,16 @@ impl Client {
     /// behind, the window is asked again a few times
     /// ([`LOGS_BEHIND_TRIES`]), a second and a half apart, and then the read
     /// fails. A window an endpoint refuses as too wide is read there in
-    /// halves (and those in halves, as far as one block). A filter with no
-    /// numbered range is asked once, through the failover.
+    /// halves (and those in halves, as far as one block). A refusal whose
+    /// words may mean the range is too wide or that the endpoint can't serve
+    /// a block of it (an invalid range, a time-out) is first checked by
+    /// asking for the range's first block alone: refused too, the endpoint
+    /// can't serve it and is passed over, never counted as having answered
+    /// and nothing learned of its width; answered, the range is read in
+    /// halves, a time-out's for that read alone. While another endpoint
+    /// limits the rate, one passed over for a block it can't serve, or one
+    /// out of reach, does not keep the read from waiting it out. A filter
+    /// with no numbered range is asked once, through the failover.
     ///
     /// Behind one endpoint's name several nodes may answer, and its head
     /// and its logs may come from different ones: the check is exact per
@@ -3700,6 +3708,11 @@ enum Passed {
     Limited(anyhow::Error, Option<Duration>),
     /// It refused the range as too wide, and was not to read it in parts.
     TooWide(anyhow::Error),
+    /// It can't serve a block of the window, however narrow the read: it
+    /// no longer keeps that block's logs. Another endpoint may.
+    Unkept(anyhow::Error),
+    /// It could not be reached.
+    Unreached(anyhow::Error),
     /// Anything else.
     Over(anyhow::Error),
 }
@@ -3753,6 +3766,10 @@ async fn end_hash(endpoint: &DynProvider, number: u64) -> Result<B256> {
 /// instead halved at the first endpoint to refuse it, an endpoint that
 /// takes a hundred blocks would read a window another takes whole in
 /// dozens of queries, every window, for as long as it answered first.
+///
+/// An endpoint that can't serve a block of the window, or can't be reached,
+/// passes it on without cutting short a wait for one that limited the rate
+/// ([`Passed::Unkept`], [`Passed::Unreached`]).
 async fn read_window(
     endpoints: &Endpoints,
     heads: &Heads,
@@ -3792,7 +3809,11 @@ async fn read_window(
                         head
                     }
                     Err(error) => {
-                        round.saw(&error);
+                        // One out of reach cuts short no wait for another
+                        // that limited the rate.
+                        if rate_limited(&error) || !error.is_transport_error() {
+                            round.saw(&error);
+                        }
                         last = Some(
                             anyhow::Error::new(error)
                                 .context(format!("the head of log endpoint {}", at + 1)),
@@ -3837,6 +3858,13 @@ async fn read_window(
                     round.retry_after = round.retry_after.max(asked);
                     last = Some(error);
                 }
+                // Not counted against the round: an endpoint that can't
+                // serve the block, or can't be reached, says nothing of
+                // whether the others that limited the rate will answer when
+                // asked again.
+                Err(Passed::Unkept(error) | Passed::Unreached(error)) => {
+                    last = Some(error);
+                }
                 Err(Passed::Over(error)) => {
                     round.other();
                     last = Some(error);
@@ -3866,7 +3894,8 @@ async fn read_window(
 /// `parts`, a range it refuses as too wide is halved, and one it is known to
 /// refuse is not asked for but read in parts as wide as the widest it has
 /// taken; without, a refusal as too wide is [`Passed::TooWide`]. What it
-/// takes and refuses is kept ([`LogWidth`]).
+/// takes and refuses is kept ([`LogWidth`]). A block it refuses alone is
+/// one it can't serve ([`Passed::Unkept`]), and teaches nothing of width.
 async fn read_range(
     endpoint: &Endpoint,
     filter: &Filter,
@@ -3907,8 +3936,38 @@ async fn read_range(
                 // A rate limit, or missing logs, is the endpoint's trouble,
                 // whatever else its words say.
                 let trouble = rate_limited(&error) || text.contains(MISSING_STATE);
-                if !trouble && to > from && refused_as_too_wide(&text) {
-                    endpoint.saw_log_width(to - from + 1, false);
+                let wide = !trouble && refused_as_too_wide(&text);
+                let timed_out = !trouble && gave_up_in_time(&text);
+                let unsure = timed_out || (!trouble && refused_as_invalid_range(&text));
+                // Refused in words that may mean the block or the width:
+                // one block alone can only mean the block, and a wider range
+                // is told apart by asking its first block alone.
+                let unkept = if to == from {
+                    unsure
+                } else if unsure {
+                    match first_block(endpoint, filter, from).await {
+                        Probe::Kept => false,
+                        Probe::Unkept => true,
+                        Probe::Unknown(probe) => {
+                            return Err(passed(probe, from, from, false));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if unkept {
+                    return Err(Passed::Unkept(
+                        anyhow::Error::new(error)
+                            .context(format!("the log endpoint can't serve block {from}")),
+                    ));
+                }
+                if (wide || unsure) && to > from {
+                    // A range given up on in time is halved for this read
+                    // alone: how long it takes depends on how many logs the
+                    // filter matches and on the node's load, not its width.
+                    if !timed_out {
+                        endpoint.saw_log_width(to - from + 1, false);
+                    }
                     if !parts {
                         return Err(Passed::TooWide(
                             anyhow::Error::new(error)
@@ -3921,21 +3980,84 @@ async fn read_range(
                     pending.push((from, middle));
                     continue;
                 }
-                let limited = rate_limited(&error);
-                let asked = retry_after(&error);
-                let error = anyhow::Error::new(error)
-                    .context(format!("reading logs from block {from} to {to}"));
-                return Err(if limited {
-                    Passed::Limited(error, asked)
-                } else if !trouble && refused_as_not_there_yet(&text) {
-                    Passed::Behind(error)
-                } else {
-                    Passed::Over(error)
-                });
+                return Err(passed(error, from, to, trouble));
             }
         }
     }
     Ok(found)
+}
+
+/// Why an endpoint's refusal of a log range that is neither too wide nor a
+/// block it can't serve passes the range on; `trouble` when its words are
+/// the endpoint's trouble whatever else they say.
+fn passed(error: alloy::transports::TransportError, from: u64, to: u64, trouble: bool) -> Passed {
+    let text = error.to_string();
+    let limited = rate_limited(&error);
+    let asked = retry_after(&error);
+    let unreached = error.is_transport_error();
+    let error =
+        anyhow::Error::new(error).context(format!("reading logs from block {from} to {to}"));
+    if limited {
+        Passed::Limited(error, asked)
+    } else if !trouble && refused_as_not_there_yet(&text) {
+        Passed::Behind(error)
+    } else if unreached {
+        Passed::Unreached(error)
+    } else {
+        Passed::Over(error)
+    }
+}
+
+/// What asking an endpoint for one block's logs alone showed.
+enum Probe {
+    /// It answered: the wider range was refused for its width.
+    Kept,
+    /// It refused the block alone: it can't serve it.
+    Unkept,
+    /// Neither: it limited the rate, couldn't be reached, or refused in
+    /// other words. Nothing is learned of the block or the width.
+    Unknown(alloy::transports::TransportError),
+}
+
+/// Ask `endpoint` for the logs of block `from` alone, to tell whether a
+/// wider range it refused in words that may mean either was refused for
+/// its width or for that block.
+async fn first_block(endpoint: &Endpoint, filter: &Filter, from: u64) -> Probe {
+    let one = filter.clone().from_block(from).to_block(from);
+    match endpoint.provider.get_logs(&one).await {
+        Ok(_) => {
+            endpoint.saw_log_width(1, true);
+            Probe::Kept
+        }
+        Err(error) => {
+            let text = error.to_string();
+            let trouble = rate_limited(&error) || text.contains(MISSING_STATE);
+            if !trouble && (refused_as_invalid_range(&text) || gave_up_in_time(&text)) {
+                Probe::Unkept
+            } else {
+                Probe::Unknown(error)
+            }
+        }
+    }
+}
+
+/// Whether a provider refused a log range as invalid, which some say of a
+/// range too wide and some of a block whose logs they no longer keep.
+fn refused_as_invalid_range(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("invalid block range")
+        && !refused_as_not_there_yet(&error)
+        && !is_rate_limit(0, &error)
+}
+
+/// Whether a provider gave up on a log range for the time it took, which
+/// may be for its width, for the logs the filter matches there, or for a
+/// block it can't serve.
+fn gave_up_in_time(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("execution aborted (timeout")
+        && !refused_as_not_there_yet(&error)
+        && !is_rate_limit(0, &error)
 }
 
 /// How many times a window no endpoint has reached yet is asked again.
@@ -4326,6 +4448,28 @@ mod tests {
         }
         assert!(!refused_as_too_wide("execution reverted"));
         assert!(!refused_as_not_there_yet("rate limited"));
+    }
+
+    #[test]
+    fn only_words_that_may_mean_a_block_not_kept_are_asked_of_one_block_to_tell() {
+        assert!(refused_as_invalid_range(
+            "error code -32602: invalid block range"
+        ));
+        assert!(gave_up_in_time(
+            "error code -32000: execution aborted (timeout = 10s)"
+        ));
+        for wide in [
+            "error code 35: ranges over 10000 blocks are not supported on free plan",
+            "error code -32600: query exceeds max block range 1000",
+            "block range too large",
+        ] {
+            assert!(refused_as_too_wide(wide), "{wide}");
+            assert!(!refused_as_invalid_range(wide), "{wide}");
+            assert!(!gave_up_in_time(wide), "{wide}");
+        }
+        assert!(!refused_as_invalid_range(
+            "rate limited: invalid block range"
+        ));
     }
 
     #[test]
