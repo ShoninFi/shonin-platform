@@ -20,9 +20,9 @@ use crate::atoms::button::{Button, Kind, Size, on_click};
 use crate::atoms::check::checkbox;
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
-use crate::atoms::segmented::segmented;
+use crate::atoms::segmented::segmented_by;
 use crate::money::format as money;
-use crate::money::quote::ExitPath;
+use crate::money::quote::{ExitPath, ExitQuote};
 use crate::money::{AmountError, Rounding, parse_units};
 use crate::tx::error::{Context, TxError};
 use crate::tx::flow::{Outcome, Prompt, SettledBy, Step};
@@ -41,7 +41,7 @@ pub enum Tab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unit {
+pub(crate) enum Unit {
     Shares,
     Dollars,
 }
@@ -953,12 +953,119 @@ fn form(panel: &Rc<Panel>, tab: Tab, connected: bool, tail: View) -> View {
     }
 }
 
-/// The unit after a withdrawal amount.
-fn unit_word(unit: Unit) -> &'static str {
+/// The unit after a withdrawal amount: shares, or the vault's asset.
+fn unit_word(unit: Unit, symbol: &str) -> String {
     match unit {
-        Unit::Shares => "shares",
-        Unit::Dollars => "USDC",
+        Unit::Shares => "shares".to_string(),
+        Unit::Dollars => symbol.to_string(),
     }
+}
+
+/// What "Max" offers, in the unit the amount is typed in: every share held,
+/// or, typed in dollars, about what they pay at the last exit price.
+pub(crate) fn max_words(
+    held: Option<&Holdings>,
+    figures: Option<&VaultFigures>,
+    in_dollars: bool,
+    decimals: u8,
+) -> String {
+    let Some(held) = held.filter(|held| !held.shares.is_zero()) else {
+        return String::new();
+    };
+    if in_dollars
+        && let Some((quote, _)) = figures.and_then(|figures| figures.exit_quote(held.shares))
+    {
+        return format!(
+            "Max: ≈ {}",
+            money::dollars(quote.payout, decimals, Rounding::Down)
+        );
+    }
+    format!("Max: {} shares", money::shares(held.shares, Rounding::Down))
+}
+
+/// A typed withdrawal amount moved to the other unit with its value, not
+/// its digits: dollars become the fewest shares that pay them, shares
+/// become what they pay rounded down to the cent. What can't be read or
+/// priced is cleared rather than carried over as a number in the new unit.
+pub(crate) fn amount_in_other_unit(
+    text: &str,
+    to_dollars: bool,
+    figures: Option<&VaultFigures>,
+    decimals: u8,
+) -> String {
+    let converted = if to_dollars {
+        parse_units(text, 18).ok().and_then(|shares| {
+            if shares.is_zero() {
+                return None;
+            }
+            let (quote, _) = figures?.exit_quote(shares)?;
+            Some(money::plain(quote.payout, decimals))
+        })
+    } else {
+        parse_units(text, decimals).ok().and_then(|dollars| {
+            if dollars.is_zero() {
+                return None;
+            }
+            Some(money::plain_exact(figures?.shares_for(dollars)?, 18))
+        })
+    };
+    converted.unwrap_or_default()
+}
+
+/// The summary's "Shares sent": every digit of the shares the request is
+/// for, whatever the button rounds to.
+pub(crate) fn shares_sent(shares: Option<U256>) -> String {
+    shares.map_or_else(|| "—".to_string(), money::shares_exact)
+}
+
+/// The smallest share amount the withdraw button shows exactly: a millionth.
+const SHOWN_SHARE_STEP: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
+
+/// The withdraw button's words: the amount as typed, in its unit. Dollars
+/// read as the payout the summary shows. Shares read exactly up to six
+/// decimals, and past that rounded down to six with "≈", so the button fits
+/// on a phone; the summary's "Shares sent" row has every digit.
+pub(crate) fn withdraw_label(
+    shares: Option<U256>,
+    quote: Option<&ExitQuote>,
+    in_dollars: bool,
+    booked: bool,
+    decimals: u8,
+) -> String {
+    let Some(shares) = shares else {
+        return "Withdraw".to_string();
+    };
+    let amount = match quote {
+        Some(quote) if in_dollars => exit_summary(quote, decimals).2,
+        _ if (shares % SHOWN_SHARE_STEP).is_zero() => {
+            format!("{} shares", money::shares_exact(shares))
+        }
+        _ => format!(
+            "≈ {} shares",
+            crate::money::format_units(shares, 18, 6, Rounding::Down)
+        ),
+    };
+    if booked {
+        format!("Book a withdrawal of {amount}")
+    } else {
+        format!("Withdraw {amount}")
+    }
+}
+
+/// A withdrawal's summary as shown: what the shares are valued at, the fee,
+/// and what is paid, each to the cent. The payout is rounded down, never
+/// promising more than is paid; the fee up, never hiding one that is
+/// charged; and the value shown is their sum, so the three agree as read.
+/// The money is the quote's.
+pub(crate) fn exit_summary(quote: &ExitQuote, decimals: u8) -> (String, String, String) {
+    let payout = crate::money::units::rounded(quote.payout, decimals, 2, Rounding::Down);
+    let fee = crate::money::units::rounded(quote.fee, decimals, 2, Rounding::Up);
+    let gross = payout.saturating_add(fee);
+    (
+        format!("≈ {}", money::dollars(gross, decimals, Rounding::Down)),
+        money::minus_dollars(fee, decimals, Rounding::Down),
+        format!("≈ {}", money::dollars(payout, decimals, Rounding::Down)),
+    )
 }
 
 /// The "$" in front of a money amount; a share count has none.
@@ -1392,29 +1499,32 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     });
     let max_line = {
         let panel = panel.clone();
-        panel.holdings.signal_cloned().map(move |held| match held {
-            Some(held) if connected && !held.shares.is_zero() => {
-                format!("Max: {} shares", money::shares(held.shares, Rounding::Down))
+        map_ref! {
+            let held = panel.holdings.signal_cloned(),
+            let figures = panel.figures.signal_cloned(),
+            let unit = panel.unit.signal() =>
+            if connected {
+                max_words(held.as_ref(), figures.as_ref(), *unit == Unit::Dollars, decimals)
+            } else {
+                String::new()
             }
-            _ => String::new(),
-        })
+        }
     };
-    let gross = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => format!(
-            "≈ {}",
-            money::dollars(quote.gross, decimals, Rounding::Nearest)
-        ),
+    let summary = quote
+        .signal_cloned()
+        .map(move |quote| quote.map(|(quote, ..)| exit_summary(&quote, decimals)))
+        .broadcast();
+    let sent = check.signal_cloned().map(|(_, shares)| shares_sent(shares));
+    let gross = summary.signal_cloned().map(|shown| match shown {
+        Some((gross, ..)) => gross,
         None => "—".to_string(),
     });
-    let fee = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => money::minus_dollars(quote.fee, decimals, Rounding::Up),
+    let fee = summary.signal_cloned().map(|shown| match shown {
+        Some((_, fee, _)) => fee,
         None => "—".to_string(),
     });
-    let payout = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => format!(
-            "≈ {}",
-            money::dollars(quote.payout, decimals, Rounding::Nearest)
-        ),
+    let payout = summary.signal_cloned().map(|shown| match shown {
+        Some((.., payout)) => payout,
         None => "—".to_string(),
     });
     let max = {
@@ -1434,12 +1544,15 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let label = {
         map_ref! {
             let quote = quote.signal_cloned(),
-            let (_, shares) = check.signal_cloned() =>
-            match (quote, shares) {
-                (Some((_, ExitPath::Booked, _, false)), _) => "Book withdrawal".to_string(),
-                (_, Some(shares)) => format!("Withdraw {} shares", whole_shares(*shares)),
-                _ => "Withdraw".to_string(),
-            }
+            let (_, shares) = check.signal_cloned(),
+            let unit = panel.unit.signal() =>
+            withdraw_label(
+                *shares,
+                quote.as_ref().map(|(quote, ..)| quote),
+                *unit == Unit::Dollars,
+                matches!(quote, Some((_, ExitPath::Booked, _, false))),
+                decimals,
+            )
         }
     };
     let submit = {
@@ -1458,16 +1571,10 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
             )
             .hook(move |dom| {
                 dom.event(move |_: dominator::events::Click| {
-                    let (verdict, shares) = withdraw_check(
-                        &panel,
-                        &panel.withdraw_text.get_cloned(),
-                        panel.unit.get(),
-                        true,
-                    );
                     // Figured with the network the panel reads with now;
                     // the flow signs with that one or not at all.
-                    if let (Check::Ready, Some(shares), Some(reviewed)) =
-                        (verdict, shares, panel.network.get_cloned())
+                    if let (Some(shares), Some(reviewed)) =
+                        (withdraw_to_send(&panel), panel.network.get_cloned())
                     {
                         start(&panel, Action::Withdraw(shares), reviewed);
                     }
@@ -1499,17 +1606,27 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                                         .attr("for", field_id("sh-withdraw-amount", panel.in_sheet))
                                         .text("Amount"),
                                 )
-                                .child(segmented(
+                                .child(segmented_by(
                                     "Amount in",
-                                    &[(Unit::Shares, "Shares"), (Unit::Dollars, "USDC")],
+                                    &[
+                                        (Unit::Shares, "Shares".to_string()),
+                                        (Unit::Dollars, symbol(panel)),
+                                    ],
                                     &panel.unit,
+                                    {
+                                        let panel = panel.clone();
+                                        move |unit| switch_unit(&panel, unit)
+                                    },
                                 )),
                         )
                         .child(amount_input(
                             field_id("sh-withdraw-amount", panel.in_sheet),
                             &panel.withdraw_text,
                             el("span")
-                                .text_from(&panel.unit, |unit| unit_word(*unit).to_string())
+                                .text_from(&panel.unit, {
+                                    let symbol = symbol(panel);
+                                    move |unit| unit_word(*unit, &symbol)
+                                })
                                 .into(),
                             (
                                 panel.unit.get() == Unit::Dollars,
@@ -1542,11 +1659,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                     // request, no exit price, no fee.
                     el("dl")
                         .class("sh-exit__rows sh-exit__preview")
+                        .child(row("Shares sent", None, sent))
                         .child(row("Your share of the cash", None, gross))
                         .child(row("You get", None, payout).class("sh-exit__row--total"))
                 } else {
                     el("dl")
                         .class("sh-exit__rows sh-exit__preview")
+                        .child(row("Shares sent", None, sent))
                         .child(row(
                             "Valued at exit-side marks",
                             Some("what the positions would actually sell for"),
@@ -1575,13 +1694,50 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
         .into()
 }
 
-/// Shares as a button names them: 2,000 or 2,000.5.
-pub(crate) fn whole_shares(shares: U256) -> String {
-    let shown = money::shares(shares, Rounding::Down);
-    shown
-        .strip_suffix(".0")
-        .map(str::to_string)
-        .unwrap_or(shown)
+/// The amount box (`text` in `unit`) moved to `to`, keeping what was typed
+/// worth the same: the text and the unit change in one step.
+pub(crate) fn switch_amount_unit(
+    text: &Mutable<String>,
+    unit: &Mutable<Unit>,
+    to: Unit,
+    figures: Option<&VaultFigures>,
+    decimals: u8,
+) {
+    if unit.get() == to {
+        return;
+    }
+    text.set(amount_in_other_unit(
+        &text.get_cloned(),
+        to == Unit::Dollars,
+        figures,
+        decimals,
+    ));
+    unit.set(to);
+}
+
+/// The withdraw box moved to `unit`, keeping what was typed worth the same.
+fn switch_unit(panel: &Panel, unit: Unit) {
+    switch_amount_unit(
+        &panel.withdraw_text,
+        &panel.unit,
+        unit,
+        panel.figures.lock_ref().as_ref(),
+        decimals(panel),
+    );
+}
+
+/// The shares the withdraw button sends now: what the box says, in its
+/// unit, read at the click; none unless the amount is ready.
+fn withdraw_to_send(panel: &Panel) -> Option<U256> {
+    match withdraw_check(
+        panel,
+        &panel.withdraw_text.get_cloned(),
+        panel.unit.get(),
+        true,
+    ) {
+        (Check::Ready, shares) => shares,
+        _ => None,
+    }
 }
 
 // Review ------------------------------------------------------------------------
@@ -2112,7 +2268,7 @@ fn prompt_lines(
             format!("Approve the withdrawal in {wallet}"),
             format!(
                 "{wallet} shows a request to withdraw {} shares from the {vault} vault. Nothing is sent until you approve.",
-                money::shares(*shares, Rounding::Down)
+                money::shares_exact(*shares)
             ),
         ),
         Prompt::Finish => (
@@ -2712,6 +2868,44 @@ pub fn done_states() -> Vec<(String, View)> {
     .collect()
 }
 
+/// A vault last priced at a little under a dollar a share, with a 0.1%
+/// transaction fee: what both panels' withdrawal tests quote with.
+#[cfg(test)]
+pub(crate) fn priced_figures() -> VaultFigures {
+    VaultFigures {
+        state: State::Open,
+        fees: crate::money::quote::Fees {
+            transaction_bps: 10,
+            ..Default::default()
+        },
+        timers: Default::default(),
+        cash: U256::from(40_136_634u64),
+        total_supply: U256::from(99_916_321_987_592_513_388u128),
+        minimum_deposit: U256::from(10_000_000u64),
+        last: Some(crate::tx::read::Priced {
+            index: U256::from(3u8),
+            time: 10,
+            valuation: crate::money::quote::Valuation {
+                gross: U256::from(10_001u64),
+                gross_exit: U256::from(10_001u64),
+                supply: U256::from(10_001_632_831_521_168u64),
+                fee: U256::ZERO,
+                fee_exit: U256::ZERO,
+            },
+        }),
+        ready_to_close: false,
+    }
+}
+
+/// An account holding 99.9 shares of that vault.
+#[cfg(test)]
+pub(crate) fn priced_holdings() -> Holdings {
+    Holdings {
+        shares: U256::from(99_906_321_354_760_992_220u128),
+        ..Default::default()
+    }
+}
+
 /// A Base Sepolia network, for the state gallery.
 fn sample_network() -> Network {
     Network {
@@ -3036,9 +3230,216 @@ mod tests {
         field[..end].to_string()
     }
 
-    #[test]
-    fn a_withdrawal_in_shares_shows_no_dollar_sign_and_one_in_usdc_does() {
+    /// A vault whose dollar is USDG, six decimals.
+    fn usdg() -> Network {
+        Network {
+            asset_symbol: "USDG".to_string(),
+            ..network()
+        }
+    }
+
+    /// A vault last priced at a little under a dollar a share, with a 0.1%
+    /// transaction fee, and an account holding 99.9 of its shares.
+    fn priced_panel() -> Rc<Panel> {
         let panel = Rc::new(Panel::new("base-1", Tab::Withdraw, false));
+        panel.network.set(Some(Rc::new(usdg())));
+        panel.figures.set(Some(priced_figures()));
+        panel.holdings.set(Some(priced_holdings()));
+        panel
+    }
+
+    #[test]
+    fn a_dollar_amount_is_sent_as_the_shares_that_pay_it_not_as_shares() {
+        let panel = priced_panel();
+        let fifty_shares = U256::from(50u128 * crate::money::quote::WAD);
+        // "50" in dollars asks for the fewest shares that pay $50 after the fee.
+        let (check, shares) = withdraw_check(&panel, "50", Unit::Dollars, true);
+        assert_eq!(check, Check::Ready);
+        let shares = shares.expect("dollars become shares");
+        assert_eq!(shares, U256::from(50_053_218_008_290_057_593u128));
+        assert_ne!(
+            shares, fifty_shares,
+            "dollars are never sent as a share count"
+        );
+        let figures = panel.figures.get_cloned().unwrap();
+        let (paid, _) = figures.exit_quote(shares).unwrap();
+        assert!(paid.payout >= U256::from(50_000_000u64));
+        let (short, _) = figures.exit_quote(shares - U256::from(1u8)).unwrap();
+        assert!(short.payout < U256::from(50_000_000u64));
+        // Only the box in shares sends the number as typed.
+        let (_, as_shares) = withdraw_check(&panel, "50", Unit::Shares, true);
+        assert_eq!(as_shares, Some(fifty_shares));
+        // What the click sends is read from the box as it is at that moment.
+        panel.withdraw_text.set("50".to_string());
+        panel.unit.set(Unit::Dollars);
+        assert_eq!(withdraw_to_send(&panel), Some(shares));
+        panel.unit.set(Unit::Shares);
+        assert_eq!(withdraw_to_send(&panel), Some(fifty_shares));
+        // More than is held sends nothing.
+        panel.withdraw_text.set("500".to_string());
+        assert_eq!(withdraw_to_send(&panel), None);
+    }
+
+    #[test]
+    fn the_wallet_prompt_names_the_exact_shares_sent() {
+        let shares = U256::from(50_053_218_008_290_057_593u128);
+        let (_, line) = prompt_words(
+            &Prompt::Withdraw { shares },
+            "the development wallet",
+            "Funding basis",
+            "USDG",
+            6,
+        );
+        let sent = shares_sent(Some(shares));
+        assert!(line.contains(&format!("withdraw {sent} shares")), "{line}");
+    }
+
+    #[test]
+    fn switching_the_unit_keeps_the_amount_not_the_digits() {
+        let panel = priced_panel();
+        panel.unit.set(Unit::Dollars);
+        panel.withdraw_text.set("50".to_string());
+        let (_, meant) = withdraw_check(&panel, "50", Unit::Dollars, true);
+        switch_unit(&panel, Unit::Shares);
+        assert_eq!(panel.unit.get(), Unit::Shares);
+        assert_eq!(panel.withdraw_text.get_cloned(), "50.053218008290057593");
+        let (_, kept) = withdraw_check(
+            &panel,
+            &panel.withdraw_text.get_cloned(),
+            Unit::Shares,
+            true,
+        );
+        assert_eq!(kept, meant, "the same shares go out after the switch");
+        // Back to dollars: what those shares pay, to the cent below.
+        switch_unit(&panel, Unit::Dollars);
+        assert_eq!(panel.withdraw_text.get_cloned(), "50.00");
+        // Picking the unit already shown changes nothing.
+        switch_unit(&panel, Unit::Dollars);
+        assert_eq!(panel.withdraw_text.get_cloned(), "50.00");
+        // What can't be read or priced is cleared, never carried over.
+        panel.withdraw_text.set("5O".to_string());
+        switch_unit(&panel, Unit::Shares);
+        assert_eq!(panel.withdraw_text.get_cloned(), "");
+        let unpriced = Panel::new("base-1", Tab::Withdraw, false);
+        unpriced.withdraw_text.set("50".to_string());
+        switch_unit(&unpriced, Unit::Dollars);
+        assert_eq!(unpriced.unit.get(), Unit::Dollars);
+        assert_eq!(unpriced.withdraw_text.get_cloned(), "");
+    }
+
+    #[test]
+    fn the_withdraw_button_names_the_amount_in_the_unit_typed() {
+        let panel = priced_panel();
+        let figures = panel.figures.get_cloned().unwrap();
+        let typed = U256::from(50_053_218_008_290_057_593u128);
+        let (quote, _) = figures.exit_quote(typed).unwrap();
+        assert_eq!(
+            withdraw_label(Some(typed), Some(&quote), true, false, 6),
+            "Withdraw ≈ $50.00"
+        );
+        // Past six decimals the button rounds down, and says so.
+        assert_eq!(
+            withdraw_label(Some(typed), Some(&quote), false, false, 6),
+            "Withdraw ≈ 50.053218 shares"
+        );
+        let short = U256::from(50_053_200_000_000_000_000u128);
+        assert_eq!(
+            withdraw_label(Some(short), None, false, false, 6),
+            "Withdraw 50.0532 shares"
+        );
+        let fifty = U256::from(50u128 * crate::money::quote::WAD);
+        let (whole, _) = figures.exit_quote(fifty).unwrap();
+        assert_eq!(
+            withdraw_label(Some(fifty), Some(&whole), false, false, 6),
+            "Withdraw 50 shares"
+        );
+        // A wei past a whole number reads as about it on the button, and
+        // exactly in the summary's "Shares sent".
+        let over = fifty + U256::from(1u8);
+        assert_eq!(
+            withdraw_label(Some(over), None, false, false, 6),
+            "Withdraw ≈ 50.000000 shares"
+        );
+        assert_eq!(shares_sent(Some(fifty)), "50");
+        assert_eq!(shares_sent(Some(over)), "50.000000000000000001");
+        assert_ne!(shares_sent(Some(fifty)), shares_sent(Some(over)));
+        assert_eq!(shares_sent(Some(typed)), "50.053218008290057593");
+        assert_eq!(shares_sent(None), "—");
+        assert_eq!(
+            withdraw_label(Some(typed), Some(&quote), true, true, 6),
+            "Book a withdrawal of ≈ $50.00"
+        );
+        assert_eq!(withdraw_label(None, None, true, false, 6), "Withdraw");
+    }
+
+    #[test]
+    fn the_summary_rounds_the_payout_down_and_the_fee_up_and_shows_their_sum() {
+        let figures = priced_figures();
+        let quote_for = |dollars: u64| {
+            let shares = figures.shares_for(U256::from(dollars * 1_000_000)).unwrap();
+            figures.exit_quote(shares).unwrap().0
+        };
+        let fifty = quote_for(50);
+        assert_eq!(fifty.fee, U256::from(50_051u64));
+        let (gross, fee, payout) = exit_summary(&fifty, 6);
+        assert_eq!(payout, "≈ $50.00");
+        assert_eq!(fee, format!("{}$0.06", money::MINUS));
+        assert_eq!(gross, "≈ $50.06");
+        // A fee under half a cent still shows, as a cent.
+        let three = quote_for(3);
+        assert!(!three.fee.is_zero() && three.fee < U256::from(5_000u64));
+        let (gross, fee, payout) = exit_summary(&three, 6);
+        assert_eq!(payout, "≈ $3.00");
+        assert_eq!(fee, format!("{}$0.01", money::MINUS));
+        assert_eq!(gross, "≈ $3.01");
+        // The button's dollars are the summary's payout.
+        assert_eq!(
+            withdraw_label(Some(three.shares), Some(&three), true, false, 6),
+            format!("Withdraw {payout}")
+        );
+        // A payout a fraction of a cent under is never rounded up.
+        let over = ExitQuote {
+            payout: U256::from(2_999_999u64),
+            ..three
+        };
+        assert_eq!(exit_summary(&over, 6).2, "≈ $2.99");
+        // No fee shows none, and the value is the payout.
+        let closed = ExitQuote {
+            fee: U256::ZERO,
+            payout: fifty.gross,
+            ..fifty
+        };
+        let (gross, fee, payout) = exit_summary(&closed, 6);
+        assert_eq!((gross.as_str(), fee.as_str()), ("≈ $50.05", "$0.00"));
+        assert_eq!(payout, "≈ $50.05");
+    }
+
+    #[test]
+    fn the_max_line_reads_in_the_unit_the_amount_is_typed_in() {
+        let panel = priced_panel();
+        let held = panel.holdings.get_cloned();
+        let figures = panel.figures.get_cloned();
+        assert_eq!(
+            max_words(held.as_ref(), figures.as_ref(), false, 6),
+            "Max: 99.9 shares"
+        );
+        let payout = figures
+            .as_ref()
+            .and_then(|figures| figures.exit_quote(held.unwrap().shares))
+            .map(|(quote, _)| quote.payout)
+            .unwrap();
+        assert_eq!(
+            max_words(held.as_ref(), figures.as_ref(), true, 6),
+            format!("Max: ≈ {}", money::dollars(payout, 6, Rounding::Down))
+        );
+        assert!(!max_words(held.as_ref(), figures.as_ref(), true, 6).contains("shares"));
+        assert_eq!(max_words(None, figures.as_ref(), true, 6), "");
+    }
+
+    #[test]
+    fn a_withdrawal_in_shares_shows_no_dollar_sign_and_one_in_dollars_names_the_vaults_asset() {
+        let panel = Rc::new(Panel::new("base-1", Tab::Withdraw, false));
+        panel.network.set(Some(Rc::new(usdg())));
         panel.unit.set(Unit::Shares);
         let shares = withdraw_field(&panel);
         assert!(
@@ -3052,7 +3453,16 @@ mod tests {
             dollars.contains('$'),
             "a dollar amount keeps its $: {dollars}"
         );
-        assert!(dollars.contains(">USDC<"), "the unit is USDC: {dollars}");
+        assert!(
+            dollars.contains(">USDG<"),
+            "the unit is the vault's asset: {dollars}"
+        );
+        let html = withdraw_form(&panel, false, View::Empty).html();
+        assert!(
+            html.contains(">USDG</button>"),
+            "the switch names USDG: {html}"
+        );
+        assert!(!html.contains("USDC"), "no other dollar is named: {html}");
     }
 
     #[test]

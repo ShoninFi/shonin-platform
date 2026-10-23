@@ -123,6 +123,18 @@ pub fn format_exact(value: U256, decimals: u8, places: u8) -> String {
     }
 }
 
+/// The value as `format_units` shows it, back in base units: 1234567 with
+/// six decimals to two places is 1230000 rounded down, 1240000 up. Figures
+/// shown side by side can then be added and taken away as read.
+pub fn rounded(value: U256, decimals: u8, places: u8, rounding: Rounding) -> U256 {
+    let places = places.min(decimals);
+    let (whole, fraction) = split(value, decimals, places, rounding);
+    whole
+        .saturating_mul(pow10(places))
+        .saturating_add(fraction)
+        .saturating_mul(pow10(decimals - places))
+}
+
 /// The whole part and `places` digits of fraction, rounded as asked.
 fn split(value: U256, decimals: u8, places: u8, rounding: Rounding) -> (U256, U256) {
     let places = places.min(decimals);
@@ -235,6 +247,29 @@ mod tests {
         assert_eq!(
             units("9007199254.740993"),
             U256::from(9_007_199_254_740_993u64)
+        );
+    }
+
+    #[test]
+    fn a_rounded_value_is_the_figure_shown_in_base_units() {
+        let value = U256::from(1_234_567u64);
+        assert_eq!(
+            rounded(value, 6, 2, Rounding::Down),
+            U256::from(1_230_000u64)
+        );
+        assert_eq!(rounded(value, 6, 2, Rounding::Up), U256::from(1_240_000u64));
+        assert_eq!(
+            rounded(value, 6, 2, Rounding::Nearest),
+            U256::from(1_230_000u64)
+        );
+        assert_eq!(
+            rounded(U256::from(1_995_000u64), 6, 2, Rounding::Nearest),
+            U256::from(2_000_000u64)
+        );
+        // A token with fewer decimals than places is already exact.
+        assert_eq!(
+            rounded(U256::from(7u8), 1, 2, Rounding::Up),
+            U256::from(7u8)
         );
     }
 

@@ -19,10 +19,11 @@ use crate::atoms::button::{Button, Kind, Size, on_click};
 use crate::atoms::check::checkbox;
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
-use crate::atoms::segmented::segmented;
+use crate::atoms::segmented::segmented_by;
 use crate::components::exit::{
-    Check, Shown, Statement, Tab, TabClick, amount_input, held_sentence, hint, placeholder,
-    review_ready, row, row_dyn, seal, statement_notice, tab_bar, tab_click, utc, whole_shares,
+    Check, Shown, Statement, Tab, TabClick, Unit, amount_input, exit_summary, held_sentence, hint,
+    max_words, placeholder, review_ready, row, row_dyn, seal, shares_sent, statement_notice,
+    switch_amount_unit, tab_bar, tab_click, utc, withdraw_label,
 };
 use crate::components::wallet::{hex_ring, open_connect};
 use crate::money::format as money;
@@ -37,12 +38,6 @@ use crate::tx::solana::{SolError, author::AuthorPrompt};
 use crate::view::{El, View, el, text};
 use crate::wallet::config_cache::ConfigId;
 use crate::wallet::solana::{SolConnection, SolNetwork};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unit {
-    Shares,
-    Dollars,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -637,6 +632,32 @@ fn deposit_check(panel: &Panel, text: &str, connected: bool) -> (Check, Option<U
     (Check::Ready, Some(amount))
 }
 
+/// The withdraw box moved to `unit`, keeping what was typed worth the same.
+fn switch_unit(panel: &Panel, unit: Unit) {
+    switch_amount_unit(
+        &panel.withdraw_text,
+        &panel.unit,
+        unit,
+        panel.figures.lock_ref().as_ref(),
+        decimals(panel),
+    );
+}
+
+/// The shares the withdraw button sends now: what the box says, in its
+/// unit, read at the click; none unless the amount is ready and fits the
+/// program's count.
+fn withdraw_to_send(panel: &Panel) -> Option<u128> {
+    match withdraw_check(
+        panel,
+        &panel.withdraw_text.get_cloned(),
+        panel.unit.get(),
+        true,
+    ) {
+        (Check::Ready, Some(shares)) => u128::try_from(shares).ok(),
+        _ => None,
+    }
+}
+
 fn withdraw_check(panel: &Panel, text: &str, unit: Unit, connected: bool) -> (Check, Option<U256>) {
     let decimals = decimals(panel);
     let figures = panel.figures.lock_ref();
@@ -979,28 +1000,31 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
             .into(),
         })
     });
-    let max_line = panel.holdings.signal_cloned().map(move |held| match held {
-        Some(held) if connected && !held.shares.is_zero() => {
-            format!("Max: {} shares", money::shares(held.shares, Rounding::Down))
+    let max_line = map_ref! {
+        let held = panel.holdings.signal_cloned(),
+        let figures = panel.figures.signal_cloned(),
+        let unit = panel.unit.signal() =>
+        if connected {
+            max_words(held.as_ref(), figures.as_ref(), *unit == Unit::Dollars, decimals)
+        } else {
+            String::new()
         }
-        _ => String::new(),
-    });
-    let gross = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => format!(
-            "≈ {}",
-            money::dollars(quote.gross, decimals, Rounding::Nearest)
-        ),
+    };
+    let summary = quote
+        .signal_cloned()
+        .map(move |quote| quote.map(|(quote, ..)| exit_summary(&quote, decimals)))
+        .broadcast();
+    let sent = check.signal_cloned().map(|(_, shares)| shares_sent(shares));
+    let gross = summary.signal_cloned().map(|shown| match shown {
+        Some((gross, ..)) => gross,
         None => "—".to_string(),
     });
-    let fee = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => money::minus_dollars(quote.fee, decimals, Rounding::Up),
+    let fee = summary.signal_cloned().map(|shown| match shown {
+        Some((_, fee, _)) => fee,
         None => "—".to_string(),
     });
-    let payout = quote.signal_cloned().map(move |quote| match quote {
-        Some((quote, ..)) => format!(
-            "≈ {}",
-            money::dollars(quote.payout, decimals, Rounding::Nearest)
-        ),
+    let payout = summary.signal_cloned().map(|shown| match shown {
+        Some((.., payout)) => payout,
         None => "—".to_string(),
     });
     let max = {
@@ -1019,12 +1043,15 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     };
     let label = map_ref! {
         let quote = quote.signal_cloned(),
-        let (_, shares) = check.signal_cloned() =>
-        match (quote, shares) {
-            (Some((_, ExitPath::Booked, _, false)), _) => "Book withdrawal".to_string(),
-            (_, Some(shares)) => format!("Withdraw {} shares", whole_shares(*shares)),
-            _ => "Withdraw".to_string(),
-        }
+        let (_, shares) = check.signal_cloned(),
+        let unit = panel.unit.signal() =>
+        withdraw_label(
+            *shares,
+            quote.as_ref().map(|(quote, ..)| quote),
+            *unit == Unit::Dollars,
+            matches!(quote, Some((_, ExitPath::Booked, _, false))),
+            decimals,
+        )
     };
     let submit = {
         let panel = panel.clone();
@@ -1041,17 +1068,10 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
             )
             .hook(move |dom| {
                 dom.event(move |_: dominator::events::Click| {
-                    let (verdict, shares) = withdraw_check(
-                        &panel,
-                        &panel.withdraw_text.get_cloned(),
-                        panel.unit.get(),
-                        true,
-                    );
                     // Figured with the cluster the panel reads with now; the
                     // flow signs with that one or not at all.
-                    if let (Check::Ready, Some(shares), Some(reviewed)) =
-                        (verdict, shares, panel.network.get_cloned())
-                        && let Ok(shares) = u128::try_from(shares)
+                    if let (Some(shares), Some(reviewed)) =
+                        (withdraw_to_send(&panel), panel.network.get_cloned())
                     {
                         start(&panel, SolAction::Withdraw(shares), reviewed);
                     }
@@ -1085,19 +1105,29 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                                         )
                                         .text("Amount"),
                                 )
-                                .child(segmented(
+                                .child(segmented_by(
                                     "Amount in",
-                                    &[(Unit::Shares, "Shares"), (Unit::Dollars, "USDC")],
+                                    &[
+                                        (Unit::Shares, "Shares".to_string()),
+                                        (Unit::Dollars, symbol(panel)),
+                                    ],
                                     &panel.unit,
+                                    {
+                                        let panel = panel.clone();
+                                        move |unit| switch_unit(&panel, unit)
+                                    },
                                 )),
                         )
                         .child(amount_input(
                             crate::components::exit::field_id("sh-withdraw-amount", panel.in_sheet),
                             &panel.withdraw_text,
                             el("span")
-                                .text_from(&panel.unit, |unit| match unit {
-                                    Unit::Shares => "shares".to_string(),
-                                    Unit::Dollars => "USDC".to_string(),
+                                .text_from(&panel.unit, {
+                                    let symbol = symbol(panel);
+                                    move |unit| match unit {
+                                        Unit::Shares => "shares".to_string(),
+                                        Unit::Dollars => symbol.clone(),
+                                    }
                                 })
                                 .into(),
                             (
@@ -1130,11 +1160,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                 .child(if closed {
                     el("dl")
                         .class("sh-exit__rows sh-exit__preview")
+                        .child(row("Shares sent", None, sent))
                         .child(row("Your share of the cash", None, gross))
                         .child(row("You get", None, payout).class("sh-exit__row--total"))
                 } else {
                     el("dl")
                         .class("sh-exit__rows sh-exit__preview")
+                        .child(row("Shares sent", None, sent))
                         .child(row(
                             "Valued at exit-side marks",
                             Some("what the positions would actually sell for"),
@@ -1422,7 +1454,7 @@ fn prompt_lines(
             format!("Approve the withdrawal in {wallet}"),
             format!(
                 "{wallet} shows a request to withdraw {} shares from the {vault} vault. Nothing is sent until you approve.",
-                money::shares(U256::from(*shares), Rounding::Down)
+                money::shares_exact(U256::from(*shares))
             ),
         ),
         Prompt::SettleClaim { .. } => (
@@ -1982,6 +2014,67 @@ mod tests {
             dev_account: None,
             config: ConfigId(alloy_primitives::B256::repeat_byte(config)),
         })
+    }
+
+    /// A panel on a USDG cluster, priced, holding 99.9 shares.
+    fn priced_panel() -> Rc<Panel> {
+        let panel = Rc::new(Panel::new("solana-4", Tab::Withdraw, false));
+        panel.network.set(Some(Rc::new(SolNetwork {
+            asset_symbol: "USDG".to_string(),
+            ..(*cluster(1)).clone()
+        })));
+        panel
+            .figures
+            .set(Some(crate::components::exit::priced_figures()));
+        panel
+            .holdings
+            .set(Some(crate::components::exit::priced_holdings()));
+        panel
+    }
+
+    #[test]
+    fn switching_the_unit_keeps_the_amount_not_the_digits() {
+        let panel = priced_panel();
+        panel.unit.set(Unit::Dollars);
+        panel.withdraw_text.set("50".to_string());
+        let meant = withdraw_to_send(&panel).expect("$50 is ready");
+        assert_eq!(meant, 50_053_218_008_290_057_593u128);
+        switch_unit(&panel, Unit::Shares);
+        assert_eq!(panel.unit.get(), Unit::Shares);
+        assert_eq!(panel.withdraw_text.get_cloned(), "50.053218008290057593");
+        assert_eq!(withdraw_to_send(&panel), Some(meant));
+        switch_unit(&panel, Unit::Dollars);
+        assert_eq!(panel.withdraw_text.get_cloned(), "50.00");
+    }
+
+    #[test]
+    fn the_withdraw_form_names_the_clusters_asset_and_the_shares_sent() {
+        let panel = priced_panel();
+        panel.unit.set(Unit::Dollars);
+        let html = withdraw_form(&panel, false, View::Empty).html();
+        assert!(
+            html.contains(">USDG</button>"),
+            "the switch names USDG: {html}"
+        );
+        assert!(!html.contains("USDC"), "no other dollar is named: {html}");
+        assert!(
+            html.contains("Shares sent"),
+            "the exact shares are stated: {html}"
+        );
+    }
+
+    #[test]
+    fn the_wallet_prompt_names_the_exact_shares_sent() {
+        let shares = 50_053_218_008_290_057_593u128;
+        let (_, line) = prompt_words(
+            &Prompt::Withdraw { shares },
+            "the development wallet",
+            "Funding basis",
+            "USDG",
+            6,
+        );
+        let sent = crate::components::exit::shares_sent(Some(U256::from(shares)));
+        assert!(line.contains(&format!("withdraw {sent} shares")), "{line}");
     }
 
     fn code(text: &str) -> [u8; 32] {
