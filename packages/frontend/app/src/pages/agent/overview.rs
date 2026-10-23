@@ -387,6 +387,17 @@ fn risks(strategy: &Strategy) -> View {
         ),
     ];
     match venues.as_slice() {
+        [] if matches!(holdings(strategy), Holdings::Outside(_)) => items.push((
+            "Where it's held can fail.".into(),
+            if strategy.drivers.is_empty() {
+                "Part of this vault's money is held outside its cash at home. It's only as safe as where it's held.".into()
+            } else {
+                format!(
+                    "Part of this vault's money is held outside its cash at home, through {}. It's only as safe as where it's held.",
+                    names(&strategy.drivers)
+                )
+            },
+        )),
         [] => {}
         [one] => items.push((
             format!("{one} can fail."),
@@ -405,12 +416,7 @@ fn risks(strategy: &Strategy) -> View {
             "A bridge can fail.".into(),
             format!(
                 "Money moves between chains through {}. It's only as safe as the bridge.",
-                join_and(
-                    &bridge_names(strategy)
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                )
+                names(&strategy.bridges)
             ),
         ));
     }
@@ -458,13 +464,97 @@ fn risks(strategy: &Strategy) -> View {
 
 // ---- Where it trades ------------------------------------------------------
 
-/// The bridges by name, as a sentence writes them: Across.
-fn bridge_names(strategy: &Strategy) -> Vec<String> {
-    strategy
-        .bridges
-        .iter()
-        .map(|name| facts::sentence(name))
-        .collect()
+/// Bridges or drivers by name, as a sentence writes them: Across and
+/// Robinhood.
+fn names(list: &[String]) -> String {
+    let named: Vec<String> = list.iter().map(|name| facts::sentence(name)).collect();
+    join_and(&named.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Below half a cent the page's In vault and Cash at home figures agree to
+/// the cent it shows money to, so the vault's value is its cash.
+const SAME_AS_CASH: f64 = 0.005;
+
+/// What can be said about where the vault's money is, with no venue listed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Holdings {
+    /// Never read whole: there are no figures to go on.
+    Unread,
+    /// Read but never valued: its shares have no price to go on.
+    Unvalued,
+    /// Closed: nothing at its stations, so its value is its cash.
+    Closed,
+    /// Its value is its cash, to the cent.
+    OnlyCash,
+    /// This much of In vault is held outside its Cash at home.
+    Outside(f64),
+    /// Its cash is more than its value: the figures disagree, so nothing is
+    /// said about where its money is.
+    Unclear,
+}
+
+/// Where the vault's money is, from the same figures the page shows as In
+/// vault and Cash at home. Within half a cent either way the two agree at the
+/// cent the page shows, so the vault holds only cash; further apart, the
+/// difference is held outside its cash, or the figures disagree (shares are
+/// priced after the fees owed) and nothing is said.
+fn holdings(strategy: &Strategy) -> Holdings {
+    let vault = &strategy.vault;
+    if crate::model::is_unread(strategy) {
+        return Holdings::Unread;
+    }
+    if vault.state == shared::VaultState::Closed {
+        return Holdings::Closed;
+    }
+    if vault.valued_at.is_none() {
+        return Holdings::Unvalued;
+    }
+    let outside = crate::model::in_vault(strategy) - vault.idle;
+    if !outside.is_finite() || outside <= -SAME_AS_CASH {
+        Holdings::Unclear
+    } else if outside < SAME_AS_CASH {
+        Holdings::OnlyCash
+    } else {
+        Holdings::Outside(outside)
+    }
+}
+
+/// With no venue listed: what the vault holds, as far as its figures say.
+fn unlisted_venue(strategy: &Strategy) -> String {
+    let as_of = strategy
+        .stale_as_of
+        .map(|at| format!(" as of {}", facts::full_day(at.date())));
+    match holdings(strategy) {
+        Holdings::Unread => "What the vault holds hasn't been read yet.".to_string(),
+        Holdings::Unvalued => "What the vault holds hasn't been valued yet.".to_string(),
+        Holdings::Closed => "The vault is closed: it holds only cash.".to_string(),
+        Holdings::Unclear => "Where the vault's money is held isn't listed here yet.".to_string(),
+        Holdings::OnlyCash => match (strategy.drivers.is_empty(), as_of) {
+            (true, None) => "No venue yet: the vault holds only cash.".to_string(),
+            (true, Some(as_of)) => format!("No venue yet: the vault held only cash{as_of}."),
+            (false, None) => "The vault holds only cash right now.".to_string(),
+            (false, Some(as_of)) => format!("The vault held only cash{as_of}."),
+        },
+        Holdings::Outside(outside) => {
+            let amount = if outside < 1.0 {
+                format::money(outside)
+            } else {
+                format::money_whole(outside)
+            };
+            let held = match as_of {
+                None => "is held outside its cash at home".to_string(),
+                Some(as_of) => format!("was held outside its cash at home{as_of}"),
+            };
+            let drivers = match strategy.drivers.len() {
+                0 => String::new(),
+                1 => format!(" Its driver: {}.", names(&strategy.drivers)),
+                _ => format!(" Its drivers: {}.", names(&strategy.drivers)),
+            };
+            format!(
+                "About {amount} of the vault {held}; where it is isn't listed here yet.{drivers}"
+            )
+        }
+    }
 }
 
 /// The markets a leg's key may hold, from what the venue says it can do.
@@ -570,15 +660,7 @@ fn where_it_trades(strategy: &Strategy) -> View {
     } else {
         View::Many(vec![
             el("strong")
-                .text(format!(
-                    "Bridges: {}.",
-                    join_and(
-                        &bridge_names(strategy)
-                            .iter()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                    )
-                ))
+                .text(format!("Bridges: {}.", names(&strategy.bridges)))
                 .into(),
             text(" Money only moves between the vault and its own stations."),
         ])
@@ -587,7 +669,7 @@ fn where_it_trades(strategy: &Strategy) -> View {
         .class("ag-o-where")
         .children(strategy.legs.iter().map(|leg| leg_row(leg, &strategy.drivers)))
         .child(View::from(strategy.legs.is_empty().then(|| {
-            el("p").class("ag-muted").text("No venue yet: the vault holds only cash.").into()
+            el("p").class("ag-muted").text(unlisted_venue(strategy)).into()
         })))
         .child(
             el("p")
@@ -939,6 +1021,7 @@ fn recent(strategy: &Strategy) -> View {
 mod tests {
     use super::*;
     use shared::{Finding, Review, Severity};
+    use time::macros::datetime;
 
     fn review() -> Review {
         let snapshot: shared::Snapshot =
@@ -963,6 +1046,172 @@ mod tests {
             file: None,
             line: None,
         }
+    }
+
+    /// A vault with no venue listed, worth `value` with `idle` of it as cash.
+    fn unlisted(value: f64, idle: f64, drivers: &[&str]) -> Strategy {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../../../tests/snapshot.json"))
+                .expect("the fixture decodes");
+        let mut strategy = snapshot
+            .strategies
+            .into_iter()
+            .next()
+            .expect("the fixture has an agent");
+        strategy.legs.clear();
+        strategy.vault.value = value;
+        strategy.vault.shares = value;
+        strategy.vault.share_price = 1.0;
+        strategy.vault.idle = idle;
+        strategy.vault.state = shared::VaultState::Open;
+        strategy.vault.valued_at = Some(datetime!(2026-09-29 14:00));
+        strategy.stale_as_of = None;
+        strategy.drivers = drivers.iter().map(|name| name.to_string()).collect();
+        strategy
+    }
+
+    fn where_line(strategy: &Strategy) -> String {
+        where_it_trades(strategy).html()
+    }
+
+    #[test]
+    fn a_vault_worth_more_than_its_cash_with_no_venue_listed_never_says_it_holds_only_cash() {
+        let strategy = unlisted(50.01, 20.10, &["robinhood"]);
+        let html = where_it_trades(&strategy).html();
+        assert!(!html.contains("only cash"), "{html}");
+        assert!(
+            html.contains(
+                "About $30 of the vault is held outside its cash at home; where it is isn&#39;t listed here yet."
+            ),
+            "{html}"
+        );
+        assert!(html.contains("Its driver: Robinhood."), "{html}");
+    }
+
+    #[test]
+    fn the_amount_held_outside_cash_is_in_vault_less_cash_at_home() {
+        // In vault is the shares at their price, as the record and the cash
+        // gauge show it, not the recorded value.
+        let mut strategy = unlisted(58.62, 31.04, &["hyperliquid", "local"]);
+        strategy.vault.value = 70.0;
+        let html = where_it_trades(&strategy).html();
+        assert!(html.contains("About $28 of the vault"), "{html}");
+        assert!(
+            html.contains("Its drivers: Hyperliquid and Local."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn less_than_a_dollar_held_outside_cash_is_said_to_the_cent() {
+        let html = where_it_trades(&unlisted(10.30, 10.00, &[])).html();
+        assert!(html.contains("About $0.30 of the vault"), "{html}");
+        assert!(!html.contains("Its driver:"), "{html}");
+    }
+
+    #[test]
+    fn a_vault_whose_value_is_its_cash_says_it_holds_only_cash() {
+        for (value, idle) in [(20.10, 20.10), (20.104, 20.10), (0.0, 0.0), (20.0, 20.004)] {
+            let html = where_line(&unlisted(value, idle, &[]));
+            assert!(
+                html.contains("No venue yet: the vault holds only cash."),
+                "{value} {idle}: {html}"
+            );
+            assert!(!html.contains("held outside"), "{value} {idle}: {html}");
+        }
+    }
+
+    #[test]
+    fn a_vault_with_drivers_that_is_all_cash_never_says_it_has_no_venue() {
+        let html = where_line(&unlisted(20.10, 20.10, &["robinhood"]));
+        assert!(
+            html.contains("The vault holds only cash right now."),
+            "{html}"
+        );
+        assert!(!html.contains("No venue"), "{html}");
+    }
+
+    #[test]
+    fn a_vault_never_read_never_says_it_holds_only_cash() {
+        let mut strategy = unlisted(0.0, 0.0, &["robinhood"]);
+        strategy.vault.state = shared::VaultState::Activating;
+        strategy.vault.valued_at = None;
+        strategy.stale_as_of = Some(datetime!(1970-01-01 0:00));
+        let html = where_line(&strategy);
+        assert!(!html.contains("only cash"), "{html}");
+        assert!(
+            html.contains("What the vault holds hasn&#39;t been read yet."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_vault_never_valued_never_says_it_holds_only_cash() {
+        let mut strategy = unlisted(0.0, 0.0, &["robinhood"]);
+        strategy.vault.valued_at = None;
+        let html = where_line(&strategy);
+        assert!(!html.contains("only cash"), "{html}");
+        assert!(
+            html.contains("What the vault holds hasn&#39;t been valued yet."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn cash_well_above_the_vault_value_claims_nothing_about_what_it_holds() {
+        let strategy = unlisted(20.0, 25.0, &["robinhood"]);
+        let html = where_line(&strategy);
+        assert!(!html.contains("only cash"), "{html}");
+        assert!(!html.contains("held outside"), "{html}");
+        assert!(!html.contains("Its driver:"), "{html}");
+        assert!(
+            html.contains("Where the vault&#39;s money is held isn&#39;t listed here yet."),
+            "{html}"
+        );
+        assert!(!risks(&strategy).html().contains("held can fail"));
+    }
+
+    #[test]
+    fn a_closed_vault_holds_only_cash_whatever_its_shares_are_priced_at() {
+        let mut strategy = unlisted(20.0, 15.0, &["robinhood"]);
+        strategy.vault.state = shared::VaultState::Closed;
+        strategy.vault.valued_at = None;
+        let html = where_line(&strategy);
+        assert!(
+            html.contains("The vault is closed: it holds only cash."),
+            "{html}"
+        );
+        assert!(!html.contains("held outside"), "{html}");
+        assert!(!risks(&strategy).html().contains("held can fail"));
+    }
+
+    #[test]
+    fn a_stale_vault_says_when_its_money_was_last_read_outside_its_cash() {
+        let mut strategy = unlisted(50.01, 20.10, &["robinhood"]);
+        strategy.stale_as_of = Some(datetime!(2026-09-28 10:00));
+        let html = where_line(&strategy);
+        assert!(
+            html.contains(
+                "About $30 of the vault was held outside its cash at home as of Sep 28, 2026;"
+            ),
+            "{html}"
+        );
+        let mut strategy = unlisted(20.10, 20.10, &["robinhood"]);
+        strategy.stale_as_of = Some(datetime!(2026-09-28 10:00));
+        let html = where_line(&strategy);
+        assert!(
+            html.contains("The vault held only cash as of Sep 28, 2026."),
+            "{html}"
+        );
+        assert!(!html.contains("right now"), "{html}");
+    }
+
+    #[test]
+    fn a_vault_with_money_outside_its_cash_and_no_venue_listed_still_warns_where_it_is_can_fail() {
+        let html = risks(&unlisted(50.01, 20.10, &["robinhood"])).html();
+        assert!(html.contains("Where it&#39;s held can fail."), "{html}");
+        let html = risks(&unlisted(20.10, 20.10, &["robinhood"])).html();
+        assert!(!html.contains("held can fail"), "{html}");
     }
 
     #[test]
