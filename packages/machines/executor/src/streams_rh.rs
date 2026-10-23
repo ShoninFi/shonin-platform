@@ -10,7 +10,8 @@
 //!   from a Robinhood Chain node every few seconds and a value is handed on
 //!   each new round. A feed often goes hours without one (it moves on a 0.5%
 //!   change or a daily heartbeat and holds the last close while the cash
-//!   market is shut), so the round's own time travels with its price.
+//!   market is shut), so the round's own time travels with its price, and
+//!   an agent that joins a feed already held is handed its current round.
 //!
 //! Where each is: `SHONIN_LIGHTER_STREAM` (default: Lighter's instance on
 //! Robinhood Chain mainnet) and `SHONIN_CHAINLINK_RPC` (default: Robinhood
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::Address;
+use alloy::primitives::aliases::U80;
 use alloy::providers::{Provider, ProviderBuilder};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
@@ -41,6 +43,8 @@ pub const ROBINHOOD_MAINNET_RPC: &str = "https://rpc.mainnet.chain.robinhood.com
 const LEVELS: usize = 20;
 /// How often each subscribed feed is read.
 const READ_EVERY: Duration = Duration::from_secs(10);
+/// How long one Chainlink read may go unanswered before it is an error.
+const CALL_MOST: Duration = Duration::from_secs(15);
 /// How long to wait before connecting again, at most.
 const RECONNECT_MOST: Duration = Duration::from_secs(30);
 
@@ -309,7 +313,7 @@ impl Chainlink {
             .parse()
             .map_err(|error| format!("bad RPC URL: {error}"))?;
         let provider = ProviderBuilder::new().connect_http(url).erased();
-        let mut last: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut last: HashMap<Vec<u8>, U80> = HashMap::new();
         let mut decimals: HashMap<Address, u8> = HashMap::new();
         let mut tick = tokio::time::interval(READ_EVERY);
         loop {
@@ -320,46 +324,89 @@ impl Chainlink {
             let wanted = outlets.wanted();
             last.retain(|feed, _| wanted.contains(feed));
             for feed in wanted {
-                let ChainlinkFeed::Price { token } = from_payload(&feed)?;
-                let Some(address) = robinhood::listings::feed(robinhood::listings::MAINNET, &token)
-                else {
+                let Ok(ChainlinkFeed::Price { token }) = from_payload(&feed) else {
                     continue;
                 };
-                let contract = IFeed::new(address, &provider);
-                let places = match decimals.get(&address) {
-                    Some(places) => *places,
-                    None => {
-                        let places = contract
-                            .decimals()
-                            .call()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        decimals.insert(address, places);
-                        places
+                let (places, round) = match read(&provider, &token, &mut decimals).await {
+                    Ok(Some(read)) => read,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // One feed's failure leaves the others read.
+                        tracing::warn!(venue = CHAINLINK, token, error, "a feed could not be read");
+                        continue;
                     }
                 };
-                let round = contract
-                    .latestRoundData()
-                    .call()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let round_id = u64::try_from(round.roundId).unwrap_or(u64::MAX);
-                if last.get(&feed) == Some(&round_id) {
-                    continue;
-                }
-                let Some(value) =
-                    chainlink_value(&token, round.answer, places, round.updatedAt, round_id)
-                else {
+                let Some(value) = hand_on(&mut last, &feed, &token, places, &round) else {
                     continue;
                 };
-                last.insert(feed.clone(), round_id);
                 let updated_ms = u64::try_from(round.updatedAt)
                     .unwrap_or(0)
                     .saturating_mul(1000);
-                outlets.publish(&feed, Some(updated_ms), to_payload(&value));
+                outlets.publish_current(&feed, Some(updated_ms), to_payload(&value));
             }
         }
     }
+}
+
+/// `token`'s feed's places and latest round, or nothing for a token with no
+/// feed. Each call is bounded, so a node that never answers is an error.
+async fn read(
+    provider: &alloy::providers::DynProvider,
+    token: &str,
+    decimals: &mut HashMap<Address, u8>,
+) -> Result<Option<(u8, IFeed::latestRoundDataReturn)>, String> {
+    let Some(address) = robinhood::listings::feed(robinhood::listings::MAINNET, token) else {
+        return Ok(None);
+    };
+    let contract = IFeed::new(address, provider);
+    let places = match decimals.get(&address) {
+        Some(places) => *places,
+        None => {
+            let places = bounded(contract.decimals().call()).await?;
+            decimals.insert(address, places);
+            places
+        }
+    };
+    let round = bounded(contract.latestRoundData().call()).await?;
+    Ok(Some((places, round)))
+}
+
+/// `call`'s answer, or an error if it has none within [`CALL_MOST`].
+async fn bounded<T, E: std::fmt::Display>(
+    call: impl std::future::IntoFuture<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(CALL_MOST, call).await {
+        Ok(answer) => answer.map_err(|error| error.to_string()),
+        Err(_) => Err(format!("no answer within {CALL_MOST:?}")),
+    }
+}
+
+/// The value to hand on for a feed's latest round, noting it as handed on;
+/// nothing for a round no later than the last one handed on, or one without
+/// a positive price.
+fn hand_on(
+    last: &mut HashMap<Vec<u8>, U80>,
+    feed: &[u8],
+    token: &str,
+    places: u8,
+    round: &IFeed::latestRoundDataReturn,
+) -> Option<ChainlinkValue> {
+    let within = unpublished(last.get(feed), round.roundId)?;
+    let value = chainlink_value(token, round.answer, places, round.updatedAt, within)?;
+    last.insert(feed.to_vec(), round.roundId);
+    Some(value)
+}
+
+/// The round within its phase for a feed's latest round id, or nothing when
+/// it is no later than the last one handed on. A round id carries its feed's
+/// phase above the low 64 bits and the round within that phase below, so it
+/// is compared whole (a new phase's rounds restart low, but its ids are
+/// greater) and the stream carries the round within the phase.
+fn unpublished(last: Option<&U80>, round_id: U80) -> Option<u64> {
+    if last.is_some_and(|last| round_id <= *last) {
+        return None;
+    }
+    Some(round_id.as_limbs()[0])
 }
 
 /// A round as the stream carries it; nothing for a price that isn't
@@ -443,6 +490,94 @@ mod tests {
             }
         );
         assert!(chainlink_value("NVDA", I256::ZERO, 8, U256::ZERO, 1).is_none());
+    }
+
+    /// A round id in `phase` of its feed: the phase above the low 64 bits.
+    fn in_phase(phase: u8, round: u64) -> U80 {
+        (U80::from(phase) << 64) | U80::from(round)
+    }
+
+    /// A feed's latest round as the contract answers it.
+    fn latest(round_id: U80) -> IFeed::latestRoundDataReturn {
+        IFeed::latestRoundDataReturn {
+            roundId: round_id,
+            answer: I256::try_from(40_000_000_000i64).unwrap(),
+            startedAt: U256::from(1_791_230_163u64),
+            updatedAt: U256::from(1_791_230_163u64),
+            answeredInRound: round_id,
+        }
+    }
+
+    /// The round each read hands on for one feed, in turn.
+    fn handed_on(reads: &[U80]) -> Vec<Option<u64>> {
+        let mut last = HashMap::new();
+        reads
+            .iter()
+            .map(|id| {
+                hand_on(&mut last, b"TSLA", "TSLA", 8, &latest(*id)).map(|value| {
+                    let ChainlinkValue::Price { round, .. } = value;
+                    round
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_new_round_above_u64_publishes_after_the_first() {
+        assert_eq!(
+            handed_on(&[in_phase(1, 1708), in_phase(1, 1709)]),
+            [Some(1708), Some(1709)]
+        );
+    }
+
+    #[test]
+    fn the_same_round_is_published_once() {
+        let round = in_phase(1, 1708);
+        assert_eq!(handed_on(&[round, round, round]), [Some(1708), None, None]);
+    }
+
+    #[test]
+    fn the_round_carried_is_the_aggregator_round_not_a_saturated_one() {
+        let [Some(round)] = handed_on(&[in_phase(1, 1708)])[..] else {
+            panic!("the first round is handed on");
+        };
+        assert_ne!(round, u64::MAX);
+        assert_eq!(round, 1708, "the round within its phase");
+    }
+
+    #[test]
+    fn a_new_phase_publishes_though_its_round_restarts_low() {
+        assert_eq!(
+            handed_on(&[in_phase(1, 5000), in_phase(2, 1)]),
+            [Some(5000), Some(1)]
+        );
+    }
+
+    #[test]
+    fn an_older_round_is_not_published_after_a_newer_one() {
+        assert_eq!(
+            handed_on(&[in_phase(1, 1709), in_phase(1, 1708), in_phase(1, 1709)]),
+            [Some(1709), None, None]
+        );
+    }
+
+    #[test]
+    fn a_round_without_a_positive_price_is_not_taken_as_published() {
+        let mut last = HashMap::new();
+        let mut zero = latest(in_phase(1, 1708));
+        zero.answer = I256::ZERO;
+        assert!(hand_on(&mut last, b"TSLA", "TSLA", 8, &zero).is_none());
+        assert!(hand_on(&mut last, b"TSLA", "TSLA", 8, &latest(in_phase(1, 1708))).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_never_answers_is_an_error_once_its_time_is_up() {
+        let hung = bounded(std::future::pending::<Result<(), String>>()).await;
+        assert!(hung.unwrap_err().contains("no answer"));
+        let answered = bounded(async { Ok::<_, String>(3) }).await;
+        assert_eq!(answered, Ok(3));
+        let refused = bounded(async { Err::<(), _>("refused") }).await;
+        assert_eq!(refused, Err("refused".to_string()));
     }
 
     #[test]

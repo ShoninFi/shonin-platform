@@ -68,13 +68,20 @@ pub trait Venue: Send + Sync + 'static {
 /// Where a venue publishes, and what it is asked for.
 #[derive(Default)]
 pub struct Outlets {
-    feeds: Mutex<HashMap<Vec<u8>, broadcast::Sender<Stamped>>>,
+    feeds: Mutex<HashMap<Vec<u8>, Outlet>>,
     /// Told when an agent subscribes to a feed nobody had.
     pub asked: Notify,
 }
 
+/// One feed's subscribers, and the value it stands at, for a feed whose
+/// values say where it stands rather than what just passed.
+struct Outlet {
+    sender: broadcast::Sender<Stamped>,
+    current: Option<Stamped>,
+}
+
 impl Outlets {
-    fn feeds(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, broadcast::Sender<Stamped>>> {
+    fn feeds(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, Outlet>> {
         self.feeds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -84,36 +91,53 @@ impl Outlets {
     /// is forgotten here, so the venue can let go of it upstream.
     pub fn wanted(&self) -> BTreeSet<Vec<u8>> {
         let mut feeds = self.feeds();
-        feeds.retain(|_, sender| sender.receiver_count() > 0);
+        feeds.retain(|_, outlet| outlet.sender.receiver_count() > 0);
         feeds.keys().cloned().collect()
     }
 
     /// Hand `value` to everyone subscribed to `feed`, stamped with now.
     pub fn publish(&self, feed: &[u8], source_ms: Option<u64>, value: Vec<u8>) {
-        let feeds = self.feeds();
-        if let Some(sender) = feeds.get(feed) {
-            let _ = sender.send(Stamped {
+        self.send(feed, source_ms, value, false);
+    }
+
+    /// As [`Outlets::publish`], and keep `value` as where `feed` stands: an
+    /// agent that subscribes to it later is handed it first, rather than
+    /// waiting for the next one.
+    pub fn publish_current(&self, feed: &[u8], source_ms: Option<u64>, value: Vec<u8>) {
+        self.send(feed, source_ms, value, true);
+    }
+
+    fn send(&self, feed: &[u8], source_ms: Option<u64>, value: Vec<u8>, current: bool) {
+        let mut feeds = self.feeds();
+        if let Some(outlet) = feeds.get_mut(feed) {
+            let stamped = Stamped {
                 received_ms: now_ms(),
                 source_ms,
                 value,
-            });
+            };
+            if current {
+                outlet.current = Some(stamped.clone());
+            }
+            let _ = outlet.sender.send(stamped);
         }
     }
 
-    fn subscribe(&self, feed: Vec<u8>) -> broadcast::Receiver<Stamped> {
+    /// A receiver for `feed`'s values from now on, and the value it stands
+    /// at, if it has one. Both are taken under one lock, so nothing is
+    /// handed twice or missed between them.
+    fn subscribe(&self, feed: Vec<u8>) -> (Option<Stamped>, broadcast::Receiver<Stamped>) {
         let mut feeds = self.feeds();
-        let fresh = feeds
-            .get(&feed)
-            .is_none_or(|sender| sender.receiver_count() == 0);
-        let receiver = feeds
-            .entry(feed)
-            .or_insert_with(|| broadcast::channel(WAITING_MOST).0)
-            .subscribe();
+        let outlet = feeds.entry(feed).or_insert_with(|| Outlet {
+            sender: broadcast::channel(WAITING_MOST).0,
+            current: None,
+        });
+        let fresh = outlet.sender.receiver_count() == 0;
+        let subscribed = (outlet.current.clone(), outlet.sender.subscribe());
         drop(feeds);
         if fresh {
             self.asked.notify_one();
         }
-        receiver
+        subscribed
     }
 }
 
@@ -134,8 +158,9 @@ impl Hub {
         }
     }
 
-    /// Subscribe to `request` on `source`: every value published for it from
-    /// now on, the oldest dropped if the reader falls behind.
+    /// Subscribe to `request` on `source`: where the feed stands, if its venue
+    /// keeps that, then every value published for it from now on, the oldest
+    /// dropped if the reader falls behind.
     pub fn subscribe(
         &self,
         source: &str,
@@ -147,7 +172,7 @@ impl Hub {
             format!("there is no shared stream called {source}; there are {known:?}")
         })?;
         let feed = venue.feed(request)?;
-        let receiver = outlets.subscribe(feed);
+        let (current, receiver) = outlets.subscribe(feed);
         let mut started = self
             .started
             .lock()
@@ -155,8 +180,10 @@ impl Hub {
         if started.insert(venue.name()) {
             tokio::spawn(venue.clone().run(outlets.clone()));
         }
-        Ok(tokio_stream::wrappers::BroadcastStream::new(receiver)
-            .filter_map(|value| std::future::ready(value.ok())))
+        Ok(futures::stream::iter(current).chain(
+            tokio_stream::wrappers::BroadcastStream::new(receiver)
+                .filter_map(|value| std::future::ready(value.ok())),
+        ))
     }
 }
 
@@ -538,6 +565,75 @@ mod tests {
         );
         drop(other);
         assert!(hub.venues["ticking"].1.wanted().is_empty());
+    }
+
+    /// A venue that publishes nothing of its own.
+    struct Quiet;
+
+    impl Venue for Quiet {
+        fn name(&self) -> &'static str {
+            "quiet"
+        }
+
+        fn feed(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(request.to_vec())
+        }
+
+        fn run(self: Arc<Self>, _outlets: Arc<Outlets>) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    async fn next_two(stream: &mut (impl Stream<Item = Stamped> + Unpin)) -> [Vec<u8>; 2] {
+        [
+            stream.next().await.unwrap().value,
+            stream.next().await.unwrap().value,
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_joining_a_held_feed_is_handed_its_current_value_first() {
+        let hub = Hub::new(vec![Arc::new(Quiet)]);
+        let mut first = hub.subscribe("quiet", b"feed").unwrap();
+        let outlets = &hub.venues["quiet"].1;
+        outlets.publish_current(b"feed", Some(7), vec![7]);
+        let mut late = hub.subscribe("quiet", b"feed").unwrap();
+        outlets.publish_current(b"feed", Some(8), vec![8]);
+        assert_eq!(
+            next_two(&mut late).await,
+            [vec![7], vec![8]],
+            "the current value, then what follows"
+        );
+        assert_eq!(
+            next_two(&mut first).await,
+            [vec![7], vec![8]],
+            "nothing twice for one already there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_only_passing_through_is_not_handed_to_a_later_subscriber() {
+        let hub = Hub::new(vec![Arc::new(Quiet)]);
+        let _first = hub.subscribe("quiet", b"feed").unwrap();
+        let outlets = &hub.venues["quiet"].1;
+        outlets.publish(b"feed", Some(7), vec![7]);
+        let mut late = hub.subscribe("quiet", b"feed").unwrap();
+        outlets.publish(b"feed", Some(8), vec![8]);
+        assert_eq!(late.next().await.unwrap().value, vec![8]);
+    }
+
+    #[tokio::test]
+    async fn a_feed_everyone_let_go_of_forgets_its_current_value() {
+        let hub = Hub::new(vec![Arc::new(Quiet)]);
+        let first = hub.subscribe("quiet", b"feed").unwrap();
+        let outlets = &hub.venues["quiet"].1;
+        outlets.publish_current(b"feed", Some(7), vec![7]);
+        drop(first);
+        // The venue's next look lets go of it upstream.
+        assert!(outlets.wanted().is_empty());
+        let mut again = hub.subscribe("quiet", b"feed").unwrap();
+        outlets.publish_current(b"feed", Some(8), vec![8]);
+        assert_eq!(again.next().await.unwrap().value, vec![8]);
     }
 
     #[test]

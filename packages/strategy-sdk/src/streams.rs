@@ -150,6 +150,7 @@ pub enum ChainlinkValue {
         /// The round's own time, in seconds since the Unix epoch. A feed
         /// can go hours without a new round while its market is shut.
         updated_at: u64,
+        /// The round within its feed's current phase.
         round: u64,
     },
 }
