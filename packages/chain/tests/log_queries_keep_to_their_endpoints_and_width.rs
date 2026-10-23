@@ -428,3 +428,328 @@ async fn a_rate_limit_on_a_log_query_moves_to_the_next_endpoint_and_is_never_hal
     assert!(chain::node_trouble(&error), "{error:#}");
     assert_eq!(alone.lock().unwrap().ranges, vec![(1, 100); 4], "halved");
 }
+
+/// A refusal a log node gives: its code and message.
+type Refused = Option<(i64, &'static str)>;
+
+/// A node with one log in every block up to its head at `head`, refusing a
+/// log query as `refuses` says, given the range and every range asked
+/// before it.
+fn log_node_refusing(
+    seen: Arc<Mutex<Seen>>,
+    head: u64,
+    refuses: impl Fn(u64, u64, &[(u64, u64)]) -> Refused + Send + Sync + 'static,
+) -> stand_in::Answer {
+    Arc::new(move |method, request| {
+        seen.lock().unwrap().methods.push(method.to_string());
+        match method {
+            "eth_getLogs" => {
+                let from = number(&request["params"][0]["fromBlock"]);
+                let to = number(&request["params"][0]["toBlock"]);
+                let refused = {
+                    let mut seen = seen.lock().unwrap();
+                    let refused = refuses(from, to, &seen.ranges);
+                    seen.ranges.push((from, to));
+                    refused
+                };
+                if let Some((code, message)) = refused {
+                    return refusal(request, code, message);
+                }
+                Said::Result(Value::Array((from..=to).map(log_at).collect()))
+            }
+            "eth_blockNumber" => Said::Result(json!(format!("0x{head:x}"))),
+            _ => stand_in::unknown_method(),
+        }
+    })
+}
+
+const INVALID_RANGE: (i64, &str) = (-32602, "invalid block range");
+const TIMED_OUT: (i64, &str) = (-32000, "execution aborted (timeout = 10s)");
+const LIMITED: (i64, &str) = (-32005, "rate limited");
+
+/// A node that no longer keeps the logs of blocks below `kept_from`: any
+/// log query reaching below it is refused as `refusal` says, whatever its
+/// width, as some providers refuse a block they have dropped.
+fn forgetting_node(
+    seen: Arc<Mutex<Seen>>,
+    kept_from: u64,
+    refusal: (i64, &'static str),
+) -> stand_in::Answer {
+    log_node_refusing(seen, 1000, move |from, _, _| {
+        (from < kept_from).then_some(refusal)
+    })
+}
+
+/// A node that keeps every block up to its head at `head`, and limits the
+/// rate of its first log query.
+fn archive_node_limiting_its_first_log_query(
+    seen: Arc<Mutex<Seen>>,
+    head: u64,
+) -> stand_in::Answer {
+    log_node_refusing(seen, head, |_, _, before| {
+        before.is_empty().then_some(LIMITED)
+    })
+}
+
+/// A node that keeps every block, refuses a log query wider than `widest`
+/// blocks for its width, and limits the rate of each range the first time
+/// it is asked for it.
+fn capped_archive_node_limiting_each_range_once(
+    seen: Arc<Mutex<Seen>>,
+    widest: u64,
+) -> stand_in::Answer {
+    log_node_refusing(seen, 1000, move |from, to, before| {
+        if to - from + 1 > widest {
+            Some((-32600, "query exceeds max block range"))
+        } else if !before.contains(&(from, to)) {
+            Some(LIMITED)
+        } else {
+            None
+        }
+    })
+}
+
+/// Where nothing listens.
+async fn out_of_reach() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+/// A client whose log queries go to `nodes` alone, in that order.
+async fn client_reading_logs_from(nodes: &[String], log_range: Option<u64>) -> chain::Client {
+    let main_url = stand_in::answering(Some(31337), logs_node(Default::default(), None)).await;
+    client_with(&main_url, Some(&nodes.join(" ")), log_range).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_an_endpoint_no_longer_keeps_is_read_from_another_without_narrowing_the_first() {
+    for refused in [INVALID_RANGE, TIMED_OUT] {
+        let message = refused.1;
+        let (forgetting, archive): (Arc<Mutex<Seen>>, Arc<Mutex<Seen>>) = Default::default();
+        let client = client_reading_logs_from(
+            &[
+                stand_in::answering(
+                    Some(31337),
+                    forgetting_node(forgetting.clone(), 500, refused),
+                )
+                .await,
+                stand_in::answering(
+                    Some(31337),
+                    archive_node_limiting_its_first_log_query(archive.clone(), 499),
+                )
+                .await,
+            ],
+            None,
+        )
+        .await;
+
+        // The first endpoint has dropped these blocks and the second limits
+        // the rate once: the window waits for the second, which has them.
+        let logs = client
+            .logs(&Filter::new().from_block(1u64).to_block(100u64))
+            .await
+            .unwrap_or_else(|error| panic!("{message}: {error:#}"));
+        assert_eq!(blocks_of(&logs), (1..=100).collect::<Vec<_>>(), "{message}");
+
+        // Blocks the first endpoint keeps, and the second hasn't reached,
+        // are asked of the first whole: dropping a block taught nothing of
+        // the width it takes.
+        let logs = client
+            .logs(&Filter::new().from_block(600u64).to_block(700u64))
+            .await
+            .unwrap_or_else(|error| panic!("{message}: {error:#}"));
+        assert_eq!(
+            blocks_of(&logs),
+            (600..=700).collect::<Vec<_>>(),
+            "{message}"
+        );
+        let ranges = forgetting.lock().unwrap().ranges.clone();
+        assert_eq!(ranges.last(), Some(&(600, 700)), "{message}: {ranges:?}");
+        assert!(
+            ranges.iter().filter(|(from, _)| *from >= 500).count() == 1,
+            "{message}: {ranges:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_no_endpoint_keeps_fails_once_each_endpoint_has_been_asked() {
+    let (one, two): (Arc<Mutex<Seen>>, Arc<Mutex<Seen>>) = Default::default();
+    let client = client_reading_logs_from(
+        &[
+            stand_in::answering(
+                Some(31337),
+                forgetting_node(one.clone(), 500, INVALID_RANGE),
+            )
+            .await,
+            stand_in::answering(
+                Some(31337),
+                forgetting_node(two.clone(), 500, INVALID_RANGE),
+            )
+            .await,
+        ],
+        None,
+    )
+    .await;
+    let error = client
+        .logs(&Filter::new().from_block(1u64).to_block(100u64))
+        .await
+        .expect_err("no endpoint keeps these blocks");
+    assert!(
+        format!("{error:#}").contains("can't serve block 1"),
+        "{error:#}"
+    );
+    // Each was asked the window and its first block, once: a block it
+    // doesn't keep is never halved towards.
+    for seen in [one, two] {
+        assert_eq!(seen.lock().unwrap().ranges, vec![(1, 100), (1, 1)]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_refused_as_invalid_whose_first_block_answers_is_halved_and_its_width_kept() {
+    let seen: Arc<Mutex<Seen>> = Default::default();
+    let node = log_node_refusing(seen.clone(), 1000, |from, to, _| {
+        (to - from + 1 > 50).then_some(INVALID_RANGE)
+    });
+    let client =
+        client_reading_logs_from(&[stand_in::answering(Some(31337), node).await], None).await;
+    for (from, to) in [(1u64, 100u64), (101, 200)] {
+        let logs = client
+            .logs(&Filter::new().from_block(from).to_block(to))
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&logs), (from..=to).collect::<Vec<_>>());
+    }
+    // The second window is read in the width the first showed it takes.
+    assert_eq!(
+        seen.lock().unwrap().ranges,
+        vec![(1, 100), (1, 1), (1, 50), (51, 100), (101, 150), (151, 200)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limited_check_of_the_first_block_teaches_nothing_and_is_waited_out() {
+    let seen: Arc<Mutex<Seen>> = Default::default();
+    let node = log_node_refusing(seen.clone(), 1000, |from, to, before| {
+        if to - from + 1 > 50 {
+            Some(INVALID_RANGE)
+        } else if from == to && !before.contains(&(from, to)) {
+            Some(LIMITED)
+        } else {
+            None
+        }
+    });
+    let client =
+        client_reading_logs_from(&[stand_in::answering(Some(31337), node).await], None).await;
+    let logs = client
+        .logs(&Filter::new().from_block(1u64).to_block(100u64))
+        .await
+        .unwrap();
+    assert_eq!(blocks_of(&logs), (1..=100).collect::<Vec<_>>());
+    // Nothing was halved until the first block answered.
+    assert_eq!(
+        seen.lock().unwrap().ranges,
+        vec![(1, 100), (1, 1), (1, 100), (1, 1), (1, 50), (51, 100)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_time_out_on_a_wide_range_halves_that_read_alone() {
+    let seen: Arc<Mutex<Seen>> = Default::default();
+    // Slow once, at the width of the first window: the node is loaded,
+    // not capped.
+    let node = log_node_refusing(seen.clone(), 1000, |from, to, before| {
+        (to - from + 1 > 50 && before.is_empty()).then_some(TIMED_OUT)
+    });
+    let client =
+        client_reading_logs_from(&[stand_in::answering(Some(31337), node).await], None).await;
+    for (from, to) in [(1u64, 100u64), (101, 200)] {
+        let logs = client
+            .logs(&Filter::new().from_block(from).to_block(to))
+            .await
+            .unwrap();
+        assert_eq!(blocks_of(&logs), (from..=to).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        seen.lock().unwrap().ranges,
+        vec![(1, 100), (1, 1), (1, 50), (51, 100), (101, 200)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_refused_part_way_through_a_window_returns_none_of_the_parts_before_it() {
+    let seen: Arc<Mutex<Seen>> = Default::default();
+    // Wider than 50 blocks is too wide; block 60 it can't serve.
+    let node = log_node_refusing(seen.clone(), 1000, |from, to, _| {
+        if to - from + 1 > 50 {
+            Some((-32600, "block range too large"))
+        } else if (from..=to).contains(&60) {
+            Some(INVALID_RANGE)
+        } else {
+            None
+        }
+    });
+    let client =
+        client_reading_logs_from(&[stand_in::answering(Some(31337), node).await], None).await;
+    let error = client
+        .logs(&Filter::new().from_block(1u64).to_block(100u64))
+        .await
+        .expect_err("block 60 is served nowhere");
+    assert!(
+        format!("{error:#}").contains("can't serve block 60"),
+        "{error:#}"
+    );
+    assert!(seen.lock().unwrap().ranges.contains(&(1, 50)), "read first");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_block_refused_for_its_logs_is_not_reported_as_one_the_endpoint_cannot_serve() {
+    let node = log_node_refusing(Default::default(), 1000, |_, _, _| {
+        Some((-32600, "query returned more than 10000 results"))
+    });
+    let client =
+        client_reading_logs_from(&[stand_in::answering(Some(31337), node).await], None).await;
+    let error = client
+        .logs(&Filter::new().from_block(7u64).to_block(7u64))
+        .await
+        .expect_err("refused");
+    let error = format!("{error:#}");
+    assert!(error.contains("more than 10000 results"), "{error}");
+    assert!(!error.contains("can't serve"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_over_several_windows_waits_out_the_endpoint_limiting_the_rate_past_those_that_cannot_serve_it()
+ {
+    let (forgetting, archive): (Arc<Mutex<Seen>>, Arc<Mutex<Seen>>) = Default::default();
+    let client = client_reading_logs_from(
+        &[
+            stand_in::answering(
+                Some(31337),
+                forgetting_node(forgetting, 10_000, INVALID_RANGE),
+            )
+            .await,
+            stand_in::answering(
+                Some(31337),
+                capped_archive_node_limiting_each_range_once(archive.clone(), 50),
+            )
+            .await,
+            out_of_reach().await,
+        ],
+        Some(100),
+    )
+    .await;
+    let logs = client
+        .logs(&Filter::new().from_block(1u64).to_block(400u64))
+        .await
+        .unwrap();
+    assert_eq!(blocks_of(&logs), (1..=400).collect::<Vec<_>>());
+    let ranges = archive.lock().unwrap().ranges.clone();
+    assert!(
+        ranges.iter().all(|(from, to)| to - from < 100),
+        "{ranges:?}"
+    );
+}
