@@ -67,6 +67,12 @@ pub fn shares(value: U256, rounding: Rounding) -> String {
     format_units(value, 18, 1, rounding)
 }
 
+/// Shares with every digit they have, none padded: `50`, `50.053218`. For
+/// an amount about to be sent, where two amounts must never read the same.
+pub fn shares_exact(value: U256) -> String {
+    format_exact(value, 18, 0)
+}
+
 /// The fallback's units, a fraction of what the stations hold scaled by
 /// 1e18, as a percentage to four decimals rounded down: `1.2345%`; a
 /// fraction too small to show says so rather than read as none.
