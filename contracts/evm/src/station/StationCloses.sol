@@ -56,9 +56,48 @@ library StationCloses {
     /// from trading its venues (ten minutes on Hyperliquid, an hour on
     /// Lighter).
     uint64 private constant PROOF_WINDOWS = 2;
+    /// A driver's exit value is a sum of figures each rounded down (its idle
+    /// dollars, each holding's quote), so the account left by a close of a
+    /// fraction can read up to a dollar-unit per figure above the stayers'
+    /// share by rounding alone. A close may leave this many: a driver whose
+    /// closes settle in the transaction sums no more figures than this.
+    uint256 internal constant ROUNDING_UNITS = 16;
+    /// The gas each call of a stopped station's full unwind is given at the
+    /// full band: exactly this, however much the transaction carries, so
+    /// whether a call goes through never depends on who sends the unwind or
+    /// with how much gas. A driver bounds each call well under it (a sale
+    /// sells at most a fixed amount of a holding per call); one that fails
+    /// within it is a call that can't go through (a token paused, frozen or
+    /// burning its gas), and only what it would have moved is left.
+    uint256 internal constant ATTEMPT_GAS = 2_750_000;
+    /// What the station keeps beside each call for its own work after it.
+    uint256 private constant ATTEMPT_RESERVE = 100_000;
+    /// What must be left before each call: the allowance, what the call
+    /// itself holds back of it (1/64, EIP-150), and the reserve.
+    uint256 internal constant ATTEMPT_FLOOR = ATTEMPT_GAS + ATTEMPT_GAS / 63 + ATTEMPT_RESERVE;
+    /// What must be left before the part, at the full band, of a driver
+    /// whose calls are each given the allowance: its own reads before the
+    /// first call, and the floor of that call. A delayed driver's part
+    /// takes no allowance and has no floor.
+    uint256 internal constant PART_FLOOR = 1_000_000 + ATTEMPT_FLOOR;
+    /// The most a driver's `exitPath` read may spend.
+    uint256 private constant EXIT_PATH_READ_GAS = 50_000;
+    /// Transient: a part of the unwind stopped short of a call's floor. Set
+    /// only by the station's own code, in a part that then returns, so no
+    /// driver, target or token can raise it.
+    bytes32 private constant SHORT_OF_GAS_SLOT = keccak256("shonin.station.unwind.shortOfGas");
 
     error NotAllowed();
     error NotYet();
+    /// A stopped station's full unwind was sent with too little gas left to
+    /// give a call its allowance, or a driver's part its floor: the whole
+    /// transaction is undone, never only the call, so whoever sends the
+    /// unwind can't have a sale skipped by sending too little gas. Only the
+    /// station raises it, from what its own code marked, and nothing on
+    /// the unwind's path catches it.
+    error ShortOfGas();
+    /// A call of a driver's part inside the band failed: the part is undone.
+    error CallFailed();
 
     // Closing a fraction ----------------------------------------------------
 
@@ -169,10 +208,11 @@ library StationCloses {
         // A shortfall is the leaver's own fill, never the stayers' gain:
         // proceeds that went to repay the account's margin debt, so the
         // account is left worth more than the stayers' share, still belong
-        // to the leaver, and the close is undone.
+        // to the leaver, and the close is undone. What the account's own
+        // figures round by is let through, and stays with the stayers.
         if (swept < freed) {
             (, uint256 exitAfter) = driver.valueOf(address(this));
-            if (exitAfter > exitBefore - freed + 1) revert IStation.ShortSweep();
+            if (exitAfter > exitBefore - freed + ROUNDING_UNITS) revert IStation.ShortSweep();
             return swept;
         }
         // Never more than the fraction's worth: anything a venue sends
@@ -185,9 +225,16 @@ library StationCloses {
     /// A stopped station's full unwind, which every holder shares: each
     /// driver closes on its own, inside the band as it has widened since the
     /// stop, so a venue that refuses or a market still outside the band
-    /// leaves only its own money behind. Everything idle then goes home. It
-    /// takes the place of a staged close: whatever that sold or brought home
-    /// is everyone's again.
+    /// leaves only its own money behind; at the full band each of a
+    /// driver's calls is made on its own with a fixed allowance of gas, so
+    /// a holding that can't be sold leaves only itself behind. An unwind
+    /// sent with too little gas to give a call its allowance, or such a
+    /// driver's part its floor, is undone whole (`ShortOfGas`), never left
+    /// behind like that, and is sent again with more. A delayed driver's
+    /// part takes no allowance, so it is held to no floor: one sent too
+    /// little gas fails whole, moving nothing, and is retried. Everything idle then goes home.
+    /// It takes the place of a staged close: whatever that sold or brought
+    /// home is everyone's again.
     function unwindStopped(bytes32[] memory drivers) external returns (uint256 sentHome, bool blocked) {
         StationLayout storage s = StationStorage.layout();
         // Not between a valuation's pricing and its settlement: what this
@@ -199,8 +246,12 @@ library StationCloses {
         if (s.stage.stagedAt != 0) _lapse(s);
         uint16 band = IStation(address(this)).stoppedBand();
         for (uint256 i = 0; i < drivers.length; i++) {
-            s.pinned(drivers[i]);
+            address driver = s.pinned(drivers[i]);
+            if (band >= BPS && gasleft() < PART_FLOOR && !_delayed(driver)) revert ShortOfGas();
             try IStation(address(this)).closeAll(drivers[i], band) returns (bool outside) {
+                // Too little gas for a call's allowance is never taken for
+                // a call that failed: the whole unwind is undone.
+                if (_shortOfGas()) revert ShortOfGas();
                 if (outside) blocked = true;
             } catch {
                 blocked = true;
@@ -227,7 +278,11 @@ library StationCloses {
         (uint256 markBefore, uint256 exitBefore) = driver.valueOf(address(this));
         Call[] memory calls;
         (calls, outside) = driver.close(address(this), WAD, band);
-        if (outside) return true;
+        // At the full band a driver whose closes settle in the transaction
+        // may sell only part of a holding per close: its calls come with
+        // `outside`, they are made, and the unwind isn't done.
+        bool partly = outside && band >= BPS && !delayed && calls.length != 0;
+        if (outside && !partly) return true;
         address[] memory targets = driver.targets();
         if (delayed) {
             // The venue acts after this transaction: place what is left to
@@ -248,11 +303,100 @@ library StationCloses {
             if (band >= BPS && flow.fullUnwindAt == 0) flow.fullUnwindAt = uint64(block.timestamp);
             return calls.length != 0;
         }
+        if (band >= BPS) {
+            // At the full band, which every holder shares, each call is made
+            // on its own with `ATTEMPT_GAS`: one that fails (a token whose
+            // transfers are paused, a pool that can't take the sale, a token
+            // that burns its gas) leaves only what it would have moved where
+            // it is, still counted by the driver, and everything else comes
+            // home. The unwind isn't done while one fails or a holding is
+            // left to sell. Inside the band the driver's part is all or
+            // nothing.
+            if (_runEach(s, calls, targets, false)) outside = true;
+            if (_shortOfGas()) return true;
+            if (_runEach(s, driver.sweep(address(this), exitBefore), targets, false)) outside = true;
+            return outside;
+        }
         uint256 held = s.balance();
-        s.run(calls, targets);
-        s.run(driver.sweep(address(this), exitBefore), targets);
+        _runEach(s, calls, targets, true);
+        _runEach(s, driver.sweep(address(this), exitBefore), targets, true);
         uint256 swept = s.balance() - held;
         if (swept < exitBefore.mulDiv(BPS - band, BPS)) revert IStation.ShortSweep();
+    }
+
+    /// Make each call, checked as `run` checks it; whether any failed. At
+    /// the full band each is made with exactly `ATTEMPT_GAS`, and one that
+    /// fails is left; with too little left for a call's floor, no more are
+    /// made and the unwind is marked short of gas, to be undone whole by
+    /// `unwindStopped`. `strict` (inside the band), each is made with all
+    /// the gas there is, and one that fails undoes the part. What a failed
+    /// call returns is never copied.
+    function _runEach(
+        StationLayout storage s,
+        Call[] memory calls,
+        address[] memory targets,
+        bool strict
+    ) private returns (bool failed) {
+        address dollar = address(s.asset());
+        for (uint256 i = 0; i < calls.length; i++) {
+            Call memory c = calls[i];
+            if (!s.allowed(c, targets, dollar)) revert StationStorage.BadCall();
+            if (strict) {
+                if (!_call(c.target, c.value, c.data, gasleft())) revert CallFailed();
+            } else {
+                // Too little left to give the call its allowance: the whole
+                // unwind is undone rather than the call left. Marked rather
+                // than raised, so nothing a driver or a token reverts with
+                // can pass for it.
+                if (gasleft() < ATTEMPT_FLOOR) {
+                    bytes32 slot = SHORT_OF_GAS_SLOT;
+                    assembly ("memory-safe") {
+                        tstore(slot, 1)
+                    }
+                    return failed;
+                }
+                if (!_call(c.target, c.value, c.data, ATTEMPT_GAS)) failed = true;
+            }
+        }
+    }
+
+    /// Make one call with `allowance` gas, and whether it went through.
+    function _call(
+        address target,
+        uint256 value,
+        bytes memory data,
+        uint256 allowance
+    ) private returns (bool ok) {
+        assembly ("memory-safe") {
+            ok := call(allowance, target, value, add(data, 32), mload(data), 0, 0)
+        }
+    }
+
+    /// Whether a part of this unwind stopped short of a call's floor.
+    function _shortOfGas() private view returns (bool short) {
+        bytes32 slot = SHORT_OF_GAS_SLOT;
+        assembly ("memory-safe") {
+            short := tload(slot)
+        }
+    }
+
+    /// Whether `driver`'s venue acts after the transaction. A driver whose
+    /// answer can't be read within a small allowance is taken not to be:
+    /// its part keeps the floor, and fails on the same read anyway.
+    function _delayed(address driver) private view returns (bool delayed) {
+        bytes memory data = abi.encodeCall(IDriver.exitPath, ());
+        uint256 allowance = EXIT_PATH_READ_GAS;
+        uint256 answer;
+        bool ok;
+        assembly ("memory-safe") {
+            ok := staticcall(allowance, driver, add(data, 32), mload(data), 0, 0)
+            if and(ok, gt(returndatasize(), 31)) {
+                returndatacopy(0, 0, 32)
+                answer := mload(0)
+            }
+            if lt(returndatasize(), 32) { ok := 0 }
+        }
+        delayed = ok && answer == uint256(ExitPath.Delayed);
     }
 
     // Delayed venues --------------------------------------------------------

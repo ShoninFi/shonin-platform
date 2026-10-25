@@ -138,8 +138,7 @@ dollar = "USDC"
 # `root` names the vault chain canonical for the root key: its
 # AttestationRegistry holds the root key's record (`rootKey()`), and its
 # allowlist decides which attested images may be given the root or a key
-# derived from it. It must be one of the network's EVM chains. Mainnet names
-# none yet, so it has no root key.
+# derived from it. It must be one of the network's EVM chains.
 
 [networks.local]
 base = "evm:31337"
@@ -160,6 +159,7 @@ base = "evm:8453"
 hyperliquid = "evm:999"
 robinhood = "evm:4663"
 solana = "solana:mainnet-beta"
+root = "base"
 
 # --- RPC settings: how often the services read a chain, and how much at once -
 # Whole milliseconds unless a name says otherwise. [rpc.defaults] holds every

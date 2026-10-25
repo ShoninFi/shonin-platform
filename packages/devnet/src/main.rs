@@ -8,7 +8,9 @@
 //! On the testnets it deploys the same platform in each chain's own dollar,
 //! with no stand-ins, signed by the accounts the developer's mnemonic derives,
 //! and drives nothing: the chains keep their own time and their real venues'
-//! markets. It never deploys to mainnet ([`MAINNET_MISSING`]).
+//! markets. Its development commands never touch mainnet
+//! ([`MAINNET_MISSING`]): mainnet has commands of its own (`mainnet-deploy`,
+//! `mainnet-admin-steps`, `mainnet-verify`), which deploy only what ships.
 //!
 //! On any network it serves the ops dashboard on its port: what is running,
 //! locally and in the cloud.
@@ -22,8 +24,12 @@ mod economics;
 mod fund;
 mod fund_wallet;
 mod hyperliquid_vaults;
+mod mainnet_evm;
+mod mainnet_guard;
+mod mainnet_solana;
 mod market;
 mod publish;
+mod read_proxy;
 mod seed;
 mod smoke;
 mod solana;
@@ -36,7 +42,7 @@ mod testnet_market;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chain::{
     ChainArgs, ChainConfig, ChainKey, ChainKind, Deployments, NetworkName, Target, connect_to,
 };
@@ -101,6 +107,43 @@ struct Args {
     command: Option<Command>,
 }
 
+/// What every mainnet command takes. None is read from the environment:
+/// each is given on the command line, by the owner, for this run.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct MainnetArgs {
+    /// The hardware key's address: admin of every contract from the first
+    /// transaction, and where the platform's fees go. Required.
+    #[arg(long)]
+    admin: Option<String>,
+    /// A file holding the deployer's private key (one 0x hex line), held by
+    /// the owner. With --confirm-mainnet, a real send.
+    #[arg(long)]
+    deployer_keyfile: Option<PathBuf>,
+    /// The chain ids being sent to, comma-separated, exactly.
+    #[arg(long)]
+    confirm_mainnet: Option<String>,
+    /// Rehearse on local anvil forks of the mainnets: every endpoint must be
+    /// local, and nothing is written beside the committed addresses.
+    #[arg(long)]
+    on_fork: bool,
+    /// The deployment generation, given explicitly and never read from the
+    /// environment: mainnet's is 1, and any other is refused.
+    #[arg(long)]
+    mainnet_generation: Option<u64>,
+}
+
+impl MainnetArgs {
+    fn flags(&self) -> mainnet_guard::Flags {
+        mainnet_guard::Flags {
+            admin: self.admin.clone(),
+            deployer_keyfile: self.deployer_keyfile.clone(),
+            confirm_mainnet: self.confirm_mainnet.clone(),
+            on_fork: self.on_fork,
+            generation: self.mainnet_generation,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Deploy the contracts to every EVM chain of the network, and on the
@@ -109,6 +152,152 @@ enum Command {
     /// Solana programs are deployed by `task contracts:solana:deploy` and set
     /// up by `solana-setup`.
     Deploy,
+    /// Mainnet's EVM deploy, of exactly what ships on each chain: without
+    /// the sending flags a dry run printing every contract, its arguments,
+    /// its address and the admin's steps; with --on-fork a rehearsal on
+    /// local forks; with --deployer-keyfile and --confirm-mainnet a real
+    /// send. The admin's steps are written for the hardware key.
+    MainnetDeploy {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// The outside contracts each mainnet's deploy builds on.
+        #[arg(long, default_value = "config/mainnet.toml")]
+        venues: PathBuf,
+        /// Where the admin's prepared steps are written.
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+        /// The operator's Google Cloud project, proposed among the admin's
+        /// steps once it exists.
+        #[arg(long)]
+        project: Option<String>,
+        /// On a fork rehearsal alone: replace a recorded deployment file
+        /// whose contracts are not on the fork (a fork restarted under
+        /// another admin). Never on mainnet, where a recorded file is never
+        /// overwritten by another deployment.
+        #[arg(long)]
+        overwrite_fork_record: bool,
+    },
+    /// Mainnet: the admin's prepared steps. On a fork, sent as the admin
+    /// (impersonated), and with --warp the fork's clock moved past the
+    /// timelock; on mainnet never sent, but each step's command for the
+    /// hardware wallet printed and written beside the steps.
+    MainnetAdminSteps {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+        #[arg(long)]
+        warp: bool,
+    },
+    /// A local Surfpool fork of mainnet-beta for ON_FORK=1 rehearsals, its
+    /// datasource a read-only forwarder on this machine that passes on reads
+    /// alone (to mainnet-beta's public endpoint, or
+    /// SHONIN_FORK_UPSTREAM_SOLANA) and refuses everything else. Runs until
+    /// stopped.
+    SolanaMainnetFork {
+        #[arg(long, default_value_t = 19210)]
+        port: u16,
+        #[arg(long, default_value_t = 19211)]
+        ws_port: u16,
+        #[arg(long, default_value_t = 19209)]
+        proxy_port: u16,
+        /// Never printed: it may carry a key.
+        #[arg(
+            long,
+            env = "SHONIN_FORK_UPSTREAM_SOLANA",
+            hide_env_values = true,
+            hide_default_value = true,
+            default_value = read_proxy::PUBLIC_UPSTREAM
+        )]
+        upstream: String,
+    },
+    /// Mainnet's Solana program ids for the mainnet build: from the owner's
+    /// keypair directory (each checked against any committed `mainnet-id`,
+    /// none written), or for a dry run without one, stand-ins. Written as the
+    /// list `SHONIN_MAINNET_IDS` names.
+    MainnetSolanaIds {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// The owner's program keypairs, `<library name>-keypair.json` each.
+        #[arg(long)]
+        program_keypairs: Option<PathBuf>,
+        /// Where each program's `mainnet-id` is committed.
+        #[arg(long, default_value = "contracts/solana/programs")]
+        program_sources: PathBuf,
+        /// Where a dry run's stand-in keypairs are made.
+        #[arg(long)]
+        stand_ins: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Mainnet's Solana deploy, from a build with the mainnet ids: without
+    /// the sending flags a dry run printing the plan; with --on-fork a
+    /// rehearsal on a local Surfpool fork of mainnet-beta; with
+    /// --deployer-keyfile and --confirm-mainnet mainnet-beta a real send.
+    /// Every program is set up, made final and read back final.
+    MainnetSolanaDeploy {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long)]
+        program_keypairs: Option<PathBuf>,
+        /// The mainnet build of the programs (`<library name>.so`).
+        #[arg(long)]
+        programs_dir: PathBuf,
+        #[arg(long, default_value = "contracts/solana/programs")]
+        program_sources: PathBuf,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+        /// Where a rehearsal keeps its throwaway deployer.
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Mainnet's Solana admin steps: on a fork sent from the stand-in
+    /// admin's keypair (--admin-keyfile, which must be --admin), with --warp
+    /// past the timelock; on mainnet never sent, but printed and written for
+    /// the hardware key.
+    MainnetSolanaAdminSteps {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long)]
+        admin_keyfile: Option<PathBuf>,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        warp: bool,
+    },
+    /// Mainnet's Solana read-back: every program final at its recorded id
+    /// and running the deployed build, and every setting, from the cluster.
+    /// Read-only.
+    MainnetSolanaVerify {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// The build that was deployed: every program's code on the cluster
+        /// is compared with it byte for byte.
+        #[arg(long)]
+        programs_dir: PathBuf,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        expect_in_force: bool,
+    },
+    /// Mainnet: read every address and setting of the deployment back from
+    /// each chain and compare it with its file, this build's plan and the
+    /// outside contracts' file. Read-only.
+    MainnetVerify {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long, default_value = "config/mainnet.toml")]
+        venues: PathBuf,
+        #[arg(long)]
+        project: Option<String>,
+        /// Require the driver (and project) in force, the timelock passed.
+        #[arg(long)]
+        expect_in_force: bool,
+    },
     /// On the testnets, set Solana devnet up from the programs already
     /// deployed there, as a development cluster is set up: every role funded
     /// by transfer from the deployer (the funding file's amounts), Circle's
@@ -455,7 +644,162 @@ async fn main() -> Result<()> {
         bail!("{MAINNET_MISSING}");
     }
 
+    let mainnet_command = matches!(
+        args.command,
+        Some(
+            Command::MainnetDeploy { .. }
+                | Command::MainnetAdminSteps { .. }
+                | Command::MainnetVerify { .. }
+                | Command::MainnetSolanaIds { .. }
+                | Command::MainnetSolanaDeploy { .. }
+                | Command::MainnetSolanaAdminSteps { .. }
+                | Command::MainnetSolanaVerify { .. }
+        )
+    );
+    if mainnet_command && target.network != NetworkName::Mainnet {
+        bail!("the mainnet commands run with NETWORK=mainnet alone");
+    }
+
+    let solana_mainnet = || -> Result<(ChainKey, ChainConfig)> {
+        solana_clusters(&target)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("the mainnet network names no Solana cluster"))
+    };
     match args.command {
+        Some(Command::SolanaMainnetFork {
+            port,
+            ws_port,
+            proxy_port,
+            upstream,
+        }) => read_proxy::fork(port, ws_port, proxy_port, &upstream).await,
+        Some(Command::MainnetSolanaIds {
+            mainnet,
+            program_keypairs,
+            program_sources,
+            stand_ins,
+            out,
+        }) => mainnet_solana::ids(
+            &mainnet.flags(),
+            program_keypairs.as_deref(),
+            &program_sources,
+            &stand_ins,
+            &out,
+        ),
+        Some(Command::MainnetSolanaDeploy {
+            mainnet,
+            program_keypairs,
+            programs_dir,
+            program_sources,
+            admin_steps_dir,
+            state_dir,
+            project,
+        }) => {
+            let (key, config) = solana_mainnet()?;
+            mainnet_solana::deploy(mainnet_solana::DeployInputs {
+                key: &key,
+                config: &config,
+                flags: mainnet.flags(),
+                program_keypairs,
+                programs_dir: &programs_dir,
+                sources: &program_sources,
+                deployments_dir: &target.deployments_dir,
+                admin_steps_dir: &admin_steps_dir,
+                state_dir: &state_dir,
+                project,
+            })
+            .await
+        }
+        Some(Command::MainnetSolanaAdminSteps {
+            mainnet,
+            admin_keyfile,
+            admin_steps_dir,
+            project,
+            warp,
+        }) => {
+            let (key, config) = solana_mainnet()?;
+            mainnet_solana::admin(
+                &key,
+                &config,
+                &mainnet.flags(),
+                admin_keyfile.as_deref(),
+                &admin_steps_dir,
+                project.as_deref(),
+                warp,
+            )
+            .await
+        }
+        Some(Command::MainnetSolanaVerify {
+            mainnet,
+            programs_dir,
+            project,
+            expect_in_force,
+        }) => {
+            let (key, config) = solana_mainnet()?;
+            mainnet_solana::verify(
+                &key,
+                &config,
+                &mainnet.flags(),
+                &target.deployments_dir,
+                &programs_dir,
+                project.as_deref(),
+                expect_in_force,
+            )
+            .await
+        }
+        Some(Command::MainnetDeploy {
+            mainnet,
+            venues,
+            admin_steps_dir,
+            project,
+            overwrite_fork_record,
+        }) => {
+            let venues = mainnet_evm::Venues::read(&venues)?;
+            mainnet_evm::run(mainnet_evm::DeployInputs {
+                chains: only(&target, one, evm_chains(&target)),
+                names: chain_names(&target),
+                artifacts: &args.artifacts,
+                venues: &venues,
+                deployments_dir: &target.deployments_dir,
+                admin_steps_dir: &admin_steps_dir,
+                project,
+                flags: mainnet.flags(),
+                overwrite_fork_record,
+            })
+            .await
+        }
+        Some(Command::MainnetAdminSteps {
+            mainnet,
+            admin_steps_dir,
+            warp,
+        }) => {
+            mainnet_evm::admin(
+                only(&target, one, evm_chains(&target)),
+                &admin_steps_dir,
+                &mainnet.flags(),
+                warp,
+            )
+            .await
+        }
+        Some(Command::MainnetVerify {
+            mainnet,
+            venues,
+            project,
+            expect_in_force,
+        }) => {
+            let venues = mainnet_evm::Venues::read(&venues)?;
+            mainnet_evm::verify(
+                only(&target, one, evm_chains(&target)),
+                &chain_names(&target),
+                &args.artifacts,
+                &venues,
+                &target.deployments_dir,
+                &mainnet.flags(),
+                project.as_deref(),
+                expect_in_force,
+            )
+            .await
+        }
         Some(Command::Deploy) if !local && one && target.key.kind == ChainKind::Solana => {
             bail!(
                 "on {} the Solana programs are deployed by task contracts:solana:deploy and set up by solana-setup (task chains:solana-setup)",
@@ -1352,12 +1696,15 @@ async fn root_registry(target: &Target) -> Result<(String, ChainKey, chain::Clie
     Ok((config.label, key, client, deployments))
 }
 
-/// Why the devnet never deploys to mainnet: what it deploys is the stand-in
-/// stack, which is for local chains and testnets.
-pub const MAINNET_MISSING: &str = "The devnet does not deploy to mainnet. What it deploys is the \
-stand-in stack: a dollar anyone may mint, a stand-in venue, and an attestation verifier that trusts \
-one development key. It is for local chains and testnets. Mainnet addresses are committed under \
-config/deployments/mainnet.";
+/// Why the devnet's development commands never touch mainnet: what they
+/// deploy and send is the stand-in stack and its roles, which are for local
+/// chains and testnets.
+pub const MAINNET_MISSING: &str = "The devnet's development commands don't touch mainnet: what \
+they deploy is the stand-in stack (a dollar anyone may mint, a stand-in venue, and an attestation \
+verifier that trusts one development key) and they sign as roles derived from a mnemonic. Mainnet \
+has its own: `task chains:deploy NETWORK=mainnet` (mainnet-deploy) deploys only what ships, \
+`task chains:admin-steps NETWORK=mainnet` prepares the hardware key's steps, and \
+`task chains:verify-deploy NETWORK=mainnet` reads it all back.";
 
 /// Each role's account on every EVM chain of the network, with its gas, and
 /// on the testnets the funder, what each role is short of its amount in the

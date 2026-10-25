@@ -183,7 +183,8 @@ contract DriverReadsAMirrorFeedTest is Test {
         listings[0] = RobinhoodDriver.Listing(
             address(stock),
             IAggregatorV3(address(feed)),
-            IUniswapV3Pool(address(new PoolDouble(address(stock), address(dollar))))
+            IUniswapV3Pool(address(new PoolDouble(address(stock), address(dollar)))),
+            type(uint256).max
         );
         driver = new RobinhoodDriver(
             RobinhoodDriver.Venue({

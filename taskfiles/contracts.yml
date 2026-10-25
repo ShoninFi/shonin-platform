@@ -85,13 +85,48 @@ tasks:
         done
 
   solana:deploy:
-    desc: "Deploy the Solana programs: to the local cluster, set up as the devnet sets it up, or with NETWORK=testnet every program to devnet (mainnet refuses)"
+    desc: "Deploy the Solana programs: to the local cluster, set up as the devnet sets it up, or with NETWORK=testnet every program to devnet. With NETWORK=mainnet the eight programs that ship, built --features mainnet with the ids of MAINNET_PROGRAM_KEYPAIRS=<dir> (<library name>-keypair.json each), set up with ADMIN=<the hardware key's Solana address> as admin and made final: alone a dry run printing the plan (stand-in ids without the keypairs); ON_FORK=1 rehearses on the local Surfpool fork contracts:solana:mainnet-fork runs (or SHONIN_RPC_SOLANA_MAINNET_BETA=http://127.0.0.1:<port>), writing under .shonin/mainnet-fork; DEPLOYER_KEYFILE=<keypair> CONFIRM_MAINNET=mainnet-beta sends for real, writes each program's mainnet-id and config/deployments/mainnet. A run stopped part way resumes: each program has its own buffer (kept in .shonin/mainnet/solana/buffers), any other buffer the deployer holds is closed, and a set-up already on the cluster is refused unless it holds this ADMIN and the mainnet settings; nothing is made final until every set-up account reads back as this deploy's. PROJECT=<id> adds the operator's project to the admin's steps"
     vars:
       DEPLOYER_KEYPAIR: '{{joinPath .PATH_ROOT ".shonin" .NETWORK "solana-deployer.json"}}'
       DEVNET_PROGRAMS: '{{joinPath .PATH_ROOT ".shonin" "testnet" "solana-programs"}}'
     cmds:
       - |
         set -e
+        if [ "{{.NETWORK}}" = mainnet ]; then
+          # Mainnet. The ids are the owner's keypairs' (checked against any
+          # committed mainnet-id, none written yet), or a dry run's stand-ins;
+          # the programs and the deploy tool are built with them, then the
+          # deploy runs in the mode the flags give.
+          state="{{.PATH_MAINNET_SOLANA}}"
+          mkdir -p "$state"
+          {{if .ON_FORK}}
+          # The rehearsal's fork: contracts:solana:mainnet-fork's, unless set.
+          export SHONIN_RPC_SOLANA_MAINNET_BETA="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
+          export SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"
+          {{end}}
+          {{.DEVNET}} --vault-chain solana mainnet-solana-ids {{.MAINNET_ARGS}} \
+            {{if .MAINNET_PROGRAM_KEYPAIRS}}--program-keypairs {{shellQuote .MAINNET_PROGRAM_KEYPAIRS}}{{end}} \
+            --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
+            --stand-ins "$state/stand-in-program-keypairs" --out "$state/program-ids"
+          export SHONIN_MAINNET_IDS="$state/program-ids"
+          out="$state/programs"
+          rm -rf "$out" && mkdir -p "$out"
+          cd "{{.PATH_CONTRACTS_SOLANA}}"
+          grep -v '^#' "$SHONIN_MAINNET_IDS" | while read -r name id; do
+            cargo build-sbf --manifest-path "programs/$(echo "$name" | tr _ -)/Cargo.toml" \
+              --features mainnet --sbf-out-dir "$out" < /dev/null
+          done
+          # cargo build-sbf leaves a keypair of its own beside each program:
+          # the ids are the owner's, so these are never used.
+          rm -f "$out"/*-keypair.json
+          cd "{{.PATH_ROOT}}"
+          {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-deploy {{.MAINNET_ARGS}} \
+            {{if .MAINNET_PROGRAM_KEYPAIRS}}--program-keypairs {{shellQuote .MAINNET_PROGRAM_KEYPAIRS}}{{end}} \
+            --programs-dir "$out" --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
+            --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}" --state-dir "$state" \
+            {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+          exit 0
+        fi
         { read -r rpc; read -r record; } <<EOF
         $({{.DEVNET}} --vault-chain solana chain)
         EOF
@@ -104,7 +139,7 @@ tasks:
             exit 0 ;;
           testnet) ;;
           *)
-            echo "This task does not deploy to mainnet. A program's mainnet id is committed in contracts/solana/programs/<name>/mainnet-id, and a mainnet build uses it with --features mainnet."
+            echo "NETWORK={{.NETWORK}} is not a network this task deploys to."
             exit 1 ;;
         esac
         # Devnet. The deployer and every program are keys of
@@ -176,3 +211,43 @@ tasks:
         jq --argjson programs "$programs" '.programs = $programs' "$record" > "$record.new"
         mv "$record.new" "$record"
         echo "(recorded in $record)"
+
+  solana:mainnet-fork:
+    desc: "A local Surfpool fork of mainnet-beta for ON_FORK=1 rehearsals of the Solana mainnet deploy, on 127.0.0.1:19210 (websocket 19211), the address the rehearsal tasks use by default. Its datasource is a read-only forwarder on 127.0.0.1:19209 that passes on reads alone (get… methods) to mainnet-beta's public endpoint, or SHONIN_FORK_UPSTREAM_SOLANA, one request each, and refuses everything else. Runs until stopped (needs surfpool)"
+    cmds:
+      - "{{.DEVNET}} solana-mainnet-fork --port 19210 --ws-port 19211 --proxy-port 19209"
+
+  solana:admin-steps:
+    desc: "Mainnet's Solana admin steps (proposing Orca's driver, and PROJECT's project): with ON_FORK=1 sent from the stand-in admin ADMIN_KEYFILE=<keypair> (which must be ADMIN) on the local fork, WARP=1 then moving its clock past the timelock; otherwise nothing is sent: each step still to do is printed (program, accounts, data) and written to .shonin/mainnet/admin-steps/admin-steps-solana-mainnet-beta.json for the hardware key (NETWORK=mainnet ADMIN=<address>)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the admin's prepared steps are mainnet's (NETWORK={{.NETWORK}})."
+    cmds:
+      # On a fork the rehearsal's ids; on mainnet the committed mainnet-id
+      # files the real send wrote.
+      - >-
+        {{if .ON_FORK}}SHONIN_RPC_SOLANA_MAINNET_BETA="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
+        SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"{{end}}
+        SHONIN_MAINNET_IDS="{{if .ON_FORK}}{{.PATH_MAINNET_SOLANA}}/program-ids{{end}}"
+        {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-admin-steps {{.MAINNET_ARGS}}
+        --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}"
+        {{if .ADMIN_KEYFILE}}--admin-keyfile {{shellQuote .ADMIN_KEYFILE}}{{end}}
+        {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+        {{if .WARP}}--warp{{end}}
+
+  solana:verify-deploy:
+    desc: "Mainnet's Solana read-back, read-only: each of the eight programs final at its recorded id and running this build, the registry's admin ADMIN, its timelock and floor two days, the Confidential Space checker its only checker with its pins, no development checker, USDC everywhere, fees and the vault factory ADMIN's, thirty days' notice on prices, Orca's driver's pool and price account and whether it is proposed (IN_FORCE=1: in force, and PROJECT's project proposed). ON_FORK=1 reads the rehearsal's (NETWORK=mainnet ADMIN=<address>)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the read-back is mainnet's (NETWORK={{.NETWORK}})."
+    cmds:
+      # On a fork the rehearsal's ids and build; on mainnet the committed
+      # mainnet-id files and the build the real send deployed.
+      - >-
+        {{if .ON_FORK}}SHONIN_RPC_SOLANA_MAINNET_BETA="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
+        SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"{{end}}
+        SHONIN_MAINNET_IDS="{{if .ON_FORK}}{{.PATH_MAINNET_SOLANA}}/program-ids{{end}}"
+        {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-verify {{.MAINNET_ARGS}}
+        --programs-dir "{{if .ON_FORK}}{{.PATH_MAINNET_SOLANA}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "solana"}}{{end}}/programs"
+        {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+        {{if .IN_FORCE}}--expect-in-force{{end}}

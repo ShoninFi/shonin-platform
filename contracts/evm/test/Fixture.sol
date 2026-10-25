@@ -95,6 +95,15 @@ contract Fixture is Test {
         vm.etch(address(driver), replacement.code);
     }
 
+    /// The test stands in for the vault factory that `stationFactory` is
+    /// initialised with: it answers with the fixture's dollar and registry,
+    /// and names that station factory as its own.
+    function actAsVaultFactoryFor(address stationFactory) internal {
+        vm.mockCall(address(this), abi.encodeWithSignature("asset()"), abi.encode(address(usd)));
+        vm.mockCall(address(this), abi.encodeWithSignature("attestation()"), abi.encode(address(attestation)));
+        vm.mockCall(address(this), abi.encodeWithSignature("stationFactory()"), abi.encode(stationFactory));
+    }
+
     function setUp() public virtual {
         (author, authorKey) = makeAddrAndKey("author");
         (alice, aliceKey) = makeAddrAndKey("alice");

@@ -36,6 +36,7 @@ contract StationFactory is IStationFactory {
     error NotBlessed();
     error WrongChain();
     error OutOfRange();
+    error NotTheVaultFactorys();
 
     constructor(address initializer_) {
         initializer = initializer_;
@@ -57,6 +58,15 @@ contract StationFactory is IStationFactory {
         ) {
             revert NotInitialized();
         }
+        // The dollar and the registry are the vault factory's own, and it
+        // creates its stations here: a slip in this one step would otherwise
+        // leave every station on the chain valuing and sending another
+        // token, or pinning drivers from another registry, for good.
+        IFactoryWiring wiring = IFactoryWiring(vaultFactory_);
+        if (
+            wiring.asset() != asset_ || wiring.attestation() != attestation_
+                || wiring.stationFactory() != address(this)
+        ) revert NotTheVaultFactorys();
         attestation = attestation_;
         asset = asset_;
         vaultFactory = vaultFactory_;
@@ -153,4 +163,11 @@ contract StationFactory is IStationFactory {
     function _salt(uint256 vaultChain, address vault) private pure returns (bytes32) {
         return keccak256(abi.encode(vaultChain, vault));
     }
+}
+
+/// What the station factory checks of the vault factory it is given.
+interface IFactoryWiring {
+    function asset() external view returns (address);
+    function attestation() external view returns (address);
+    function stationFactory() external view returns (address);
 }

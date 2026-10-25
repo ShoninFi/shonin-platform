@@ -213,46 +213,93 @@ impl<'a> TickArray<'a> {
         Ok(None)
     }
 
-    /// The offset of the first initialized tick from `offset` (counted in
-    /// ticks of the array, 0 to 87) downwards, itself included, or upwards,
-    /// itself excluded.
-    pub fn next_initialized(&self, offset: i32, down: bool) -> Option<i32> {
-        let data = &self.data;
-        if self.dynamic {
-            let bitmap = u128_at(data, 44);
+    /// Hands `each` the offset (counted in ticks of the array, 0 to 87) and
+    /// the liquidity's change going up of every initialized tick from
+    /// `offset` downwards, itself included, or upwards, itself excluded,
+    /// nearest first, for as long as it answers true; false if it stopped
+    /// one. Read straight from the array's bytes, as [`Self::tick`] reads
+    /// one tick: a sale's path meets every tick on its way, and at a small
+    /// spacing that is hundreds of them.
+    pub fn each_initialized(
+        &self,
+        offset: i32,
+        down: bool,
+        mut each: impl FnMut(i32, i128) -> bool,
+    ) -> Result<bool> {
+        let data: &[u8] = &self.data;
+        if !self.dynamic {
+            let net = |at: i32| -> Option<i128> {
+                let base = 12 + at as usize * FIXED_TICK_LEN;
+                (data[base] != 0).then(|| i128_at(data, base + 1))
+            };
             if down {
-                if offset < 0 {
-                    return None;
+                let mut at = offset.min(TICKS_PER_ARRAY - 1);
+                while at >= 0 {
+                    if let Some(net) = net(at) {
+                        if !each(at, net) {
+                            return Ok(false);
+                        }
+                    }
+                    at -= 1;
                 }
-                let below = bitmap & (u128::MAX >> (127 - offset.min(127) as u32));
-                (below != 0).then(|| 127 - below.leading_zeros() as i32)
             } else {
-                let from = offset + 1;
-                if from >= TICKS_PER_ARRAY {
-                    return None;
+                let mut at = offset.max(-1) + 1;
+                while at < TICKS_PER_ARRAY {
+                    if let Some(net) = net(at) {
+                        if !each(at, net) {
+                            return Ok(false);
+                        }
+                    }
+                    at += 1;
                 }
-                let above = bitmap & !((1u128 << from) - 1);
-                (above != 0).then(|| above.trailing_zeros() as i32)
             }
-        } else if down {
-            let mut at = offset.min(TICKS_PER_ARRAY - 1);
-            while at >= 0 {
-                if data[12 + at as usize * FIXED_TICK_LEN] != 0 {
-                    return Some(at);
-                }
-                at -= 1;
-            }
-            None
-        } else {
-            let mut at = offset + 1;
-            while at < TICKS_PER_ARRAY {
-                if data[12 + at as usize * FIXED_TICK_LEN] != 0 {
-                    return Some(at);
-                }
-                at += 1;
-            }
-            None
+            return Ok(true);
         }
+        // A dynamic array keeps a bitmap of its initialized ticks, then each
+        // tick in order: one byte for one that isn't, that byte and its data
+        // for one that is. A tick's data follows the initialized ones below
+        // it, so their count is kept as the walk goes.
+        let bitmap = u128_at(data, 44) & ((1u128 << TICKS_PER_ARRAY) - 1);
+        let net = |at: usize, below: usize| -> Result<i128> {
+            let base = DYNAMIC_HEADER + below * (DYNAMIC_TICK_LEN + 1) + (at - below) + 1;
+            require!(
+                data.len() >= base + DYNAMIC_TICK_LEN && data[base - 1] == 1,
+                DriverError::WrongAccounts
+            );
+            Ok(i128_at(data, base))
+        };
+        if down {
+            if offset < 0 {
+                return Ok(true);
+            }
+            let mut left = bitmap & (u128::MAX >> (127 - offset.min(127) as u32));
+            let mut below = left.count_ones() as usize;
+            while left != 0 {
+                let at = 127 - left.leading_zeros() as usize;
+                left &= !(1u128 << at);
+                below -= 1;
+                if !each(at as i32, net(at, below)?) {
+                    return Ok(false);
+                }
+            }
+        } else {
+            let from = offset.max(-1) + 1;
+            if from >= TICKS_PER_ARRAY {
+                return Ok(true);
+            }
+            let under = (1u128 << from) - 1;
+            let mut left = bitmap & !under;
+            let mut below = (bitmap & under).count_ones() as usize;
+            while left != 0 {
+                let at = left.trailing_zeros() as usize;
+                left &= left - 1;
+                if !each(at as i32, net(at, below)?) {
+                    return Ok(false);
+                }
+                below += 1;
+            }
+        }
+        Ok(true)
     }
 
     /// The tick `tick` of a pool of `tick_spacing`, which this array must

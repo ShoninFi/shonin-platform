@@ -20,7 +20,7 @@
 //! - `pools`: `--pool-tokens` of each listed token added to its pool as a
 //!   full-range position, with the dollar at the pool's own price (minted
 //!   where anyone may mint it, else the funder's).
-//! - `driver`: the Robinhood driver deployed by the admin from the listing
+//! - `driver`: the Robinhood driver deployed by the admin from the listings
 //!   resolved against the recorded mirrors, recorded in
 //!   `robinhood-driver-evm-<chain>.json`, and with `--propose` proposed to
 //!   the chain's registry under the name `config/drivers.toml` lists for
@@ -52,8 +52,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Client, NetworkName, Role};
 use robinhood::listings::{
-    self, FEED_DECIMALS, Feed, MODULE_PROXY_FACTORY, MirrorFeeds, MirrorRecord, ROLES_MASTERCOPY,
-    SAFE_PROXY_FACTORY, SAFE_SINGLETON, Venue,
+    self, FEED_DECIMALS, Feed, MAX_LISTINGS, MODULE_PROXY_FACTORY, MirrorFeeds, MirrorRecord,
+    ROLES_MASTERCOPY, Resolved, SAFE_PROXY_FACTORY, SAFE_SINGLETON, Venue,
 };
 use serde::{Deserialize, Serialize};
 use testnet_market::bindings::{AggregatorV3Interface, IMirrorFeed, IToken, IUniswapV3Pool};
@@ -99,6 +99,7 @@ alloy::sol! {
             address token;
             address feed;
             address pool;
+            uint256 maxSale;
         }
         constructor(DriverVenue venue, DriverListing[] listings);
     }
@@ -914,14 +915,7 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
                         maxFeedAge: U256::from(MAX_FEED_AGE),
                         twapWindow: TWAP_WINDOW,
                     },
-                    listings: resolved
-                        .iter()
-                        .map(|listing| RobinhoodDriver::DriverListing {
-                            token: listing.token.address,
-                            feed: listing.feed,
-                            pool: listing.pool,
-                        })
-                        .collect(),
+                    listings: driver_listings(&resolved)?,
                 }
                 .abi_encode(),
             );
@@ -978,9 +972,92 @@ async fn driver(on: &OnChain<'_>, propose: bool) -> Result<()> {
     Ok(())
 }
 
+/// What the driver's constructor lists: each resolved token with a maximum
+/// sale, the rest kept priced but not listed. More than the driver takes,
+/// or none, is refused before anything is sent.
+fn driver_listings(resolved: &[Resolved]) -> Result<Vec<RobinhoodDriver::DriverListing>> {
+    let listings: Vec<_> = resolved
+        .iter()
+        .filter_map(|listing| {
+            listing
+                .max_sale
+                .map(|max_sale| RobinhoodDriver::DriverListing {
+                    token: listing.token.address,
+                    feed: listing.feed,
+                    pool: listing.pool,
+                    maxSale: U256::from(max_sale),
+                })
+        })
+        .collect();
+    if listings.is_empty() || listings.len() > MAX_LISTINGS {
+        bail!(
+            "the driver would list {} tokens, and it takes 1 to {MAX_LISTINGS}",
+            listings.len()
+        );
+    }
+    if listings.iter().any(|listing| listing.maxSale.is_zero()) {
+        bail!("a listing's max sale is zero, and the driver refuses zero");
+    }
+    Ok(listings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved(venue: &Venue) -> Vec<Resolved> {
+        let mirrors = MirrorFeeds {
+            chain_id: venue.chain,
+            feeds: venue
+                .listed
+                .iter()
+                .filter_map(|listing| match listing.feed {
+                    Feed::Mirror { chain, source } => Some((
+                        listing.token.symbol.to_string(),
+                        MirrorRecord {
+                            address: Address::repeat_byte(0xfe),
+                            source,
+                            source_chain_id: chain,
+                        },
+                    )),
+                    Feed::Chainlink(_) => None,
+                })
+                .collect(),
+        };
+        venue.resolve(&mirrors).unwrap()
+    }
+
+    #[test]
+    fn each_test_venue_s_driver_is_built_from_at_most_its_maximum_listings_with_their_max_sales() {
+        for venue in [&listings::ROBINHOOD_TESTNET, &listings::BASE_SEPOLIA_VENUE] {
+            let all = resolved(venue);
+            let built = driver_listings(&all).unwrap();
+            assert!(built.len() <= MAX_LISTINGS, "{}", venue.label);
+            for listing in &built {
+                let source = all
+                    .iter()
+                    .find(|resolved| resolved.token.address == listing.token)
+                    .unwrap();
+                assert_eq!(listing.maxSale, U256::from(source.max_sale.unwrap()));
+                assert_eq!((listing.feed, listing.pool), (source.feed, source.pool));
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_listing_more_than_it_takes_or_nothing_is_refused() {
+        let mut all = resolved(&listings::ROBINHOOD_TESTNET);
+        for listing in &mut all {
+            listing.max_sale = Some(1);
+        }
+        assert!(driver_listings(&all).is_err());
+        for listing in &mut all {
+            listing.max_sale = None;
+        }
+        assert!(driver_listings(&all).is_err());
+        all[0].max_sale = Some(0);
+        assert!(driver_listings(&all).is_err());
+    }
 
     #[test]
     fn a_driver_is_refused_for_a_deployment_whose_dollar_is_not_the_venue_s() {

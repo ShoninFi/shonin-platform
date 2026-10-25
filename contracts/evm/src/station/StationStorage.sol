@@ -109,23 +109,7 @@ library StationStorage {
         address dollar = address(asset(s));
         for (uint256 i = 0; i < calls.length; i++) {
             Call memory c = calls[i];
-            bool allowed;
-            if (c.target == dollar) {
-                if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
-                    // The spender: the first argument, after the selector.
-                    bytes memory data = c.data;
-                    uint256 word;
-                    assembly ("memory-safe") {
-                        word := mload(add(data, 36))
-                    }
-                    // Not an address in its word: no approval anyone checked.
-                    address spender = address(uint160(word));
-                    allowed = word >> 160 == 0 && includes(targets, spender) && !ours(s, spender);
-                }
-            } else {
-                allowed = includes(targets, c.target) && !ours(s, c.target);
-            }
-            if (!allowed) revert BadCall();
+            if (!allowed(s, c, targets, dollar)) revert BadCall();
             (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
             if (!ok) {
                 assembly {
@@ -133,6 +117,26 @@ library StationStorage {
                 }
             }
         }
+    }
+
+    /// Whether the station makes `c` for a driver listing `targets`.
+    function allowed(
+        StationLayout storage s,
+        Call memory c,
+        address[] memory targets,
+        address dollar
+    ) internal view returns (bool) {
+        if (c.target != dollar) return includes(targets, c.target) && !ours(s, c.target);
+        if (c.data.length != 68 || bytes4(c.data) != APPROVE) return false;
+        // The spender: the first argument, after the selector.
+        bytes memory data = c.data;
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(data, 36))
+        }
+        // Not an address in its word: no approval anyone checked.
+        address spender = address(uint160(word));
+        return word >> 160 == 0 && includes(targets, spender) && !ours(s, spender);
     }
 
     function ours(StationLayout storage s, address target) internal view returns (bool) {

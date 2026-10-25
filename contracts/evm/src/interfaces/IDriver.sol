@@ -59,7 +59,10 @@ interface IDriver {
     function exitPath() external view returns (ExitPath);
     function valuation() external view returns (ValuationKind);
 
-    /// Let `key` trade the station's account until `validUntil`.
+    /// Let `key` trade the station's account until `validUntil`, where the
+    /// venue can end an approval by itself; where it can't, until the key
+    /// is revoked (the station's keeper revokes a key whose blessing has
+    /// lapsed).
     function approveKey(
         address station,
         address key,
@@ -72,9 +75,18 @@ interface IDriver {
     function withdraw(address station, uint256 amount) external view returns (Call[] memory);
     /// Close `fraction` (1e18 is all) of every position, each order no worse
     /// than `bandBps` from the venue's own price; at 10,000 or more, at any
-    /// price, never blocked. `blocked` is true, with no
-    /// calls, when a market is outside the band: nothing is closed then, so a
-    /// leaver is never sold through a market that has run away.
+    /// price. A stopped station's full unwind at 10,000, through a driver
+    /// whose closes settle in the transaction, makes each call on its own
+    /// with a fixed allowance of gas (`StationCloses.ATTEMPT_GAS`) and lets
+    /// one that fails be, so no call may count on an earlier one having
+    /// gone through except to fail without it (an approval and the sale it
+    /// is for), and each call must fit that allowance with room to spare.
+    /// `blocked` is true, with no calls, when a market is outside the band:
+    /// nothing is closed then, so a leaver is never sold through a market
+    /// that has run away. At 10,000 such a driver may instead sell only
+    /// part of a holding, to keep each sale within the allowance: it
+    /// returns its calls with `blocked` true, the calls are made, and the
+    /// unwind isn't done until a later close sells the rest.
     function close(
         address station,
         uint256 fraction,

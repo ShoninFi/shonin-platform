@@ -43,8 +43,10 @@
 //! position withdrawn at its pool's price (as a withdrawal pays), its fees,
 //! and all the SOL sold in the first pool, worked out step by step as Orca's
 //! swap works it out through everyone else's liquidity, no further than
-//! half the band from Pyth's square-root price, which the given tick arrays
-//! must reach. The pool's own price is where that sale starts, and anyone
+//! half the band from Pyth's square-root price, nor than the given tick
+//! arrays reach from anywhere in the price's array (two arrays less a tick
+//! spacing, from a pool as far from Pyth's as it may stand), which they must
+//! reach. The pool's own price is where that sale starts, and anyone
 //! can push it for a transaction: so nothing is valued or closed with the
 //! selling pool, or a pool holding the station's liquidity, as far as
 //! [`network::NEAR_BPS`] from Pyth's price (or the band, if narrower), and
@@ -67,11 +69,10 @@
 //! pool's state), and no more than so many of them: a valuation's as many
 //! as it affords ([`sale::VALUE_CROSSINGS`]), a close's as many as one close
 //! can afford ([`sale::CLOSE_CROSSINGS`]); what is left unsold there is
-//! valued at the band's limit, the worst price inside the band, where the
-//! rest of the way is shown to hold the depth to take it, and is outside
-//! otherwise. Smaller ticks, which anyone can place for a position's rent,
-//! are paired so that the sale never fetches more than Orca's swap would
-//! (see [`sale::sell`]). A claim's close whose own swap would cross more
+//! valued as sold on through the least liquidity on the rest of the way to
+//! the sale's limit, where that takes it all, and is outside otherwise. Smaller ticks, which anyone can place for
+//! a position's rent, are paired so that the sale never fetches more than
+//! Orca's swap would (see [`sale::sell`]). A claim's close whose own swap would cross more
 //! initialized ticks of any size than one close affords
 //! ([`sale::SWAP_CROSSINGS`]) is refused this try, the valuation standing,
 //! and the vault may serve the claim in parts. A stopped station's unwind
@@ -119,10 +120,19 @@
 //! valuation at a 10% band about 67,000, at the full band (every tick of the
 //! three arrays initialized) about 242,000. All inside
 //! `shonin_driver::COMPUTE_PER_DRIVER`. A valuation and a claim's close read
-//! every initialized tick on the way to the band's limit, about 800 units
-//! each: at spacing 64 a 10% band is some 17 of them; at spacing 4 a band of
-//! a few percent is already more than one close affords. Each slot more
-//! costs about 85,000, which is why there is one.
+//! every initialized tick on the way to the sale's limit, a few hundred
+//! units each, read twice in a claim's close (its own sale, then the
+//! stayers' valuation after it): so inside the band a sale is worked out no
+//! further than [`sale::SALE_SPACINGS`] tick spacings, whatever the band and
+//! the pool's spacing, and a claim's close walking all of them on a pool
+//! with every tick initialized, its arrays dynamic, costs about 345,000 with
+//! the vault's call around it. A sale also ends
+//! a stretch wherever the small ticks' deepest fall grows past a step of
+//! its grid ([`sale::VALUE_GRID`], [`sale::CLOSE_GRID`]), about 3,500 units
+//! each: a valuation at the full band walking a stretch at every step of
+//! its three arrays, a station holding more than the pool takes there,
+//! about 303,000. Each slot more costs about 85,000, which is why there is
+//! one.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::set_return_data;
@@ -878,12 +888,12 @@ pub mod logic {
                     SaleEnd::default(),
                 ));
             }
-            let crossings = match asked {
-                Asked::Value => sale::VALUE_CROSSINGS,
-                Asked::Close | Asked::Unwind => sale::CLOSE_CROSSINGS,
+            let (crossings, grid) = match asked {
+                Asked::Value => (sale::VALUE_CROSSINGS, sale::VALUE_GRID),
+                Asked::Close | Asked::Unwind => (sale::CLOSE_CROSSINGS, sale::CLOSE_GRID),
             };
             let (exit, sold_all, sale) =
-                self.liquidation(band_bps, crossings, asked == Asked::Unwind)?;
+                self.liquidation(band_bps, crossings, grid, asked == Asked::Unwind)?;
             // A sale stopped short of a tick it may not cross sells up to
             // there in an unwind, where nobody is paid at the valuation;
             // anything else short of all of it is outside.
@@ -905,20 +915,23 @@ pub mod logic {
             &self,
             band_bps: u16,
             crossings: u32,
+            grid: i32,
             unwind: bool,
         ) -> Result<(u128, bool, SaleEnd)> {
             let (asset, dollars) = self.holdings(|p| self.pools[p].sqrt_price, true)?;
             let asset = clamp(asset);
             let pool = &self.pools[0];
             let own = self.own();
-            let band_limit = self.sale_limit(band_bps)?;
+            let (furthest, _) = self.sale_limit(band_bps)?;
             // A valuation's sale, and a claim's, is worked out over every
             // tick on the way to the limit (the stayers' valuation after a
             // close then meets no tick the one before it didn't), and what
-            // its crossings leave unsold is valued at the limit. An unwind's
-            // swap crosses no more initialized ticks than one transaction
-            // affords, however small: it reads no further than the one past
-            // them, and goes no further than a unit short of it.
+            // its crossings leave unsold is valued as sold on through the
+            // least liquidity on the rest of the way to the limit, where
+            // that takes it all. An unwind's swap crosses no more
+            // initialized ticks than one transaction affords, however small:
+            // it reads no further than the one past them, and goes no further
+            // than a unit short of it.
             let path = sale::path(
                 pool,
                 &self.sale_arrays,
@@ -927,22 +940,29 @@ pub mod logic {
                 if unwind {
                     sale::Reach::First(sale::SWAP_CROSSINGS + 1)
                 } else {
-                    sale::Reach::Limit(band_limit)
+                    sale::Reach::Limit(furthest)
                 },
             )?;
             let limit = if unwind {
-                Self::swap_limit(&path, band_limit)?
+                Self::swap_limit(&path, furthest)?
             } else {
-                band_limit
+                furthest
             };
+            let ends = sale::Ends::new(
+                pool,
+                &path,
+                POOLS[0].theta,
+                &own,
+                network::asset_is_a(),
+                grid,
+            );
             let sold = if asset == 0 {
                 sale::Sale::default()
             } else {
-                sale::sell(
+                sale::sell_along(
                     pool,
                     &self.sale_starts,
-                    &path,
-                    POOLS[0].theta,
+                    &ends,
                     &own,
                     asset,
                     network::asset_is_a(),
@@ -977,12 +997,14 @@ pub mod logic {
                         _ if !unwind => None,
                         Some(stop) => Some(stop),
                         // Stopped by what Orca's swap may cross.
-                        None if limit != band_limit && sold.end == limit && sold.sold < asset => {
+                        None if limit != furthest && sold.end == limit && sold.sold < asset => {
                             Some(limit)
                         }
                         None => None,
                     },
                     path: Some(path),
+                    // A claim's close sells along the same stretches.
+                    ends: (grid == sale::CLOSE_GRID).then_some(ends),
                 },
             ))
         }
@@ -1031,21 +1053,67 @@ pub mod logic {
             math::sqrt_price_at(tick.clamp(math::MIN_TICK, math::MAX_TICK)).map_err(math_error)
         }
 
-        /// The square-root price the sale may go no further than: Pyth's
-        /// price with the asset cheaper by the band. Selling A lowers the
-        /// pool's price and selling B raises it; either way the limit is
-        /// rounded towards the price it guards. The given arrays must reach
-        /// it, so that nobody can value or close the station through a
-        /// shorter reach. At the full band, where any price goes, the limit
-        /// is a tick spacing inside the furthest the arrays can reach, which
-        /// must then start at the pool's price: a sale stops there rather
-        /// than run out of arrays, and the next goes on from where it
-        /// stopped.
-        fn sale_limit(&self, band_bps: u16) -> Result<u128> {
+        /// The square-root price nearest Pyth's that the sale arrays from the
+        /// pool's price reach wherever the price stands in its array, and
+        /// no further than [`sale::SALE_SPACINGS`] tick spacings: two
+        /// arrays less a tick spacing (or those spacings, if fewer) from a
+        /// pool standing as far from Pyth's as [`network::NEAR_BPS`] lets
+        /// anything be valued or closed. Selling A, Pyth's root times `1 +
+        /// t / 2` (no lower than the highest root such a pool has) times
+        /// the root of that many ticks below, rounded up; selling B, times
+        /// `1 - t / 2` and the root of as many above, rounded down. Either
+        /// way it is at least a tick spacing inside those arrays' edge.
+        fn reach_root(&self) -> Result<u128> {
+            let spacing = self.pools[0].tick_spacing as i32;
+            let ticks = (2 * orca::TICKS_PER_ARRAY * spacing - spacing)
+                .min(sale::SALE_SPACINGS * spacing)
+                .min(math::MAX_TICK);
+            let near = network::NEAR_BPS as u128;
+            let two = 2 * BPS as u128;
+            // Pyth's root times a ratio kept as square-root prices are
+            // (times 2^64), and the product's 2^64ths dropped or rounded up.
+            let times = |ratio: u128, up: bool| {
+                let product = W::mul(self.pyth_sqrt, ratio).0;
+                if product[3] != 0 {
+                    return u128::MAX;
+                }
+                let root = product[1] as u128 | (product[2] as u128) << 64;
+                root.saturating_add(u128::from(up && product[0] != 0))
+            };
+            let root = if network::asset_is_a() {
+                let ratio = math::sqrt_price_at(-ticks).map_err(math_error)?;
+                times((ratio * (two + near)).div_ceil(two), true).saturating_add(1)
+            } else {
+                let ratio = math::sqrt_price_at(ticks).map_err(math_error)?;
+                times(ratio * (two - near) / two, false)
+            };
+            Ok(root.clamp(math::MIN_SQRT_PRICE, math::MAX_SQRT_PRICE))
+        }
+
+        /// The square-root price the sale may go no further than, and the
+        /// band's own limit: Pyth's price with the asset cheaper by the
+        /// band, rounded towards the price it guards (selling A lowers the
+        /// pool's price and selling B raises it). The sale's limit is the
+        /// band's, or, where that lies beyond what the sale arrays from the
+        /// pool's price always reach or beyond [`sale::SALE_SPACINGS`]
+        /// ([`Self::reach_root`]), that reach: a
+        /// sale never goes past the band, and a wide band is sold through
+        /// as far as the arrays reach, what can't be sold there being
+        /// outside, or left for the next unwind. Both depend only on Pyth's
+        /// price and the band, so the stayers' valuation after a close meets
+        /// the same limits as the close. The given arrays must reach the
+        /// sale's limit, so that nobody can value or close the station
+        /// through a shorter reach. At the full band, where any price goes,
+        /// both are a tick spacing inside the furthest the arrays can
+        /// reach, which must then start at the pool's price: a sale stops
+        /// there rather than run out of arrays, and the next goes on from
+        /// where it stopped.
+        fn sale_limit(&self, band_bps: u16) -> Result<(u128, u128)> {
             let selling_a = network::asset_is_a();
             if band_bps as u64 >= BPS {
                 require!(self.sale_from_price, DriverError::WrongAccounts);
-                return self.sale_reach(true);
+                let limit = self.sale_reach(true)?;
+                return Ok((limit, limit));
             }
             // The root of a price moved by `b` moves by about half as much,
             // and never by less: `sqrt(1 - b) <= 1 - b / 2` and
@@ -1053,10 +1121,13 @@ pub mod logic {
             // Pyth's root is never past the band, and keeps a sale a hair
             // inside it.
             let band = band_bps as u64;
-            let limit = if selling_a {
-                self.scaled_root(2 * BPS - band, 2 * BPS).saturating_add(1)
+            let reach = self.reach_root()?;
+            let (floor, limit) = if selling_a {
+                let floor = self.scaled_root(2 * BPS - band, 2 * BPS).saturating_add(1);
+                (floor, floor.max(reach))
             } else {
-                self.scaled_root(2 * BPS + band, 2 * BPS)
+                let floor = self.scaled_root(2 * BPS + band, 2 * BPS);
+                (floor, floor.min(reach))
             };
             let edge = self.sale_reach(false)?;
             let reaches = if selling_a {
@@ -1065,7 +1136,7 @@ pub mod logic {
                 edge >= limit
             };
             require!(reaches, DriverError::WrongAccounts);
-            Ok(limit)
+            Ok((limit, floor))
         }
 
         /// The least of each token a withdrawal of `liquidity` from `h` may
@@ -1244,7 +1315,8 @@ pub mod logic {
             // towards the limit, and the next unwind from there.
             if sale > 0 && (ending.sells || full) {
                 let pool = &self.pools[0];
-                let band_limit = self.sale_limit(band_bps)?;
+                let (furthest, _) = self.sale_limit(band_bps)?;
+                let ends = ending.ends;
                 let path = match ending.path {
                     Some(path) => path,
                     None => sale::path(
@@ -1255,26 +1327,37 @@ pub mod logic {
                         if unwind {
                             sale::Reach::First(sale::SWAP_CROSSINGS + 1)
                         } else {
-                            sale::Reach::Limit(band_limit)
+                            sale::Reach::Limit(furthest)
                         },
                     )?,
                 };
                 let limit = match ending.stop {
                     Some(stop) => stop,
-                    None if unwind => Self::swap_limit(&path, band_limit)?,
+                    None if unwind => Self::swap_limit(&path, furthest)?,
                     None => {
                         // A claim's swap crosses no more initialized ticks
                         // than one close affords: if the leaver's own sale,
                         // worked out through less liquidity than Orca's
                         // swap will find, can't be made before that, this
                         // try is refused (the vault may serve a part).
-                        let limit = Self::swap_limit(&path, band_limit)?;
-                        let theirs = sale::sell(
+                        let limit = Self::swap_limit(&path, furthest)?;
+                        let own = self.own();
+                        let ends = match ends {
+                            Some(ends) => ends,
+                            None => sale::Ends::new(
+                                pool,
+                                &path,
+                                POOLS[0].theta,
+                                &own,
+                                asset_is_a,
+                                sale::CLOSE_GRID,
+                            ),
+                        };
+                        let theirs = sale::sell_along(
                             pool,
                             &self.sale_starts,
-                            &path,
-                            POOLS[0].theta,
-                            &self.own(),
+                            &ends,
+                            &own,
                             sale,
                             asset_is_a,
                             limit,
@@ -1357,6 +1440,8 @@ pub mod logic {
         pub stop: Option<u128>,
         /// The ticks on the way to the band's limit, and their threshold.
         pub path: Option<sale::Path>,
+        /// The stretches a claim's close sells along on that path.
+        pub ends: Option<sale::Ends>,
     }
 
     fn clamp(value: u128) -> u64 {
@@ -1498,6 +1583,278 @@ pub mod logic {
     /// A, times 2^128), for callers working out a pool's starting price.
     pub fn sqrt_price_for(raw: W) -> u128 {
         Book::sqrt_at(raw)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use shonin_station::state::MAX_EXIT_BAND_BPS;
+
+        /// A book of a pool at `spacing`, its price at `root` in tick
+        /// `tick`, the sale's arrays the three from the price, and Pyth's
+        /// root at `pyth`.
+        fn book(spacing: u16, tick: i32, root: u128, pyth: u128) -> Book<'static> {
+            let pool = Whirlpool {
+                config: Pubkey::default(),
+                tick_spacing: spacing,
+                fee_tier_index: spacing,
+                fee_rate: 400,
+                protocol_fee_rate: 1_300,
+                liquidity: 0,
+                sqrt_price: root,
+                tick_current: tick,
+                mint_a: Pubkey::default(),
+                vault_a: Pubkey::default(),
+                fee_growth_global_a: 0,
+                mint_b: Pubkey::default(),
+                vault_b: Pubkey::default(),
+                fee_growth_global_b: 0,
+            };
+            let span = orca::TICKS_PER_ARRAY * spacing as i32;
+            let current = pool.array_start(tick);
+            let step = if network::asset_is_a() { -span } else { span };
+            Book {
+                price: None,
+                pyth: W::ZERO,
+                pyth_sqrt: pyth,
+                now: 0,
+                pools: vec![pool],
+                asset: 0,
+                held: Vec::new(),
+                sale_arrays: Vec::new(),
+                sale_starts: [current, current + step, current + 2 * step],
+                sale_from_price: true,
+            }
+        }
+
+        /// Pyth's roots putting a pool at `root` as far above and below
+        /// Pyth's as it may stand for `band_bps` and still be valued, and
+        /// level with it.
+        fn pyths(root: u128, band_bps: u16) -> [u128; 3] {
+            let t = Book::near_bps(band_bps) as u128;
+            let (bps, whole) = (BPS as u128, 8 * BPS as u128 * BPS as u128);
+            // Pyth's root a hair above where the pool reads as too high,
+            // and a hair below where it reads as too low.
+            let below = root * whole / (whole + 4 * bps * t - t * t) + 2;
+            let above = root * (2 * bps) / (2 * bps - t) - 2;
+            [below, root, above]
+        }
+
+        /// Every band a station may be created with, from every place of
+        /// the pool's price in its array, with the pool anywhere it may
+        /// stand from Pyth's: the sale arrays from the price reach the
+        /// sale's limit, which is never past the band's own and lies at
+        /// least a tick spacing inside the arrays' edge.
+        fn every_band_reaches_its_sale_limit_at(spacing: u16, base: i32, bands: &[u16]) {
+            let span = orca::TICKS_PER_ARRAY * spacing as i32;
+            let selling_a = network::asset_is_a();
+            let mut capped = 0usize;
+            for offset in 0..span {
+                let tick = base + offset;
+                let low = math::sqrt_price_at(tick).unwrap();
+                let high = math::sqrt_price_at(tick + 1).unwrap() - 1;
+                for root in [low, high] {
+                    for &band in bands {
+                        for pyth in pyths(root, band) {
+                            let book = book(spacing, tick, root, pyth);
+                            if book.far(root, band) {
+                                continue;
+                            }
+                            let (limit, floor) = book
+                                .sale_limit(band)
+                                .unwrap_or_else(|_| panic!("{spacing} {offset} {band} {pyth}"));
+                            let starts = book.sale_starts;
+                            let inside = if selling_a {
+                                *starts.iter().min().unwrap() + spacing as i32
+                            } else {
+                                *starts.iter().max().unwrap() + span - spacing as i32
+                            };
+                            let inside = math::sqrt_price_at(inside).unwrap();
+                            if selling_a {
+                                assert!(limit >= floor && limit >= inside, "{offset} {band}");
+                            } else {
+                                assert!(limit <= floor && limit <= inside, "{offset} {band}");
+                            }
+                            capped += usize::from(limit != floor);
+                        }
+                    }
+                }
+            }
+            println!("spacing {spacing}: the arrays' reach bound the sale {capped} times");
+        }
+
+        fn bands() -> Vec<u16> {
+            (1..=MAX_EXIT_BAND_BPS).collect()
+        }
+
+        #[test]
+        fn every_band_reaches_its_sale_limit_from_anywhere_in_an_array_at_spacing_4() {
+            // The arrays around a SOL price near $100.
+            every_band_reaches_its_sale_limit_at(4, -23_232, &bands());
+        }
+
+        #[test]
+        fn every_band_reaches_its_sale_limit_from_anywhere_in_an_array_at_spacing_64() {
+            let bands: Vec<u16> = bands()
+                .into_iter()
+                .filter(|b| b % 25 == 0 || *b < 30)
+                .collect();
+            every_band_reaches_its_sale_limit_at(64, -22_528, &bands);
+        }
+
+        /// Up to the reach (the arrays', or `sale::SALE_SPACINGS`) the
+        /// sale's limit is the band's own; past it, the sale's limit stops
+        /// at the reach, nearer Pyth's price than the band's.
+        #[test]
+        fn a_band_within_the_arrays_reach_sells_to_its_own_limit_and_a_wider_one_to_the_reach() {
+            let tick = -23_232;
+            let root = math::sqrt_price_at(tick).unwrap();
+            let book = book(4, tick, root, root);
+            let (limit, floor) = book.sale_limit(20).unwrap();
+            assert_eq!(limit, floor);
+            let (limit, floor) = book.sale_limit(MAX_EXIT_BAND_BPS).unwrap();
+            assert_ne!(limit, floor);
+            assert_eq!(limit, book.reach_root().unwrap());
+        }
+
+        /// Mainnet's SOL/USDC pool at spacing 4 and its tick arrays around
+        /// the price, as read from mainnet-beta (public account data, in
+        /// `fixtures/mainnet-sol-usdc`): a pool whose in-range liquidity
+        /// nearly all ends through ticks under the listed threshold.
+        mod mainnet_pool {
+            use super::*;
+
+            /// The listed threshold of mainnet's pool, whichever network
+            /// this build lists.
+            const THETA: u128 = 15_000_000_000_000;
+
+            fn account(data: &'static [u8]) -> &'static AccountInfo<'static> {
+                let key: &'static Pubkey = Box::leak(Box::new(Pubkey::new_unique()));
+                let lamports: &'static mut u64 = Box::leak(Box::new(1));
+                let data: &'static mut [u8] = Box::leak(data.to_vec().into_boxed_slice());
+                Box::leak(Box::new(AccountInfo::new(
+                    key,
+                    false,
+                    false,
+                    lamports,
+                    data,
+                    &WHIRLPOOL_PROGRAM,
+                    false,
+                    0,
+                )))
+            }
+
+            /// A book of the real pool, Pyth level with it, the sale's three
+            /// arrays from the price.
+            fn real_book() -> Book<'static> {
+                let pool = Whirlpool::load(account(include_bytes!(
+                    "../fixtures/mainnet-sol-usdc/pool.bin"
+                )))
+                .unwrap();
+                let mut book = book(4, pool.tick_current, pool.sqrt_price, pool.sqrt_price);
+                book.pools = vec![pool];
+                let arrays: [&'static [u8]; 5] = [
+                    include_bytes!("../fixtures/mainnet-sol-usdc/tick-array-22880.bin"),
+                    include_bytes!("../fixtures/mainnet-sol-usdc/tick-array-23232.bin"),
+                    include_bytes!("../fixtures/mainnet-sol-usdc/tick-array-23584.bin"),
+                    include_bytes!("../fixtures/mainnet-sol-usdc/tick-array-23936.bin"),
+                    include_bytes!("../fixtures/mainnet-sol-usdc/tick-array-24288.bin"),
+                ];
+                book.sale_arrays = arrays
+                    .into_iter()
+                    .map(|bytes| TickArray::load(account(bytes)).unwrap().unwrap())
+                    .filter(|array| book.sale_starts.contains(&array.start))
+                    .collect();
+                assert_eq!(book.sale_arrays.len(), 3);
+                book
+            }
+
+            /// Who works a sale out: a valuation, a claim's close, or Orca's
+            /// swap itself (every initialized tick crossed exactly).
+            #[derive(Clone, Copy, Debug)]
+            enum By {
+                Value,
+                Close,
+                Orca,
+            }
+
+            /// Selling `amount` of SOL at `band_bps` as `by` works it out, to
+            /// the limit the driver sets.
+            fn sale(book: &Book, band_bps: u16, amount: u64, by: By) -> sale::Sale {
+                let pool = &book.pools[0];
+                let (limit, _) = book.sale_limit(band_bps).unwrap();
+                let path = sale::path(
+                    pool,
+                    &book.sale_arrays,
+                    &book.sale_starts,
+                    true,
+                    sale::Reach::Limit(limit),
+                )
+                .unwrap();
+                let (theta, crossings, tail, grid) = match by {
+                    By::Value => (THETA, sale::VALUE_CROSSINGS, true, sale::VALUE_GRID),
+                    By::Close => (THETA, sale::CLOSE_CROSSINGS, true, sale::CLOSE_GRID),
+                    By::Orca => (0, u32::MAX / 2, false, 1),
+                };
+                sale::sell(
+                    pool,
+                    &book.sale_starts,
+                    &path,
+                    theta,
+                    &[],
+                    amount,
+                    true,
+                    limit,
+                    crossings,
+                    tail,
+                    grid,
+                )
+                .unwrap()
+            }
+
+            /// The most SOL that sale takes whole, to a hundredth of a SOL.
+            fn sellable(book: &Book, band_bps: u16, by: By) -> u64 {
+                let (mut lo, mut hi) = (0u64, 1_000_000_000_000_000u64);
+                while hi - lo > 10_000_000 {
+                    let mid = lo + (hi - lo) / 2;
+                    if sale(book, band_bps, mid, by).sold == mid {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+
+            /// On the real pool, a valuation's sale and a claim's close's
+            /// sale of everything take nearly all the SOL Orca's swap would
+            /// take before the same limit at every band, never more, and
+            /// never fetch more for any amount.
+            #[test]
+            fn on_the_real_pool_a_sale_is_worked_out_to_nearly_what_orca_s_swap_takes_and_never_more(
+            ) {
+                let book = real_book();
+                for band in [100u16, 200, 500, 1_000] {
+                    let orca = sellable(&book, band, By::Orca);
+                    for by in [By::Value, By::Close] {
+                        let ours = sellable(&book, band, by);
+                        println!(
+                            "band {band} bps: {by:?} sells {} SOL, Orca's swap {} SOL",
+                            ours / 1_000_000_000,
+                            orca / 1_000_000_000
+                        );
+                        assert!(ours <= orca, "{band} {by:?}: {ours} > {orca}");
+                        assert!(ours >= orca / 100 * 90, "{band} {by:?}: {ours} of {orca}");
+                        for tenths in [1u64, 4, 10] {
+                            let amount = ours / 10 * tenths;
+                            let ours = sale(&book, band, amount, by);
+                            let orca = sale(&book, band, amount, By::Orca);
+                            assert!(ours.proceeds <= orca.proceeds, "{band} {by:?} {amount}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

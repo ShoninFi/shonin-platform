@@ -658,9 +658,10 @@ fn at_the_full_band_each_unwind_sells_on_from_where_the_last_stopped_across_empt
 }
 
 /// Whoever gives the sale's tick arrays must give a set reaching the sale's
-/// limit: the one before the pool's price, which reaches an array less, is
-/// refused where its reach falls short, and at the full band, where the sale
-/// goes as far as its arrays reach, only the set from the price is taken.
+/// limit: inside the band the sale goes no further than
+/// `sale::SALE_SPACINGS`, which the set before the pool's price (reaching an
+/// array less) reaches too, and at the full band, where the sale goes as far
+/// as its arrays reach, only the set from the price is taken.
 #[test]
 fn a_sale_tick_array_set_falling_short_of_the_sale_s_limit_is_refused() {
     let (mut env, home) = providing();
@@ -672,14 +673,9 @@ fn a_sale_tick_array_set_falling_short_of_the_sale_s_limit_is_refused() {
         &[base + SPAN, base, base - SPAN]
             .map(|s| AccountMeta::new(tick_array_address(&pool(), s), false)),
     );
-    // A band whose limit the set from the price reaches and the one before
-    // it doesn't.
+    // Inside the band both reach the sale's limit.
     assert!(env.driver_value(&group, 8_000).is_ok());
-    expect_err(
-        env.driver_value(&before, 8_000),
-        orca_error(OrcaError::WrongAccounts),
-    );
-    // Narrower, both reach it.
+    assert!(env.driver_value(&before, 8_000).is_ok());
     assert!(env.driver_value(&before, 6_400).is_ok());
     // The full band.
     assert!(env.driver_value(&group, 10_000).is_ok());
@@ -687,6 +683,31 @@ fn a_sale_tick_array_set_falling_short_of_the_sale_s_limit_is_refused() {
         env.driver_value(&before, 10_000),
         orca_error(OrcaError::WrongAccounts),
     );
+}
+
+/// A band wider than the sale's tick arrays reach from just inside the
+/// price's array is valued as far as they reach, never refused: from there,
+/// the widest band short of the full one values the station as a band the
+/// arrays reach does.
+#[test]
+fn a_band_wider_than_the_sale_arrays_reach_is_valued_as_far_as_they_reach() {
+    let (mut env, home) = providing();
+    let start = array_start(env.pool_state().tick);
+    push_to(
+        &mut env,
+        orca_math::sqrt_price_at(start + SPACING).unwrap() + 1,
+    );
+    env.price_follows_pool();
+    let tick = env.pool_state().tick;
+    assert!(tick >= start && tick < start + 2 * SPACING, "{tick}");
+    let group = env.orca_group(&home.station);
+    let wide = ok(env.driver_value(&group, 9_900));
+    let within = ok(env.driver_value(&group, 6_000));
+    assert_eq!(
+        (wide.mark, wide.exit, wide.outside),
+        (within.mark, within.exit, within.outside)
+    );
+    println!("{wide:?}");
 }
 
 /// Bob provides 400 SOL and as many dollars within about 6% of the price.
@@ -1433,7 +1454,8 @@ fn a_sale_is_exact_through_a_real_provider_s_ticks_and_never_above_orca_s_throug
 /// their depth counted; a unit smaller, wholly on the sale's way, each adds
 /// before it removes and the sale is worked out as if they weren't there.
 /// Eight ticks at the threshold, more than a close's sale may cross, leave
-/// the rest of the sale valued at the band's limit, and a claim is served.
+/// the rest of the sale valued as sold on through the least liquidity past
+/// them, and a claim is served.
 #[test]
 fn ticks_at_the_pool_s_threshold_are_crossed_exactly_and_smaller_ones_wholly_on_the_way_cost_nothing(
 ) {
@@ -1791,9 +1813,10 @@ fn every_other_spacing(env: &mut Env, count: i32, liquidity: u128) {
 
 /// Eight ticks over the pool's threshold right below the price, more than a
 /// close's sale may cross exactly: the rest of the sale of everything is
-/// valued at the band's limit, and a claim is paid at its first try, never
-/// more than without them and never less than the band allows (the stayers
-/// keep the difference).
+/// valued as sold on through the least liquidity past them, and a claim is
+/// paid at its first try, about what it is paid without them (the liquidity
+/// they add is real) and never less than the band allows (the stayers keep
+/// the difference).
 #[test]
 fn ticks_over_the_threshold_never_make_a_claim_wait() {
     use shonin_solana_tests::vault::ClaimState;
@@ -1809,7 +1832,7 @@ fn ticks_over_the_threshold_never_make_a_claim_wait() {
         assert_eq!(claim.state, ClaimState::Paid);
         paid.push(claim.paid);
     }
-    assert!(paid[1] <= paid[0], "{paid:?}");
+    assert!(paid[1] <= paid[0] + paid[0] / 1_000, "{paid:?}");
     assert!(paid[1] >= paid[0] - paid[0] / 10, "{paid:?}");
 }
 
@@ -1842,6 +1865,18 @@ fn a_claim_whose_own_swap_would_cross_too_many_ticks_is_paid_in_parts() {
 /// may use.
 #[test]
 fn every_tick_of_the_sale_s_arrays_initialized_fits_the_compute_of_every_call() {
+    every_call_fits_the_compute(false);
+}
+
+/// As above, and a stranger's small positions from above the price each
+/// ending a step of the sale's grid further down, so that a sale works out
+/// a stretch at every step of its grid on the way: each call still fits.
+#[test]
+fn a_sale_ending_a_stretch_at_every_step_of_its_grid_fits_the_compute_of_every_call() {
+    every_call_fits_the_compute(true);
+}
+
+fn every_call_fits_the_compute(stretches: bool) {
     for dynamic in [false, true] {
         let mut env = Env::with_orca();
         if dynamic {
@@ -1856,6 +1891,19 @@ fn every_tick_of_the_sale_s_arrays_initialized_fits_the_compute_of_every_call() 
         let top = env.pool_state().tick.div_euclid(SPACING) * SPACING;
         let bottom = array_start(env.pool_state().tick) - 2 * SPAN;
         env.crowd_below((top - bottom) / SPACING);
+        if stretches {
+            // Ending just past each step of the valuation's grid, so the
+            // small ticks' deepest fall grows in every stretch.
+            let grid = shonin_orca_driver::sale::VALUE_GRID * SPACING;
+            let mut lower = (top - SPACING).div_euclid(grid) * grid - SPACING;
+            let mut ranges = Vec::new();
+            while lower > bottom {
+                ranges.push((lower, UPPER));
+                lower -= grid;
+            }
+            let theta = shonin_orca_driver::network::POOLS[0].theta;
+            env.provide_ranges(&ranges, theta / 4);
+        }
         env.price_follows_pool();
         let group = env.orca_group(&home.station);
         let (_, full) = ok(env.driver_value_metered(&group, BPS as u16));
@@ -1871,6 +1919,18 @@ fn every_tick_of_the_sale_s_arrays_initialized_fits_the_compute_of_every_call() 
             }
         }
         assert!(close > 0);
+        // With SOL enough that the valuations' sales and the unwinds walk
+        // every stretch on the way.
+        let mut deep = Vec::new();
+        if stretches {
+            let bob = env.bob.insecure_clone();
+            env.svm.airdrop(&bob.pubkey(), 20_000 * SOL).unwrap();
+            env.wrap(&bob, 10_000 * SOL);
+            send_wsol(&mut env, &home, 10_000 * SOL);
+            for band in [BPS as u16, 1_000] {
+                deep.push(ok(env.driver_value_metered(&group, band)).1);
+            }
+        }
         env.halt_and_stop(&home);
         env.skip(8 * shonin_station::state::WIDEN_AFTER);
         let payer = env.payer.insecure_clone();
@@ -1881,9 +1941,9 @@ fn every_tick_of_the_sale_s_arrays_initialized_fits_the_compute_of_every_call() 
             unwinds.push(meta.compute_units_consumed);
         }
         println!(
-            "dynamic {dynamic}: valuation at the full band {full}, at 10% {banded}; a claim's close {close}; unwinds {unwinds:?}"
+            "stretches {stretches}, dynamic {dynamic}: valuation at the full band {full}, at 10% {banded}; a claim's close {close}; unwinds {unwinds:?}; holding more, valuations {deep:?}"
         );
-        for compute in [full, banded, close].into_iter().chain(unwinds) {
+        for compute in [full, banded, close].into_iter().chain(unwinds).chain(deep) {
             assert!(compute < COMPUTE_PER_DRIVER, "{compute}");
         }
     }

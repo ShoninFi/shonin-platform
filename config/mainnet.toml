@@ -1,0 +1,107 @@
+# What the mainnet deploy builds on: every outside contract the platform's
+# contracts and drivers name on each mainnet, read by `task chains:deploy
+# NETWORK=mainnet` and checked again by `task chains:verify-deploy
+# NETWORK=mainnet`. Each address was read on its chain (code present,
+# `symbol()`, `decimals()`, a pool's tokens and fee, a feed's description)
+# before it was written here. A driver's listings are fixed in its contract
+# when it is deployed: changing one here changes what the next deploy
+# creates, never what is on the chain.
+#
+# Nothing here is secret, and nothing here is Shonin's own: Shonin's
+# addresses are written by the deploy under config/deployments/mainnet/.
+
+# --- Every EVM chain ---------------------------------------------------------
+
+[evm]
+# The standard deterministic deployer every contract is created through.
+create2_deployer = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
+# What the Robinhood driver (and `uniswap-base`, the same contract) puts
+# each station's holdings in: Safe v1.4.1 and a Zodiac Roles v2 module.
+safe_singleton = "0x29fcB43b46531BcA003ddC8FCB67FFE91900C762"
+safe_proxy_factory = "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"
+roles_mastercopy = "0x9646fDAD06d3e24444381f44362a3B0eB343D337"
+module_proxy_factory = "0x000000000000aDdB49795b0f9bA5BC298cDda236"
+
+# --- Base (8453) -------------------------------------------------------------
+
+[evm.chains."8453"]
+label = "Base"
+# Circle's USDC.
+dollar = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+dollar_symbol = "USDC"
+
+# `uniswap-base`: the Robinhood driver's contract, listing WETH against
+# USDC in Uniswap v3's 0.05% pool at Chainlink's ETH/USD price. ETH/USD on
+# Base updates every few minutes and at least every twenty, so a price an
+# hour old is three missed updates: stale.
+[evm.chains."8453".uniswap]
+driver = "uniswap-base"
+router = "0x2626664c2603336E57B271c5C0b26F421741e481"
+max_feed_age = 3600
+twap_window = 1800
+
+[[evm.chains."8453".uniswap.listings]]
+symbol = "WETH"
+asset = "0x4200000000000000000000000000000000000006"
+feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+pool = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+# The most WETH one sale of a stopped station's full unwind sells, in wei
+# (300 WETH): sized from the pool so a sale, through the Safe and to the
+# pool's tick limit if it empties, fits the gas the station gives each call.
+# Whatever is left is sold by the next unwind.
+max_sale = "300000000000000000000"
+
+# --- Robinhood Chain (4663) --------------------------------------------------
+
+[evm.chains."4663"]
+label = "Robinhood Chain"
+# Paxos's USDG.
+dollar = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+dollar_symbol = "USDG"
+
+# `robinhood`: stock tokens against USDG in Uniswap v3's 0.05% pools at
+# Chainlink's prices. The stock feeds stop over weekends and holidays,
+# hence four days.
+[evm.chains."4663".uniswap]
+driver = "robinhood"
+router = "0xcaf681a66d020601342297493863e78c959e5cb2"
+max_feed_age = 345600
+twap_window = 1800
+
+[[evm.chains."4663".uniswap.listings]]
+symbol = "NVDA"
+asset = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
+feed = "0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15"
+pool = "0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3"
+# The most NVDA one sale of a stopped station's full unwind sells, in the
+# token's base units (1,000 NVDA, 18 decimals), sized from the pool as
+# Base's WETH is.
+max_sale = "1000000000000000000000"
+
+[[evm.chains."4663".uniswap.listings]]
+symbol = "AAPL"
+asset = "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9"
+feed = "0x6B22A786bAa607d76728168703a39Ea9C99f2cD0"
+pool = "0xAae0d815EE56e4092a5E5C2911E676Fea50B2d6D"
+# The most AAPL one sale of a stopped station's full unwind sells, in the
+# token's base units (100 AAPL, 18 decimals), sized from the pool as Base's
+# WETH is.
+max_sale = "100000000000000000000"
+
+# --- HyperEVM (999) ----------------------------------------------------------
+
+[evm.chains."999"]
+label = "Hyperliquid"
+# Circle's USDC on HyperEVM.
+dollar = "0xb88339CB7199b77E23DB6E890353E22632Ba630f"
+dollar_symbol = "USDC"
+
+# `hyperliquid`: the ETH perp and the HYPE/USDC spot pair, by mainnet's
+# numbers (testnet numbers them differently).
+[evm.chains."999".hyperliquid]
+driver = "hyperliquid"
+# Circle's deposit contract into HyperCore: HyperCore's token 0 (USDC)
+# names it as its EVM contract.
+deposit_wallet = "0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24"
+perps = [1]
+spot_pairs = [107]

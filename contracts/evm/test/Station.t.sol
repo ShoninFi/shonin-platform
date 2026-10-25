@@ -159,6 +159,7 @@ abstract contract StationBase is Fixture {
         blessServiceKey(BUILDER_IMAGE, builder);
 
         ownStations = new StationFactory(address(this));
+        actAsVaultFactoryFor(address(ownStations));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
 
         vault = new FakeVault(IERC20(address(usd)));
@@ -238,6 +239,7 @@ contract StationTest is StationBase {
 
     function test_only_the_named_key_initialises_the_factory_and_only_once() public {
         StationFactory fresh = new StationFactory(alice);
+        actAsVaultFactoryFor(address(fresh));
         vm.expectRevert(StationFactory.NotInitializer.selector);
         fresh.initialize(address(attestation), address(usd), address(this), address(1));
         vm.prank(alice);

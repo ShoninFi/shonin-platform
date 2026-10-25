@@ -170,6 +170,88 @@ library HyperCore {
         return abi.decode(_read(CORE_USER_EXISTS, abi.encode(user), GAS_SMALL), (bool));
     }
 
+    // Reads of one market that may fail ------------------------------------
+    //
+    // A market the venue no longer answers for (delisted, renumbered) makes
+    // its reads fail. These say so instead of reverting, so one market can't
+    // stop a close of the others; each answer is checked for its size and
+    // range rather than decoded blindly, so nothing here reverts.
+
+    function _tryWords(
+        address precompile,
+        bytes memory input,
+        uint256 gas,
+        uint256 words
+    ) private view returns (bool ok, bytes memory out) {
+        (ok, out) = precompile.staticcall{gas: gas}(input);
+        ok = ok && out.length >= 32 * words;
+    }
+
+    function _word(bytes memory out, uint256 i) private pure returns (uint256 word) {
+        assembly ("memory-safe") {
+            word := mload(add(add(out, 32), mul(i, 32)))
+        }
+    }
+
+    function _u64(bytes memory out, uint256 i) private pure returns (bool ok, uint64 value) {
+        uint256 word = _word(out, i);
+        if (word > type(uint64).max) return (false, 0);
+        return (true, uint64(word));
+    }
+
+    /// The signed size of `user`'s position in `perp`.
+    function tryPosition(address user, uint32 perp) internal view returns (bool ok, int64 szi) {
+        bytes memory out;
+        (ok, out) = _tryWords(POSITION, abi.encode(user, uint16(perp)), GAS_POSITION, 5);
+        if (!ok) return (false, 0);
+        int256 word = int256(_word(out, 0));
+        if (word < type(int64).min || word > type(int64).max) return (false, 0);
+        szi = int64(word);
+    }
+
+    /// `user`'s total and held balance of `token`.
+    function trySpotBalance(
+        address user,
+        uint64 token
+    ) internal view returns (bool ok, uint64 total, uint64 hold) {
+        bytes memory out;
+        (ok, out) = _tryWords(SPOT_BALANCE, abi.encode(user, token), GAS_SMALL, 3);
+        if (!ok) return (false, 0, 0);
+        bool okHold;
+        (ok, total) = _u64(out, 0);
+        (okHold, hold) = _u64(out, 1);
+        if (!ok || !okHold || hold > total) return (false, 0, 0);
+    }
+
+    function _tryPrice(address precompile, uint32 index) private view returns (bool ok, uint64 px) {
+        bytes memory out;
+        (ok, out) = _tryWords(precompile, abi.encode(index), GAS_SMALL, 1);
+        if (!ok) return (false, 0);
+        (ok, px) = _u64(out, 0);
+    }
+
+    function tryMarkPx(uint32 perp) internal view returns (bool, uint64) {
+        return _tryPrice(MARK_PX, perp);
+    }
+
+    function tryOraclePx(uint32 perp) internal view returns (bool, uint64) {
+        return _tryPrice(ORACLE_PX, perp);
+    }
+
+    function trySpotPx(uint32 pair) internal view returns (bool, uint64) {
+        return _tryPrice(SPOT_PX, pair);
+    }
+
+    function tryBbo(uint32 asset) internal view returns (bool ok, uint64 bid, uint64 ask) {
+        bytes memory out;
+        (ok, out) = _tryWords(BBO, abi.encode(asset), GAS_SMALL, 2);
+        if (!ok) return (false, 0, 0);
+        bool okAsk;
+        (ok, bid) = _u64(out, 0);
+        (okAsk, ask) = _u64(out, 1);
+        if (!ok || !okAsk) return (false, 0, 0);
+    }
+
     // Actions, as CoreWriter's raw bytes ------------------------------------
 
     /// Version 1, the action's id in three bytes, then its fields.

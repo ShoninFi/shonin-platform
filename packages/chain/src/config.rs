@@ -760,7 +760,7 @@ mod tests {
         }
     }
     #[test]
-    fn the_committed_file_names_base_as_the_root_key_s_chain_on_local_and_testnet_only() {
+    fn the_committed_file_names_base_as_the_root_key_s_chain_on_every_network() {
         let text = include_str!("../../../config/chains.toml");
         let configs = ChainConfigs::from_toml(text, no_env).unwrap();
         let root = |network| {
@@ -778,7 +778,10 @@ mod tests {
             root(NetworkName::Testnet),
             Some((Chain::Base, "evm:84532".to_string()))
         );
-        assert_eq!(root(NetworkName::Mainnet), None);
+        assert_eq!(
+            root(NetworkName::Mainnet),
+            Some((Chain::Base, "evm:8453".to_string()))
+        );
     }
 
     #[test]

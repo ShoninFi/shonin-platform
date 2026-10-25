@@ -9,11 +9,23 @@
 //! deploys the program with, `target/deploy/<name>-keypair.json`, which never
 //! leaves the machine. Without that keypair, as on a fresh checkout's `cargo
 //! check`, a placeholder stands in.
+//!
+//! A mainnet id is chosen when the programs are first deployed, from keypairs
+//! the owner holds. The mainnet deploy builds before any `mainnet-id` is
+//! written, so a mainnet build may instead take its ids from the file
+//! [`MAINNET_IDS_VAR`] names (one `<library name> <id>` a line): a rehearsal
+//! builds that way and never writes the committed files. A committed id that
+//! differs from the listed one is refused, as is a program the list leaves
+//! out.
 
 use std::path::{Path, PathBuf};
 
 /// The system program's address: a valid key, and obviously not ours.
 const PLACEHOLDER: &str = "11111111111111111111111111111111";
+
+/// The variable naming a list of mainnet ids to build with, beside or
+/// before the committed `mainnet-id` files.
+pub const MAINNET_IDS_VAR: &str = "SHONIN_MAINNET_IDS";
 
 /// Where a program's address comes from.
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +82,38 @@ pub fn committed_id(network: &str, path: &Path, text: Option<&str>) -> Result<St
     }
 }
 
+/// The id a list of mainnet ids (`<library name> <id>` a line, `#` starting
+/// a comment) gives `lib_name`, checked against the committed id when there
+/// is one (`committed`, the committed file's contents). A list without the
+/// program, or naming another id than the committed one, is refused.
+pub fn listed_mainnet_id(
+    lib_name: &str,
+    list: &str,
+    committed_path: &Path,
+    committed: Option<&str>,
+) -> Result<String, String> {
+    let listed = list
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .filter(|line| !line.is_empty())
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next() == Some(lib_name)).then(|| parts.next().unwrap_or_default())
+        })
+        .ok_or_else(|| format!("{MAINNET_IDS_VAR} lists no id for {lib_name}"))?;
+    let id = committed_id("mainnet", Path::new(MAINNET_IDS_VAR), Some(listed))?;
+    if let Some(text) = committed.filter(|text| !text.trim().is_empty()) {
+        let held = committed_id("mainnet", committed_path, Some(text))?;
+        if held != id {
+            return Err(format!(
+                "{} holds {held}, and {MAINNET_IDS_VAR} lists {id} for {lib_name}: a committed mainnet id is never replaced",
+                committed_path.display()
+            ));
+        }
+    }
+    Ok(id)
+}
+
 /// Writes `program_id.rs` into `OUT_DIR` for the program whose library is
 /// named `lib_name` (as in `[lib] name`), for `include!` in its `lib.rs`.
 pub fn emit(lib_name: &str) {
@@ -101,6 +145,18 @@ pub fn program_id(lib_name: &str, program_dir: &Path, mainnet: bool, devnet: boo
             let path = program_dir.join(file);
             println!("cargo:rerun-if-changed={}", path.display());
             let text = std::fs::read_to_string(&path).ok();
+            if network == "mainnet" {
+                println!("cargo:rerun-if-env-changed={MAINNET_IDS_VAR}");
+                if let Some(list) = std::env::var_os(MAINNET_IDS_VAR).filter(|v| !v.is_empty()) {
+                    let list = PathBuf::from(list);
+                    println!("cargo:rerun-if-changed={}", list.display());
+                    let listed = std::fs::read_to_string(&list).unwrap_or_else(|error| {
+                        panic!("reading {MAINNET_IDS_VAR} ({}): {error}", list.display())
+                    });
+                    return listed_mainnet_id(lib_name, &listed, &path, text.as_deref())
+                        .unwrap_or_else(|why| panic!("{why}"));
+                }
+            }
             committed_id(network, &path, text.as_deref()).unwrap_or_else(|why| panic!("{why}"))
         }
         Source::LocalKeypair => {
@@ -192,6 +248,46 @@ mod tests {
         let path = Path::new("devnet-id");
         assert!(committed_id("devnet", path, Some("not-an-id")).is_err());
         assert!(committed_id("devnet", path, Some("1111")).is_err());
+    }
+
+    const OTHER: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+
+    #[test]
+    fn a_listed_mainnet_id_is_built_with_when_nothing_is_committed() {
+        let list = format!("# rehearsal\nshonin_vault {OTHER}\nshonin_registry {ID}\n");
+        let path = Path::new("programs/shonin-registry/mainnet-id");
+        assert_eq!(
+            listed_mainnet_id("shonin_registry", &list, path, None),
+            Ok(ID.to_string())
+        );
+        assert_eq!(
+            listed_mainnet_id("shonin_registry", &list, path, Some(&format!("{ID}\n"))),
+            Ok(ID.to_string())
+        );
+    }
+
+    #[test]
+    fn a_listed_mainnet_id_other_than_the_committed_one_is_refused() {
+        let list = format!("shonin_registry {ID}\n");
+        let path = Path::new("programs/shonin-registry/mainnet-id");
+        let why = listed_mainnet_id("shonin_registry", &list, path, Some(OTHER)).unwrap_err();
+        assert!(why.contains("never replaced"), "{why}");
+    }
+
+    #[test]
+    fn a_mainnet_id_list_without_the_program_or_with_a_bad_id_is_refused() {
+        let path = Path::new("mainnet-id");
+        assert!(listed_mainnet_id(
+            "shonin_station",
+            &format!("shonin_registry {ID}"),
+            path,
+            None
+        )
+        .is_err());
+        assert!(
+            listed_mainnet_id("shonin_station", "shonin_station not-an-id", path, None).is_err()
+        );
+        assert!(listed_mainnet_id("shonin_station", "shonin_station", path, None).is_err());
     }
 
     #[test]

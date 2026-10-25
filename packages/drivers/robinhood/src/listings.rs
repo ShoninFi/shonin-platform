@@ -141,6 +141,21 @@ pub struct Listing {
     pub feed: Feed,
     /// The fee tier of its pool against the dollar.
     pub fee: u32,
+    /// For a token the chain's driver lists, the most of it, in its base
+    /// units, that one sale of a stopped station's full unwind sells (the
+    /// driver refuses zero). `None` for a token kept priced on the test
+    /// network that the driver does not list: it takes at most
+    /// [`MAX_LISTINGS`].
+    pub max_sale: Option<u128>,
+}
+
+/// The most listings the driver's constructor takes (`MAX_LISTINGS` in its
+/// contract).
+pub const MAX_LISTINGS: usize = 2;
+
+/// A stock token's 18 decimals: `whole` tokens in base units.
+const fn stock_tokens(whole: u128) -> u128 {
+    whole * 1_000_000_000_000_000_000
 }
 
 /// Uniswap v3 on a chain: the factory pools are found from, the router
@@ -170,7 +185,12 @@ pub struct Venue {
 /// The feeds' decimals: Chainlink's USD feeds' and the mirrors'.
 pub const FEED_DECIMALS: u8 = 8;
 
-const fn mirror(symbol: &'static str, token: Address, source: Address) -> Listing {
+const fn mirror(
+    symbol: &'static str,
+    token: Address,
+    source: Address,
+    max_sale: Option<u128>,
+) -> Listing {
     Listing {
         token: Token {
             symbol,
@@ -182,13 +202,18 @@ const fn mirror(symbol: &'static str, token: Address, source: Address) -> Listin
             source,
         },
         fee: 500,
+        max_sale,
     }
 }
 
 /// Robinhood Chain testnet: four of Robinhood's stock tokens (each with a
 /// mainnet feed readable with no key), against USDG, each priced by a
 /// mirror of its mainnet feed. The tokens come from Robinhood's faucet; USDG
-/// can be minted by anyone.
+/// can be minted by anyone. The driver lists two of them, TSLA and AMD, as
+/// it takes at most [`MAX_LISTINGS`]; AMZN and PLTR stay mirrored and
+/// priced for a driver deployed before that limit. Each listed one's
+/// maximum sale is of mainnet's order, well above what a test station
+/// holds, so it never splits a test unwind's sale.
 pub const ROBINHOOD_TESTNET: Venue = Venue {
     chain: TESTNET,
     label: "Robinhood Chain testnet",
@@ -209,21 +234,25 @@ pub const ROBINHOOD_TESTNET: Venue = Venue {
             "TSLA",
             address!("C9f9c86933092BbbfFF3CCb4b105A4A94bf3Bd4E"),
             address!("4A1166a659A55625345e9515b32adECea5547C38"),
+            Some(stock_tokens(1_000)),
         ),
         mirror(
             "AMD",
             address!("71178BAc73cBeb415514eB542a8995b82669778d"),
             address!("943A29E7ae51A4798823ca9eEd2ed533B2A22C72"),
+            Some(stock_tokens(1_000)),
         ),
         mirror(
             "AMZN",
             address!("5884aD2f920c162CFBbACc88C9C51AA75eC09E02"),
             address!("D5a1508ceD74c084eBf3cBe853e2C968fB2a651C"),
+            None,
         ),
         mirror(
             "PLTR",
             address!("1FBE1a0e43594b3455993B5dE5Fd0A7A266298d0"),
             address!("820ABedFF239034956B7A9d2F0a331f9F075eB4c"),
+            None,
         ),
     ],
 };
@@ -254,6 +283,8 @@ pub const BASE_SEPOLIA_VENUE: Venue = Venue {
         },
         feed: Feed::Chainlink(address!("4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1")),
         fee: 500,
+        // 300 WETH (18 decimals), as on Base mainnet.
+        max_sale: Some(300_000_000_000_000_000_000),
     }],
 };
 
@@ -338,6 +369,8 @@ pub struct Resolved {
     pub feed: Address,
     pub pool: Address,
     pub fee: u32,
+    /// As [`Listing::max_sale`]: `Some` for a token the driver lists.
+    pub max_sale: Option<u128>,
 }
 
 impl Venue {
@@ -381,6 +414,7 @@ impl Venue {
                         listing.fee,
                     ),
                     fee: listing.fee,
+                    max_sale: listing.max_sale,
                 })
             })
             .collect()
@@ -516,6 +550,30 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn each_test_venue_s_driver_lists_one_to_its_maximum_each_with_a_max_sale() {
+        for venue in [&ROBINHOOD_TESTNET, &BASE_SEPOLIA_VENUE] {
+            let sales: Vec<u128> = venue
+                .listed
+                .iter()
+                .filter_map(|listing| listing.max_sale)
+                .collect();
+            assert!((1..=MAX_LISTINGS).contains(&sales.len()), "{}", venue.label);
+            assert!(sales.iter().all(|&sale| sale > 0), "{}", venue.label);
+        }
+        let listed: Vec<_> = ROBINHOOD_TESTNET
+            .listed
+            .iter()
+            .filter(|listing| listing.max_sale.is_some())
+            .map(|listing| listing.token.symbol)
+            .collect();
+        assert_eq!(listed, ["TSLA", "AMD"]);
+        assert_eq!(
+            ROBINHOOD_TESTNET.listed[0].max_sale,
+            Some(1_000 * 10u128.pow(18))
+        );
     }
 
     #[test]

@@ -50,7 +50,9 @@ contract BaseSepoliaForkTest is Test {
         forked = true;
 
         RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](1);
-        listings[0] = RobinhoodDriver.Listing(WETH, IAggregatorV3(ETH_FEED), IUniswapV3Pool(WETH_POOL));
+        listings[0] = RobinhoodDriver.Listing(
+            WETH, IAggregatorV3(ETH_FEED), IUniswapV3Pool(WETH_POOL), type(uint256).max
+        );
         driver = new RobinhoodDriver(
             RobinhoodDriver.Venue({
                 dollar: IERC20(USDC),

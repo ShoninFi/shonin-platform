@@ -130,6 +130,8 @@ mod tests {
                 .networks
                 .contains(&"mainnet".to_string())
         );
+        // A driver not yet built is offered nowhere, mainnet least of all.
+        assert!(catalogue.drivers["lighter"].networks.is_empty());
         assert!(catalogue.bridges.contains_key("local-bridge"));
     }
 
@@ -174,11 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn hyperliquid_is_offered_on_testnet_with_the_driver_contract_s_list() {
+    fn hyperliquid_is_offered_on_testnet_and_mainnet_with_the_driver_contract_s_list() {
         let catalogue = Catalogue::published();
         let hyperliquid = &catalogue.drivers["hyperliquid"];
         assert_eq!(hyperliquid.chain, DriverChain::On(Chain::Hyperliquid));
-        assert_eq!(hyperliquid.networks, vec!["testnet".to_string()]);
+        assert_eq!(hyperliquid.networks, vec!["testnet", "mainnet"]);
         // The same codes, in the same order, as `HyperliquidDriver.restricted()`.
         assert_eq!(hyperliquid.restricted, vec!["CA-ON", "SANCTIONED", "US"]);
         assert_eq!(hyperliquid.exit, Exit::Delayed);
@@ -192,7 +194,7 @@ mod tests {
         assert_eq!(base.chain, DriverChain::On(Chain::Base));
         assert_eq!(robinhood.chain, DriverChain::On(Chain::Robinhood));
         for driver in [base, robinhood] {
-            assert_eq!(driver.networks, vec!["testnet".to_string()]);
+            assert_eq!(driver.networks, vec!["testnet", "mainnet"]);
             assert_eq!(driver.custody, Custody::Station);
             assert_eq!(driver.exit, Exit::Contract);
         }

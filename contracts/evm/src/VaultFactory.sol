@@ -100,9 +100,20 @@ contract VaultFactory is IVaultFactory {
         previous = deps.previous;
         _checked(config_);
         _config = config_;
+        // Each chain once, by name and by id, and this one among them: a
+        // record naming this chain could otherwise never activate.
+        bool here;
         for (uint256 i = 0; i < chains_.length; i++) {
+            if (chains_[i].name == bytes32(0) || chains_[i].chainId == 0) revert OutOfRange();
+            for (uint256 j = 0; j < i; j++) {
+                if (chains_[j].name == chains_[i].name || chains_[j].chainId == chains_[i].chainId) {
+                    revert ChainTwice();
+                }
+            }
+            if (chains_[i].chainId == block.chainid) here = true;
             _chains.push(chains_[i]);
         }
+        if (!here) revert UnknownChain(bytes32(0));
     }
 
     function activate(
