@@ -68,7 +68,7 @@ contract RobinhoodStationTest is Fixture {
         _keepFeedFresh();
 
         RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](1);
-        listings[0] = RobinhoodDriver.Listing(NVDA, IAggregatorV3(NVDA_FEED), pool);
+        listings[0] = RobinhoodDriver.Listing(NVDA, IAggregatorV3(NVDA_FEED), pool, type(uint256).max);
         rh = new RobinhoodDriver(
             RobinhoodDriver.Venue({
                 dollar: IERC20(address(usd)),

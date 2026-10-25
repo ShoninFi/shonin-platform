@@ -68,6 +68,7 @@ contract StationLimitsTest is Fixture {
     /// chain's description: the executor can't create it with another.
     function test_a_remote_stations_exit_band_is_the_one_the_builder_signed() public {
         StationFactory ownStations = new StationFactory(address(this));
+        actAsVaultFactoryFor(address(ownStations));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         address vaultAddr = makeAddr("vault on chain 8453");
 
@@ -108,6 +109,7 @@ contract StationLimitsTest is Fixture {
     /// trades on: money between two other chains goes through home.
     function test_a_remote_station_sends_only_home() public {
         StationFactory ownStations = new StationFactory(address(this));
+        actAsVaultFactoryFor(address(ownStations));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         address vaultAddr = makeAddr("vault on chain 8453");
         bytes32 leaf = keccak256(

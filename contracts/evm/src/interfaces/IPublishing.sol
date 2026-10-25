@@ -17,6 +17,9 @@ struct Submission {
 /// then records it under.
 interface IPublishing {
     event Submitted(uint256 indexed strategyId, address indexed author, bytes32 indexed upload, uint256 fee);
+    /// The dollar refused the transfer to the platform: `owed` stays here.
+    event FeeHeld(uint256 owed);
+    event Collected(uint256 amount);
 
     /// Pay the fee, in the chain's dollar, and take the next id.
     function submit(bytes32 upload) external returns (uint256 strategyId);
@@ -28,4 +31,8 @@ interface IPublishing {
     function fee() external view returns (uint256);
     function asset() external view returns (address);
     function platform() external view returns (address);
+    /// Fees taken that the dollar hasn't yet let through to the platform.
+    function owed() external view returns (uint256);
+    /// Anyone: send `owed` on to the platform.
+    function collect() external returns (uint256 amount);
 }

@@ -19,7 +19,10 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// dollar, with their decimals read from the venue then. A station holding a
 /// perp outside the list can't be valued at its exit side, so the driver
 /// reports every market as outside the band until it is gone: valuations are
-/// void and no leaver is paid at a figure nobody can check.
+/// void and no leaver is paid at a figure nobody can check. A listed market
+/// the venue stops answering for is treated the same way. A full unwind is
+/// never held by either: it closes every listed market it can read, and
+/// leaves the rest, worth nothing to it.
 ///
 /// A holding worth less than the venue's smallest order can't be closed, so
 /// it neither closes nor blocks; a spot holding like that can't be sold
@@ -337,12 +340,18 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// position, each limited to the venue's own price (the oracle for a
     /// perp, the spot price for a pair) less or plus the band, and only
     /// while every price of every market held is inside the band.
+    ///
+    /// At the full band nothing blocks: the listed markets are closed at any
+    /// price, and what the driver can't close is left where it is, worth
+    /// nothing to the close: a perp it doesn't list, and a listed market the
+    /// venue doesn't answer for. Inside the band either of those blocks.
     function close(
         address station,
         uint256 fraction,
         uint16 bandBps
     ) external view returns (Call[] memory calls, bool blocked) {
-        if (_unlisted(station)) return (new Call[](0), true);
+        bool full = bandBps >= BPS;
+        if (!full && _unlisted(station)) return (new Call[](0), true);
         // No HYPE to send the dollars home with: nothing is sold for a
         // leaver whose close could then never come home. A full unwind,
         // which everyone shares, goes ahead and sends once there is.
@@ -350,8 +359,9 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         // stage keeps would miss them), nor when what the close frees
         // couldn't leave the account.
         if (fraction < WAD) {
-            HyperCore.SpotBalance memory gas = HyperCore.spotBalance(station, _spots[_gas].token);
-            if (uint256(gas.total) - uint256(gas.hold) < gasFloor) return (new Call[](0), true);
+            (bool read, uint64 gasTotal, uint64 gasHold) =
+                HyperCore.trySpotBalance(station, _spots[_gas].token);
+            if (!read || uint256(gasTotal) - uint256(gasHold) < gasFloor) return (new Call[](0), true);
             if (!priced(station) || !_releasable(station, fraction)) return (new Call[](0), true);
         }
         calls = new Call[](_perps.length + _spots.length);
@@ -390,26 +400,47 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         return worth >= kept + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
     }
 
-    /// The order closing `fraction` of one perp position, if any.
+    /// The order closing `fraction` of one perp position, if any. A market
+    /// whose reads fail is outside the band, and at the full band is left.
     function _perpClose(
         address station,
         Perp memory perp,
         uint256 fraction,
         uint16 bandBps
     ) private view returns (bytes memory action, bool outside) {
-        int256 szi = HyperCore.position(station, perp.index).szi;
+        bool full = bandBps >= BPS;
+        (bool read, int64 szi) = HyperCore.tryPosition(station, perp.index);
+        if (!read) return ("", !full);
         if (szi == 0) return ("", false);
         bool isLong = szi > 0;
-        uint256 open = uint256(isLong ? szi : -szi);
+        uint256 open = uint256(int256(isLong ? szi : -szi));
         uint256 size = _part(open, fraction);
-        uint256 mark = HyperCore.markPx(perp.index);
-        // A position the venue wouldn't take an order for whole is dust:
-        // it can't be closed, and it can't block anything either.
-        if (open * mark < MIN_ORDER) return ("", false);
+        uint256 mark;
+        uint256 venuePx;
+        {
+            uint64 m;
+            uint64 o;
+            (read, m) = HyperCore.tryMarkPx(perp.index);
+            if (!read) return ("", !full);
+            mark = m;
+            // A position the venue wouldn't take an order for whole is dust:
+            // it can't be closed, and it can't block anything either.
+            if (open * mark < MIN_ORDER) return ("", false);
+            (read, o) = HyperCore.tryOraclePx(perp.index);
+            // No price to limit an order by is no answer either.
+            if (!read || o == 0) return ("", !full);
+            venuePx = o;
+        }
         uint256 limit;
         {
-            (uint256 bid, uint256 ask) = HyperCore.bbo(perp.index);
-            (limit, outside) = _limit(isLong, HyperCore.oraclePx(perp.index), mark, bid, ask, bandBps);
+            // At the full band the book doesn't matter.
+            uint64 bid;
+            uint64 ask;
+            if (!full) {
+                (read, bid, ask) = HyperCore.tryBbo(perp.index);
+                if (!read) return ("", true);
+            }
+            (limit, outside) = _limit(isLong, venuePx, mark, bid, ask, bandBps);
         }
         // Size times a perp price is already millionths of a dollar.
         if (outside || size * mark < MIN_ORDER) return ("", outside);
@@ -423,31 +454,45 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         );
     }
 
-    /// The order selling `fraction` of one spot holding, if any.
+    /// The order selling `fraction` of one spot holding, if any. A market
+    /// whose reads fail is outside the band, and at the full band is left.
     function _spotClose(
         address station,
         uint256 index,
         uint256 fraction,
         uint16 bandBps
     ) private view returns (bytes memory action, bool outside) {
+        bool full = bandBps >= BPS;
         Spot memory spot = _spots[index];
-        HyperCore.SpotBalance memory balance = HyperCore.spotBalance(station, spot.token);
+        (bool read, uint64 balanceTotal, uint64 balanceHold) = HyperCore.trySpotBalance(station, spot.token);
+        if (!read) return ("", !full);
         uint256 lot = 10 ** (spot.weiDecimals - spot.szDecimals);
         // HYPE up to the reserve pays for sends home: only the rest is held.
         uint256 kept = index == _gas ? gasReserve : 0;
-        uint256 total = uint256(balance.total);
+        uint256 total = uint256(balanceTotal);
         uint256 held = total > kept ? (total - kept) / lot : 0;
         if (held == 0) return ("", false);
         uint256 size = _part(held, fraction);
         // What open orders hold can't be sold until they are cancelled.
-        uint256 spare = total - uint256(balance.hold);
+        uint256 spare = total - uint256(balanceHold);
         uint256 free = spare > kept ? (spare - kept) / lot : 0;
-        uint256 venuePx = HyperCore.spotPx(spot.pair);
+        uint256 venuePx;
+        {
+            uint64 px;
+            (read, px) = HyperCore.trySpotPx(spot.pair);
+            if (!read || px == 0) return ("", !full);
+            venuePx = px;
+        }
         // Dust.
         if (held * venuePx / 100 < MIN_ORDER) return ("", false);
         uint256 limit;
         {
-            (uint256 bid, uint256 ask) = HyperCore.bbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
+            uint64 bid;
+            uint64 ask;
+            if (!full) {
+                (read, bid, ask) = HyperCore.tryBbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
+                if (!read) return ("", true);
+            }
             (limit, outside) = _limit(true, venuePx, venuePx, bid, ask, bandBps);
         }
         if (outside) return ("", true);
@@ -749,25 +794,22 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// holding worth less than the smallest order, at nothing, since nothing
     /// sells them. Money in the venue's own vaults is counted by the
     /// station, which knows where it is.
+    ///
+    /// A market whose reads fail is never counted above what is known: a
+    /// perp's whole notional comes off the exit side, as a perp the driver
+    /// doesn't list does, and a spot holding counts as nothing (at the exit
+    /// side only, where only its book can't be read). `close` reports such a
+    /// market as outside the band, so no valuation prices on these figures.
     function valueOf(address station) external view returns (uint256 mark, uint256 exit) {
         HyperCore.MarginSummary memory summary = HyperCore.marginSummary(station);
         int256 perpValue = summary.accountValue;
         uint256 discount;
         uint256 listed;
         for (uint256 i = 0; i < _perps.length; i++) {
-            int256 szi = HyperCore.position(station, _perps[i].index).szi;
-            if (szi == 0) continue;
-            uint256 px = HyperCore.markPx(_perps[i].index);
-            (uint256 bid, uint256 ask) = HyperCore.bbo(_perps[i].index);
-            uint256 open = uint256(szi > 0 ? szi : -szi);
-            listed += open * px;
-            if (szi > 0) {
-                uint256 exitPx = bid < px ? bid : px;
-                discount += open * (px - exitPx);
-            } else {
-                uint256 exitPx = ask > px ? ask : px;
-                discount += open * (exitPx - px);
-            }
+            (bool known, uint256 open, uint256 off) = _perpDiscount(station, _perps[i].index);
+            if (!known) continue;
+            listed += open;
+            discount += off;
         }
         // A position the driver doesn't know is worth nothing to a leaver.
         if (summary.ntlPos > listed + _perps.length + 1) discount += summary.ntlPos - listed;
@@ -779,31 +821,79 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         mark += dollars;
         exit += dollars;
         for (uint256 i = 0; i < _spots.length; i++) {
-            Spot memory spot = _spots[i];
-            uint256 total = HyperCore.spotBalance(station, spot.token).total;
-            if (i == _gas) total = total > gasReserve ? total - gasReserve : 0;
-            if (total == 0) continue;
-            uint256 px = HyperCore.spotPx(spot.pair);
-            uint256 scale = 10 ** (uint256(spot.weiDecimals) + 8 - spot.szDecimals);
-            uint256 worth = total.mulDiv(px * 1e6, scale);
-            if (worth < MIN_ORDER) continue;
-            (uint256 bid,) = HyperCore.bbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
-            mark += worth;
-            exit += total.mulDiv((bid < px ? bid : px) * 1e6, scale);
+            (uint256 m, uint256 x) = _spotWorth(station, i);
+            mark += m;
+            exit += x;
         }
+    }
+
+    /// One listed perp's notional at its mark, and what selling it at the
+    /// exit side would lose against the mark; `known` is false when any of
+    /// its reads fails.
+    function _perpDiscount(
+        address station,
+        uint32 index
+    ) private view returns (bool known, uint256 notional, uint256 off) {
+        (bool read, int64 szi) = HyperCore.tryPosition(station, index);
+        if (!read) return (false, 0, 0);
+        if (szi == 0) return (true, 0, 0);
+        uint64 m;
+        uint64 bid;
+        uint64 ask;
+        (read, m) = HyperCore.tryMarkPx(index);
+        if (!read) return (false, 0, 0);
+        (read, bid, ask) = HyperCore.tryBbo(index);
+        if (!read) return (false, 0, 0);
+        uint256 px = m;
+        uint256 open = uint256(int256(szi > 0 ? szi : -szi));
+        notional = open * px;
+        if (szi > 0) {
+            uint256 exitPx = bid < px ? bid : px;
+            off = open * (px - exitPx);
+        } else {
+            uint256 exitPx = ask > px ? ask : px;
+            off = open * (exitPx - px);
+        }
+        known = true;
+    }
+
+    /// One listed spot holding at its price and at the lower of it and the
+    /// bid; nothing for what can't be read.
+    function _spotWorth(address station, uint256 i) private view returns (uint256 mark, uint256 exit) {
+        Spot memory spot = _spots[i];
+        (bool read, uint64 balance,) = HyperCore.trySpotBalance(station, spot.token);
+        if (!read) return (0, 0);
+        uint256 total = balance;
+        if (i == _gas) total = total > gasReserve ? total - gasReserve : 0;
+        if (total == 0) return (0, 0);
+        uint64 px;
+        (read, px) = HyperCore.trySpotPx(spot.pair);
+        if (!read) return (0, 0);
+        uint256 scale = 10 ** (uint256(spot.weiDecimals) + 8 - spot.szDecimals);
+        mark = total.mulDiv(uint256(px) * 1e6, scale);
+        if (mark < MIN_ORDER) return (0, 0);
+        uint64 bid;
+        (read, bid,) = HyperCore.tryBbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
+        if (!read) return (mark, 0);
+        exit = total.mulDiv((bid < px ? bid : px) * uint256(1e6), scale);
     }
 
     /// Whether the account holds a perp the driver doesn't list: its total
     /// notional is more than the listed perps' (with a dollar-unit of
-    /// rounding for each).
+    /// rounding for each). A listed perp whose reads fail counts as one it
+    /// doesn't list.
     function _unlisted(address station) private view returns (bool) {
         uint256 total = HyperCore.marginSummary(station).ntlPos;
         if (total == 0) return false;
         uint256 listed;
         for (uint256 i = 0; i < _perps.length; i++) {
-            int256 szi = HyperCore.position(station, _perps[i].index).szi;
+            (bool read, int64 szi) = HyperCore.tryPosition(station, _perps[i].index);
+            if (!read) return true;
             if (szi == 0) continue;
-            listed += uint256(szi > 0 ? szi : -szi) * HyperCore.markPx(_perps[i].index);
+            uint64 px;
+            (read, px) = HyperCore.tryMarkPx(_perps[i].index);
+            if (!read) return true;
+            listed += uint256(int256(szi > 0 ? szi : -szi)) * px;
         }
         return total > listed + _perps.length + 1;
     }

@@ -83,6 +83,21 @@ contract StationDouble {
         }
     }
 
+    /// Make one of `driver`'s calls as a stopped station's full unwind
+    /// makes it at the full band, checked as `run` checks it but with
+    /// exactly `allowance` gas: whether it went through, and what it spent.
+    function attempt(
+        IDriver driver,
+        Call memory c,
+        uint256 allowance
+    ) external returns (bool ok, uint256 spent) {
+        address[] memory targets = driver.targets();
+        if (c.target != dollar && !_includes(targets, c.target)) revert BadCall();
+        uint256 before = gasleft();
+        (ok,) = c.target.call{gas: allowance, value: c.value}(c.data);
+        spent = before - gasleft();
+    }
+
     function approveKey(IDriver driver, address key) external {
         run(driver, driver.approveKey(address(this), key, type(uint64).max));
         approvedKey[driver.name()] = key;

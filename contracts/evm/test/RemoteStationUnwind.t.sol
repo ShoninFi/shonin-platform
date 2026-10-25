@@ -33,6 +33,7 @@ contract RemoteStationUnwindTest is Fixture {
         blessServiceKey(BUILDER_IMAGE, builder);
 
         ownStations = new StationFactory(address(this));
+        actAsVaultFactoryFor(address(ownStations));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         blessFor(EXECUTOR_IMAGE, executor);
         blessFor(UNWINDER_IMAGE, unwinder);

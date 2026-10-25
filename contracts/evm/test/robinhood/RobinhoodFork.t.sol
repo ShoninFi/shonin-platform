@@ -54,8 +54,12 @@ contract RobinhoodForkTest is Test {
         forked = true;
 
         RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](2);
-        listings[0] = RobinhoodDriver.Listing(NVDA, IAggregatorV3(NVDA_FEED), IUniswapV3Pool(NVDA_POOL));
-        listings[1] = RobinhoodDriver.Listing(TSLA, IAggregatorV3(TSLA_FEED), IUniswapV3Pool(TSLA_POOL));
+        listings[0] = RobinhoodDriver.Listing(
+            NVDA, IAggregatorV3(NVDA_FEED), IUniswapV3Pool(NVDA_POOL), type(uint256).max
+        );
+        listings[1] = RobinhoodDriver.Listing(
+            TSLA, IAggregatorV3(TSLA_FEED), IUniswapV3Pool(TSLA_POOL), type(uint256).max
+        );
         driver = new RobinhoodDriver(
             RobinhoodDriver.Venue({
                 dollar: IERC20(USDG),
@@ -312,12 +316,14 @@ contract RobinhoodForkTest is Test {
         assertTrue(blocked, "feed below the market");
     }
 
-    function test_at_the_full_band_everything_is_sold_at_any_price_and_nothing_blocks() public onFork {
+    function test_at_the_full_band_everything_is_sold_at_any_price_whatever_the_feed() public onFork {
         _setUpAndFund();
         _buyNvda(2000e6, _nvdaFor(2000e6) * 98 / 100, _safe());
         vm.mockCall(NVDA, abi.encodeCall(IStockToken.oraclePaused, ()), abi.encode(true));
-        (, bool blocked) = driver.close(address(station), 1e18, 10_000);
-        assertFalse(blocked);
+        (Call[] memory offered, bool blocked) = driver.close(address(station), 1e18, 10_000);
+        assertGt(offered.length, 0, "a full-band close made no sale");
+        // Not done until a close finds nothing left to sell.
+        assertTrue(blocked, "a full-band close that sells said it was done");
         uint256 before = IERC20(USDG).balanceOf(address(station));
         (Call[] memory calls,) = driver.close(address(station), 1e18, 10_000);
         station.run(IDriver(address(driver)), calls);

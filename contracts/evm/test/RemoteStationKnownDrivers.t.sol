@@ -19,6 +19,7 @@ contract RemoteStationKnownDriversTest is Fixture {
     function setUp() public override {
         super.setUp();
         ownStations = new StationFactory(address(this));
+        actAsVaultFactoryFor(address(ownStations));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         bytes32 leaf = keccak256(
             bytes.concat(keccak256(abi.encode(VAULT_CHAIN, vaultAddr, BUNDLE, block.chainid, executor)))

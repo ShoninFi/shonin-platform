@@ -103,6 +103,29 @@ contract MockHyperCore {
 
     // Setting the scene -----------------------------------------------------
 
+    /// Markets the venue no longer answers for: every read naming one fails,
+    /// burning the gas it was given, as the venue's precompiles do.
+    mapping(uint32 => bool) public brokenPerp;
+    mapping(uint32 => bool) public brokenPair;
+    mapping(uint64 => bool) public brokenToken;
+
+    function breakPerp(uint32 index) external {
+        brokenPerp[index] = true;
+    }
+
+    function breakPair(uint32 index) external {
+        brokenPair[index] = true;
+    }
+
+    function breakToken(uint64 index) external {
+        brokenToken[index] = true;
+    }
+
+    function _fail() private pure {
+        // Burn whatever gas the read was given.
+        for (uint256 i = 0;; i++) {}
+    }
+
     function listPerp(uint32 index, uint8 szDecimals, uint64 price) external {
         perp[index] = Market(price, price, price, price, szDecimals, true);
         perpList.push(index);
@@ -202,10 +225,12 @@ contract MockHyperCore {
     function answer(address precompile, bytes calldata input) external view returns (bytes memory) {
         if (precompile == HyperCore.POSITION) {
             (address user, uint16 index) = abi.decode(input, (address, uint16));
+            if (brokenPerp[index]) _fail();
             return abi.encode(HyperCore.Position(szi[user][index], 0, 0, 0, false));
         }
         if (precompile == HyperCore.SPOT_BALANCE) {
             (address user, uint64 t) = abi.decode(input, (address, uint64));
+            if (brokenToken[t]) _fail();
             return abi.encode(HyperCore.SpotBalance(spotTotal[user][t], spotHold[user][t], 0));
         }
         if (precompile == HyperCore.VAULT_EQUITY) {
@@ -216,9 +241,16 @@ contract MockHyperCore {
             address user = abi.decode(input, (address));
             return abi.encode(uint64(withdrawableOf(user)));
         }
-        if (precompile == HyperCore.MARK_PX) return abi.encode(perp[abi.decode(input, (uint32))].mark);
-        if (precompile == HyperCore.ORACLE_PX) return abi.encode(perp[abi.decode(input, (uint32))].oracle);
-        if (precompile == HyperCore.SPOT_PX) return abi.encode(pair[abi.decode(input, (uint32))].px);
+        if (precompile == HyperCore.MARK_PX || precompile == HyperCore.ORACLE_PX) {
+            uint32 index = abi.decode(input, (uint32));
+            if (brokenPerp[index]) _fail();
+            return abi.encode(precompile == HyperCore.MARK_PX ? perp[index].mark : perp[index].oracle);
+        }
+        if (precompile == HyperCore.SPOT_PX) {
+            uint32 index = abi.decode(input, (uint32));
+            if (brokenPair[index]) _fail();
+            return abi.encode(pair[index].px);
+        }
         if (precompile == HyperCore.PERP_ASSET_INFO) {
             Market memory m = perp[abi.decode(input, (uint32))];
             require(m.listed, "no such perp");
@@ -239,9 +271,11 @@ contract MockHyperCore {
         if (precompile == HyperCore.BBO) {
             uint32 asset = abi.decode(input, (uint32));
             if (asset >= HyperCore.SPOT_ASSET_OFFSET) {
+                if (brokenPair[asset - HyperCore.SPOT_ASSET_OFFSET]) _fail();
                 SpotPair memory p = pair[asset - HyperCore.SPOT_ASSET_OFFSET];
                 return abi.encode(p.bid, p.ask);
             }
+            if (brokenPerp[asset]) _fail();
             return abi.encode(perp[asset].bid, perp[asset].ask);
         }
         if (precompile == HyperCore.ACCOUNT_MARGIN_SUMMARY) {

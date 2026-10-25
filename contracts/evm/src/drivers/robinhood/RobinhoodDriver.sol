@@ -65,6 +65,32 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// The most a token's `oraclePaused` read may spend: a proxied token
     /// answers it in a few thousand.
     uint256 private constant PAUSE_READ_GAS = 50_000;
+    /// The most stock tokens one driver lists. A stopped station's full
+    /// unwind gives each of its calls (an approval and a sale per token, and
+    /// the idle dollars) a fixed allowance of gas, so the whole unwind,
+    /// every call spending all of it, fits the per-transaction gas cap of
+    /// 2^24 (EIP-7825) with room for the station's and the vault's own
+    /// work. Its exit value sums the idle dollars and one rounded-down quote
+    /// per token, well within the sixteen dollar-units a station lets a
+    /// close leave above the stayers' share for that rounding.
+    uint256 public constant MAX_LISTINGS = 2;
+    /// How far one sale of a stopped station's full unwind may move its
+    /// pool's price: this many of the pool's tick spacings from the price
+    /// the close is prepared at, in the sale's direction (about 5% at the
+    /// 0.05% fee's spacing of ten ticks). A sale's gas grows with every
+    /// initialised tick it crosses, so a sale that takes all of a thin
+    /// pool's liquidity would otherwise walk to the tick limit across
+    /// however many range boundaries lie on its side (or anyone has minted
+    /// there), and could never fit the gas the station gives it. Within
+    /// this distance it crosses at most this many and one more, every
+    /// spacing initialised, and fits that allowance with room to spare,
+    /// whatever the pool's spacing. What the limit leaves
+    /// unsold is sold by the next unwind, from the price this one left.
+    uint256 public constant SALE_SPACINGS = 50;
+    /// The pool's bounds on a swap's price limit (exclusive).
+    uint160 private constant MIN_SQRT_RATIO = 4_295_128_739;
+    uint160 private constant MAX_SQRT_RATIO =
+        1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
 
     // Roles v2's condition types and operators.
     uint8 private constant T_NONE = 0;
@@ -101,10 +127,15 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     bytes32 private immutable _moduleCodeHash;
 
     Stock[] private _stocks;
+    /// The most of each listed token one sale of a stopped station's full
+    /// unwind sells (see `Listing`).
+    mapping(address token => uint256) public maxSale;
 
     error NotListed();
     error Repeated();
     error BadPool();
+    error TooMany();
+    error NoMaxSale();
 
     struct Venue {
         IERC20 dollar;
@@ -121,6 +152,13 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         address token;
         IAggregatorV3 feed;
         IUniswapV3Pool pool;
+        /// The most of the token, in its own units, that one sale of a
+        /// stopped station's full unwind sells. Sized from the pool, so
+        /// that one such sale (through the Safe, the router and the pool,
+        /// as far as its price limit) spends well under the gas the
+        /// station gives each call; what is left is sold by the next
+        /// unwind.
+        uint256 maxSale;
     }
 
     constructor(Venue memory venue, Listing[] memory listings) {
@@ -142,6 +180,7 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
                 hex"5af43d82803e903d91602b57fd5bf3"
             )
         );
+        if (listings.length > MAX_LISTINGS) revert TooMany();
         uint8 dollarDecimals = IERC20Metadata(address(venue.dollar)).decimals();
         for (uint256 i = 0; i < listings.length; i++) {
             Listing memory listing = listings[i];
@@ -158,6 +197,8 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
             if (!pair) revert BadPool();
             uint8 decimals = IERC20Metadata(listing.token).decimals() + listing.feed.decimals();
             if (decimals < dollarDecimals) revert BadPool();
+            if (listing.maxSale == 0) revert NoMaxSale();
+            maxSale[listing.token] = listing.maxSale;
             _stocks.push(
                 Stock({
                     token: listing.token,
@@ -239,6 +280,9 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
 
     // Keys and money --------------------------------------------------------
 
+    /// Make `key` a member of the role. A role's membership has no end of
+    /// its own, so `validUntil` is not kept here: the key trades until it
+    /// is revoked.
     function approveKey(address station, address key, uint64) external view returns (Call[] memory calls) {
         Call[] memory setup = _setUp(station);
         calls = _append(setup, 1);
@@ -283,7 +327,17 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// leaver, never on the dollars the Safe keeps for everyone. Blocked
     /// when any holding worth more than dust has a feed that can't be
     /// trusted or a market further from its feed than the band, on either
-    /// side. At the full band, everything is sold at any price.
+    /// side. At the full band, everything is sold at any price, at most
+    /// `maxSale` of a token per close and no further than `SALE_SPACINGS`
+    /// from the pool's price, so each sale fits the gas the station gives
+    /// it; a close that sells anything is reported blocked beside its calls
+    /// (what the sale leaves at its price limit is only known once it is
+    /// made), and the next unwind sells on, done once nothing is left to
+    /// sell. Each call stands
+    /// alone (its own Safe transaction): the station makes each on its own
+    /// then, so a token whose sale fails (its transfers paused, its pool
+    /// unable to take it, its gas burned) stays in the Safe, still valued,
+    /// and the other holdings and the idle dollars come home.
     function close(
         address station,
         uint256 fraction,
@@ -295,9 +349,10 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         calls = new Call[](count * 2 + 1);
         uint256 made;
         for (uint256 i = 0; i < count; i++) {
-            (Call[2] memory sale, bool sells, bool outside) =
+            (Call[2] memory sale, bool sells, bool outside, bool more) =
                 _sale(station, safe, _stocks[i], fraction, bandBps);
             if (outside) return (new Call[](0), true);
+            if (more) blocked = true;
             if (!sells) continue;
             calls[made++] = sale[0];
             calls[made++] = sale[1];
@@ -379,23 +434,31 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     // Internals -------------------------------------------------------------
 
     /// One stock's part of a close: approve the router and sell the
-    /// fraction, paid to the station.
+    /// fraction, paid to the station; at the full band no more than
+    /// `maxSale` and no further than `SALE_SPACINGS` from the pool's price,
+    /// and `more`, since either may leave some to sell.
     function _sale(
         address station,
         address safe,
         Stock memory stock,
         uint256 fraction,
         uint16 bandBps
-    ) private view returns (Call[2] memory sale, bool sells, bool outside) {
+    ) private view returns (Call[2] memory sale, bool sells, bool outside, bool more) {
         uint256 balance = IERC20(stock.token).balanceOf(safe);
-        if (balance == 0) return (sale, false, false);
+        if (balance == 0) return (sale, false, false, false);
         (bool trusted, uint256 price) = _feedPrice(stock);
         bool dust = trusted ? balance.mulDiv(price, stock.scale) < DUST_USD : balance < DUST_UNITS;
         bool banded = bandBps < BPS && !dust;
-        if (banded && (!trusted || _outsideBand(stock, price, bandBps))) return (sale, false, true);
+        if (banded && (!trusted || _outsideBand(stock, price, bandBps))) return (sale, false, true, false);
         uint256 amountIn = balance.mulDiv(fraction, WAD, Math.Rounding.Ceil);
         if (amountIn > balance) amountIn = balance;
-        if (amountIn == 0) return (sale, false, false);
+        if (amountIn == 0) return (sale, false, false, false);
+        uint160 priceLimit;
+        if (bandBps >= BPS) {
+            if (amountIn > maxSale[stock.token]) amountIn = maxSale[stock.token];
+            priceLimit = _priceLimit(stock);
+            more = true;
+        }
         uint256 minOut = banded ? amountIn.mulDiv(price, stock.scale).mulDiv(BPS - bandBps, BPS) : 0;
         sale[0] = _exec(station, stock.token, abi.encodeCall(IERC20.approve, (router, amountIn)));
         sale[1] = _exec(
@@ -411,12 +474,29 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
                         recipient: station,
                         amountIn: amountIn,
                         amountOutMinimum: minOut,
-                        sqrtPriceLimitX96: 0
+                        sqrtPriceLimitX96: priceLimit
                     })
                 )
             )
         );
         sells = true;
+    }
+
+    /// The price a full-band sale of `stock` stops at: `SALE_SPACINGS` of
+    /// its pool's tick spacings past the pool's current tick, in the sale's
+    /// direction (down when the stock is the pool's token0), within the
+    /// bounds the pool takes.
+    function _priceLimit(Stock memory stock) private view returns (uint160) {
+        (, int24 tick,,,,,) = stock.pool.slot0();
+        int256 distance = int256(SALE_SPACINGS) * int256(stock.pool.tickSpacing());
+        if (stock.token < address(dollar)) {
+            int256 target = int256(tick) - distance;
+            if (target <= UniswapPrice.MIN_TICK) return MIN_SQRT_RATIO + 1;
+            return UniswapPrice.sqrtRatioAtTick(int24(target));
+        }
+        int256 above = int256(tick) + distance;
+        if (above >= UniswapPrice.MAX_TICK) return MAX_SQRT_RATIO - 1;
+        return UniswapPrice.sqrtRatioAtTick(int24(above));
     }
 
     /// The calls that set the station's Safe up, if it isn't yet: the Safe
