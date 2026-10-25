@@ -252,12 +252,10 @@ pub fn initialized_ticks(
             return Ok(Vec::new());
         };
         let mut found = Vec::new();
-        let mut offset = -1;
-        while let Some(at) = array.next_initialized(offset, false) {
-            let tick = array.start + at * tick_spacing as i32;
-            found.push((tick, array.tick(tick, tick_spacing)?.liquidity_net));
-            offset = at;
-        }
+        array.each_initialized(-1, false, |at, net| {
+            found.push((array.start + at * tick_spacing as i32, net));
+            true
+        })?;
         Ok(found)
     })
 }

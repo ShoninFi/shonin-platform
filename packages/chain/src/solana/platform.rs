@@ -293,6 +293,18 @@ impl Platform {
         args: shonin_registry::InitializeArgs,
         checker: Pubkey,
     ) -> Instruction {
+        Self::ix_initialize_registry_trusting(deployer, args, shonin_dev_verifier::ID, checker)
+    }
+
+    /// Set the registry up, trusting first the checker whose state account
+    /// is `checker`, of the checker program `verifier_program` (final by
+    /// then): on mainnet, the Confidential Space checker.
+    pub fn ix_initialize_registry_trusting(
+        deployer: &Pubkey,
+        args: shonin_registry::InitializeArgs,
+        verifier_program: Pubkey,
+        checker: Pubkey,
+    ) -> Instruction {
         Instruction {
             program_id: shonin_registry::ID,
             accounts: shonin_registry::accounts::Initialize {
@@ -300,8 +312,8 @@ impl Platform {
                 config: registry::config_address(),
                 program: shonin_registry::ID,
                 program_data: program_data_address(&shonin_registry::ID),
-                verifier_program: shonin_dev_verifier::ID,
-                verifier_program_data: Some(program_data_address(&shonin_dev_verifier::ID)),
+                verifier_program,
+                verifier_program_data: Some(program_data_address(&verifier_program)),
                 verifier_state: checker,
                 verifier_record: registry::verifier_address(&checker),
                 system_program: SYSTEM,

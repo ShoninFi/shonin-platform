@@ -894,7 +894,9 @@ pub mod shonin_station {
     /// neither layout, and one not at its own station address. It neither
     /// reads nor changes whether the station has stopped: a stopped station
     /// is rewritten the same way, and no station keeps anything between
-    /// transactions that a rewrite could cut short.
+    /// transactions that a rewrite could cut short. Not in a mainnet build,
+    /// where every station is made in the current layout.
+    #[cfg(not(feature = "mainnet"))]
     pub fn migrate_station(ctx: Context<MigrateStation>) -> Result<()> {
         let info = ctx.accounts.station.to_account_info();
         let (station, layout) = {
@@ -1801,6 +1803,7 @@ pub struct Value<'info> {
     pub station: Box<Account<'info, Station>>,
 }
 
+#[cfg(not(feature = "mainnet"))]
 #[derive(Accounts)]
 pub struct MigrateStation<'info> {
     #[account(mut)]

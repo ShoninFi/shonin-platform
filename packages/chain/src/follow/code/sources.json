@@ -21,7 +21,7 @@
   "src/Vault.sol": "0x59c6584aaf8b69be050c345b6f857a597b75438c6c9324af30f726dfd43eaf91",
   "src/ViewReads.sol": "0x57728b3dd879da0e49b37de5a9468c6363c758d2252d2d7b59736a0eea6707bd",
   "src/interfaces/IAttestationRegistry.sol": "0x769a4cc1b3d2877c62788f1e64003a80b0d59583e43b607e0c84565032a1e855",
-  "src/interfaces/IDriver.sol": "0x39c81962e86b94020d83226dd94c053c448c351b0d78eaac99b0596d8afe3ad1",
+  "src/interfaces/IDriver.sol": "0x5003eef9b545c7907865d93b9f9e6cce0e6f8dca7334920a9b84c53ecb315342",
   "src/interfaces/IPrices.sol": "0xe283523617fbb91cb727abe41e553e75c0e982719d238bc1815eb216b403e79d",
   "src/interfaces/IStation.sol": "0xcd0e152127889b70d80b4e862fc4325e16ceed195a689218639478efa87f80ca",
   "src/interfaces/IVault.sol": "0xdec93295b3ca26ecf4d68775a3c9b5ab0f099d1b47830ceaa745be6fbf21342b",
