@@ -35,9 +35,9 @@ const LOCAL_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// The shortest the timelock may ever be where depositors' money is at
 /// stake. Fixed in the registry when it is deployed, so it can't be lowered
 /// later; development chains have none.
-const MAINNET_MIN_TIMELOCK: u64 = 2 * 24 * 60 * 60;
+pub(crate) const MAINNET_MIN_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// How long a blessing lasts before an executor has to attest again.
-const BLESSING_TTL: u64 = 72 * 60 * 60;
+pub(crate) const BLESSING_TTL: u64 = 72 * 60 * 60;
 /// The same on a local chain, whose clock runs an hour a second: ninety
 /// days, so a blessing lasts over half an hour of real time and the path from
 /// a fresh key's blessing to its gas and its approval at the station is never
@@ -56,7 +56,7 @@ const MAX_EXIT_COST: u64 = 50_000_000;
 const DEAD_ASSETS: u64 = 10_000;
 /// The standard deterministic deployer, present on anvil and on the public
 /// chains, which puts the same creation code at the same address everywhere.
-const CREATE2_DEPLOYER: Address =
+pub(crate) const CREATE2_DEPLOYER: Address =
     alloy::primitives::address!("4e59b44847b379578588920ca78fbf26c0b4956c");
 /// What a deployment file records the deployment's generation under. It is
 /// written beside the addresses (every reader of the file ignores it).
@@ -621,7 +621,16 @@ async fn deploy(
     // and its contracts go out a few to a transaction.
     let dollar = public_dollar(client.chain_id).map(|dollar| dollar.address);
     let plan = plan(artifacts, network, &roles, chains, generation, dollar)?;
-    create(client, admin, artifacts, &plan.creations, &mut landed).await?;
+    let signer = own_key(admin)?;
+    create(
+        client,
+        admin,
+        signer.as_ref(),
+        artifacts,
+        &plan.creations,
+        &mut landed,
+    )
+    .await?;
     let at = plan.addresses;
 
     let wanted = StationFactorySet {
@@ -663,15 +672,15 @@ async fn deploy(
 /// its creation code (the build's, with its libraries linked and its
 /// constructor's arguments appended), its salt, and so its address.
 #[derive(Clone, Debug)]
-struct Creation {
-    name: &'static str,
-    salt: B256,
-    code: Vec<u8>,
-    address: Address,
+pub(crate) struct Creation {
+    pub name: &'static str,
+    pub salt: B256,
+    pub code: Vec<u8>,
+    pub address: Address,
 }
 
 impl Creation {
-    fn new(
+    pub(crate) fn new(
         artifacts: &Path,
         name: &'static str,
         salt: B256,
@@ -728,7 +737,7 @@ struct Plan {
 /// and its admin, so no two deployments on a chain share one. (The
 /// contracts at one address on every chain use [`salt`] alone, as their
 /// creation code names the admin where it matters.)
-fn deployment_salt(generation: u64, admin: Address) -> B256 {
+pub(crate) fn deployment_salt(generation: u64, admin: Address) -> B256 {
     keccak256(("shonin-deployment", U256::from(generation), admin).abi_encode_params())
 }
 
@@ -747,17 +756,171 @@ fn plan(
 ) -> Result<Plan> {
     // None on testnets: nobody else's money is at stake there, and their
     // clocks run in real time, so two days would be two real days. Mainnet
-    // gets a floor the admin can never go under.
-    let (timelock, min_timelock, price_notice) = match network {
-        NetworkName::Local => (LOCAL_TIMELOCK, 0, LOCAL_PRICE_NOTICE),
-        NetworkName::Testnet => (0, 0, 0),
-        NetworkName::Mainnet => (MAINNET_MIN_TIMELOCK, MAINNET_MIN_TIMELOCK, 0),
+    // is never planned here: its deploy has a plan of its own, which can't
+    // create a stand-in or the development checker.
+    let terms = match network {
+        NetworkName::Local => Terms {
+            timelock: LOCAL_TIMELOCK,
+            min_timelock: 0,
+            price_notice: LOCAL_PRICE_NOTICE,
+        },
+        NetworkName::Testnet => Terms {
+            timelock: 0,
+            min_timelock: 0,
+            price_notice: 0,
+        },
+        NetworkName::Mainnet => bail!(
+            "the development plan never deploys to mainnet: the mainnet deploy plans what ships alone"
+        ),
     };
-    let blessing_ttl = blessing_ttl(network);
     let admin = roles.admin;
     let own = deployment_salt(generation, admin);
-    let everywhere = salt(generation);
     let mut creations = Vec::new();
+    let add = |name: &'static str,
+               arguments: Vec<u8>,
+               creations: &mut Vec<Creation>|
+     -> Result<Address> {
+        let creation = Creation::new(artifacts, name, own, arguments, &[])?;
+        let address = creation.address;
+        creations.push(creation);
+        Ok(address)
+    };
+
+    let (usd, venue) = match dollar {
+        Some(dollar) => (dollar, Address::ZERO),
+        None => {
+            let usd = add("LocalUsd", ().abi_encode_params(), &mut creations)?;
+            let venue = add(
+                "LocalVenue",
+                (usd, roles.operator, U256::from(MARGIN_BPS)).abi_encode_params(),
+                &mut creations,
+            )?;
+            (usd, venue)
+        }
+    };
+    let verifier = add(
+        "DevAttestationVerifier",
+        (roles.attestor,).abi_encode_params(),
+        &mut creations,
+    )?;
+    let platform = platform_contracts(
+        artifacts,
+        network,
+        &terms,
+        &Parties {
+            admin,
+            platform: roles.platform,
+            usd,
+            verifier,
+        },
+        chains,
+        generation,
+        &mut creations,
+    )?;
+    let (driver, bridge) = if dollar.is_some() {
+        (Address::ZERO, Address::ZERO)
+    } else {
+        (
+            add(
+                "LocalDriver",
+                (venue, usd).abi_encode_params(),
+                &mut creations,
+            )?,
+            add(
+                "LocalBridge",
+                (usd, roles.operator).abi_encode_params(),
+                &mut creations,
+            )?,
+        )
+    };
+    Ok(Plan {
+        creations,
+        addresses: Planned {
+            usd,
+            venue,
+            verifier,
+            attestation: platform.attestation,
+            publishing: platform.publishing,
+            prices: platform.prices,
+            strategies: platform.strategies,
+            reviews: platform.reviews,
+            profiles: platform.profiles,
+            driver,
+            bridge,
+            station_implementation: platform.station_implementation,
+            station_factory: platform.station_factory,
+            closer: platform.closer,
+            factory: platform.factory,
+        },
+    })
+}
+
+/// The timelock, its floor and the price list's notice a deployment's
+/// platform contracts are created with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Terms {
+    pub timelock: u64,
+    pub min_timelock: u64,
+    pub price_notice: u64,
+}
+
+/// Who and what the platform contracts name: the admin, the account the
+/// platform's fees go to, the dollar, and the registry's first checker.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Parties {
+    pub admin: Address,
+    pub platform: Address,
+    pub usd: Address,
+    pub verifier: Address,
+}
+
+/// Where the platform contracts are: everything a deployment has whatever
+/// its network, and nothing that stands in for anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlatformAddresses {
+    pub attestation: Address,
+    pub publishing: Address,
+    pub prices: Address,
+    pub strategies: Address,
+    pub reviews: Address,
+    pub profiles: Address,
+    pub station_closes: Address,
+    pub station_implementation: Address,
+    pub station_factory: Address,
+    pub closer: Address,
+    pub valuations: Address,
+    pub claims: Address,
+    pub posts: Address,
+    pub upkeep: Address,
+    pub vault_implementation: Address,
+    pub factory: Address,
+}
+
+/// The platform's own contracts, appended to `creations` in the order they
+/// are created, each with its address: the registry (with `parties`'
+/// checker as its first), publishing, prices, the strategy and review
+/// registries, author profiles, the station and its factory, the closer,
+/// the vault's libraries and implementation, and the vault factory. It
+/// creates nothing that stands in for a dollar, a venue or a checker: those
+/// are named in `parties`.
+pub(crate) fn platform_contracts(
+    artifacts: &Path,
+    network: NetworkName,
+    terms: &Terms,
+    parties: &Parties,
+    chains: &[(String, u64)],
+    generation: u64,
+    creations: &mut Vec<Creation>,
+) -> Result<PlatformAddresses> {
+    let Parties {
+        admin,
+        platform,
+        usd,
+        verifier,
+    } = *parties;
+    let blessing_ttl = blessing_ttl(network);
+    let own = deployment_salt(generation, admin);
+    let everywhere = salt(generation);
     let mut add = |name: &'static str,
                    salt: B256,
                    arguments: Vec<u8>,
@@ -769,35 +932,23 @@ fn plan(
         Ok(address)
     };
 
-    let (usd, venue) = match dollar {
-        Some(dollar) => (dollar, Address::ZERO),
-        None => {
-            let usd = add("LocalUsd", own, ().abi_encode_params(), &[])?;
-            let venue = add(
-                "LocalVenue",
-                own,
-                (usd, roles.operator, U256::from(MARGIN_BPS)).abi_encode_params(),
-                &[],
-            )?;
-            (usd, venue)
-        }
-    };
-    let verifier = add(
-        "DevAttestationVerifier",
-        own,
-        (roles.attestor,).abi_encode_params(),
-        &[],
-    )?;
     let attestation = add(
         "AttestationRegistry",
         own,
-        (admin, verifier, timelock, min_timelock, blessing_ttl).abi_encode_params(),
+        (
+            admin,
+            verifier,
+            terms.timelock,
+            terms.min_timelock,
+            blessing_ttl,
+        )
+            .abi_encode_params(),
         &[],
     )?;
     let publishing = add(
         "Publishing",
         own,
-        (usd, roles.platform, U256::from(PUBLISH_FEE)).abi_encode_params(),
+        (usd, platform, U256::from(PUBLISH_FEE)).abi_encode_params(),
         &[],
     )?;
     let prices = add(
@@ -805,7 +956,7 @@ fn plan(
         own,
         (
             admin,
-            price_notice,
+            terms.price_notice,
             // The fuel one core runs through in a second, from the same
             // constant the executor bills with.
             shared::manifest::FUEL_PER_CORE_SECOND,
@@ -835,19 +986,6 @@ fn plan(
         &[],
     )?;
     let profiles = add("AuthorProfiles", own, ().abi_encode_params(), &[])?;
-    let (driver, bridge) = if dollar.is_some() {
-        (Address::ZERO, Address::ZERO)
-    } else {
-        (
-            add("LocalDriver", own, (venue, usd).abi_encode_params(), &[])?,
-            add(
-                "LocalBridge",
-                own,
-                (usd, roles.operator).abi_encode_params(),
-                &[],
-            )?,
-        )
-    };
 
     // The station factory and its implementation carry nothing chain-specific
     // in their creation code, so they land at the same addresses on every
@@ -907,7 +1045,7 @@ fn plan(
                 station_factory,
                 vault_implementation,
                 admin,
-                roles.platform,
+                platform,
                 // The factory this one replaces: none on a fresh deployment.
                 Address::ZERO,
             ),
@@ -941,25 +1079,23 @@ fn plan(
             closer,
         })
     );
-    Ok(Plan {
-        creations,
-        addresses: Planned {
-            usd,
-            venue,
-            verifier,
-            attestation,
-            publishing,
-            prices,
-            strategies,
-            reviews,
-            profiles,
-            driver,
-            bridge,
-            station_implementation,
-            station_factory,
-            closer,
-            factory,
-        },
+    Ok(PlatformAddresses {
+        attestation,
+        publishing,
+        prices,
+        strategies,
+        reviews,
+        profiles,
+        station_closes,
+        station_implementation,
+        station_factory,
+        closer,
+        valuations,
+        claims,
+        posts,
+        upkeep,
+        vault_implementation,
+        factory,
     })
 }
 
@@ -1126,9 +1262,10 @@ async fn ensure_batch_creator(client: &Client, from: Address, artifacts: &Path) 
 /// them, then wait for them all. Each batch is measured without sending it
 /// first, and sent with that gas and some room. A contract already there
 /// (an earlier try's, its address following from its code) is kept.
-async fn create(
+pub(crate) async fn create(
     client: &Client,
     from: Address,
+    key: Option<&alloy::signers::local::PrivateKeySigner>,
     artifacts: &Path,
     creations: &[Creation],
     landed: &mut Landed,
@@ -1197,7 +1334,7 @@ async fn create(
             gas_limit: Some(gas),
         });
     }
-    send_together(client, from, &outgoing, |_, _| {}).await?;
+    send_together(client, from, key, &outgoing, |_, _| {}).await?;
     for creation in &missing {
         wait_for_code(client, creation.name, creation.address).await?;
         landed.record(creation.name, creation.address, keccak256(&creation.code))?;
@@ -1207,13 +1344,13 @@ async fn create(
 }
 
 /// One transaction among several one account sends together.
-struct Outgoing {
+pub(crate) struct Outgoing {
     /// What it does, for its errors.
-    name: String,
-    to: Address,
-    data: Vec<u8>,
+    pub name: String,
+    pub to: Address,
+    pub data: Vec<u8>,
     /// Its gas, or the node's estimate (with a fifth more) when `None`.
-    gas_limit: Option<u64>,
+    pub gas_limit: Option<u64>,
 }
 
 /// How many of one account's transactions are handed to the chain before
@@ -1256,15 +1393,16 @@ fn own_key(from: Address) -> Result<Option<alloy::signers::local::PrivateKeySign
 /// those). A send refused stops the rest; one that lands reverted, or is
 /// dropped, is an error naming it. Nothing else may send from `from`
 /// meanwhile: the numbers are counted here.
-async fn send_together(
+pub(crate) async fn send_together(
     client: &Client,
     from: Address,
+    key: Option<&alloy::signers::local::PrivateKeySigner>,
     outgoing: &[Outgoing],
     mut sent: impl FnMut(usize, B256),
 ) -> Result<()> {
     use alloy::providers::Provider;
-    let signing = own_key(from)?
-        .map(|key| client.signing_provider(key))
+    let signing = key
+        .map(|key| client.signing_provider(key.clone()))
         .transpose()?;
     let reading = client.provider();
     // Each one's gas first, estimated as if it were next, whatever its
@@ -1541,12 +1679,12 @@ pub fn creation_gas(client: &Client) -> Option<u64> {
 /// never created twice; the record is what tells an earlier try of this
 /// very deploy from another deployment. It goes once the deployment file
 /// is written.
-struct Landed {
+pub(crate) struct Landed {
     path: std::path::PathBuf,
     generation: u64,
     from_block: Option<u64>,
     /// The build the last try was made from ([`build_of`]).
-    build: Option<B256>,
+    pub build: Option<B256>,
     contracts: std::collections::BTreeMap<String, (Address, B256)>,
 }
 
@@ -1578,8 +1716,14 @@ const DEPLOYED: [&str; 21] = [
 /// Which build of the contracts `artifacts` holds: the hash of every
 /// deployed contract's creation code, as the build left it.
 fn build_of(artifacts: &Path) -> Result<B256> {
+    build_of_these(artifacts, &DEPLOYED)
+}
+
+/// Which build of the contracts `names` `artifacts` holds: the hash of each
+/// one's creation code, as the build left it.
+pub(crate) fn build_of_these(artifacts: &Path, names: &[&str]) -> Result<B256> {
     let mut codes = Vec::new();
-    for name in DEPLOYED {
+    for name in names {
         let path = artifacts
             .join(format!("{name}.sol"))
             .join(format!("{name}.json"));
@@ -1602,7 +1746,7 @@ impl Landed {
 
     /// The record for `file` under `generation`; empty if there is none or
     /// it is from another generation.
-    fn load(file: &Path, generation: u64) -> Self {
+    pub(crate) fn load(file: &Path, generation: u64) -> Self {
         let path = Self::path_for(file);
         let mut landed = Self {
             path: path.clone(),
@@ -1641,7 +1785,7 @@ impl Landed {
 
     /// The block the first try began at, so the deployment's readers start
     /// early enough; this try's if it is the first.
-    fn first_block(&mut self, now: u64) -> u64 {
+    pub(crate) fn first_block(&mut self, now: u64) -> u64 {
         *self.from_block.get_or_insert(now)
     }
 
@@ -1661,7 +1805,7 @@ impl Landed {
         self.save()
     }
 
-    fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         let contracts: serde_json::Map<String, serde_json::Value> = self
             .contracts
             .iter()
@@ -1688,7 +1832,7 @@ impl Landed {
     }
 
     /// The deployment file is written: the record is done with.
-    fn finished(file: &Path) {
+    pub(crate) fn finished(file: &Path) {
         let _ = std::fs::remove_file(Self::path_for(file));
     }
 }
@@ -2155,7 +2299,8 @@ async fn set_up(
                 .collect();
             // Its hash is in the file as soon as a node has it, before its
             // receipt is waited for.
-            send_together(client, *from, &outgoing, |index, hash| {
+            let key = own_key(*from)?;
+            send_together(client, *from, key.as_ref(), &outgoing, |index, hash| {
                 let mut setup = lock(setup);
                 setup.sent.insert(steps[index].name.clone(), hash);
                 record(&mut setup);
@@ -2731,6 +2876,39 @@ mod tests {
     }
 
     #[test]
+    fn the_development_plan_refuses_mainnet_whose_deploy_plans_only_what_ships() {
+        let roles = Roles {
+            admin: Address::repeat_byte(1),
+            platform: Address::repeat_byte(2),
+            attestor: Address::repeat_byte(3),
+            builder: Address::repeat_byte(4),
+            reviewer: Address::repeat_byte(5),
+            executor: Address::repeat_byte(6),
+            keeper: Address::repeat_byte(7),
+            operator: Address::repeat_byte(8),
+            author: Address::repeat_byte(9),
+            viewer: Address::repeat_byte(10),
+        };
+        let names = [("base".to_string(), 8453u64)];
+        for dollar in [None, Some(Address::repeat_byte(0x11))] {
+            let error = plan(
+                Path::new("/nowhere"),
+                NetworkName::Mainnet,
+                &roles,
+                &names,
+                1,
+                dollar,
+            )
+            .err()
+            .expect("the development plan made a mainnet plan");
+            assert!(
+                error.to_string().contains("never deploys to mainnet"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn a_public_test_network_s_setup_proposes_no_stand_in_and_hands_out_no_money() {
         let roles = Roles {
             admin: Address::repeat_byte(1),
@@ -3167,7 +3345,7 @@ mod tests {
         let sent_before = node.provider().get_transaction_count(admin).await.unwrap();
 
         stand_in.code_fails.store(true, Ordering::SeqCst);
-        let error = create(&client, admin, &artifacts, creations, &mut landed)
+        let error = create(&client, admin, None, &artifacts, creations, &mut landed)
             .await
             .expect_err("a contract whose code couldn't be read was taken for one missing");
         assert!(
@@ -3189,7 +3367,7 @@ mod tests {
         }
 
         stand_in.code_fails.store(false, Ordering::SeqCst);
-        create(&client, admin, &artifacts, creations, &mut landed)
+        create(&client, admin, None, &artifacts, creations, &mut landed)
             .await
             .unwrap();
         for creation in creations {

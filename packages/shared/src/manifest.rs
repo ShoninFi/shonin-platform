@@ -548,7 +548,7 @@ exclude = ["GB"]
     }
 
     #[test]
-    fn a_hyperliquid_vault_is_accepted_on_testnet_only() {
+    fn a_hyperliquid_vault_is_accepted_on_testnet_and_mainnet_and_not_on_the_local_network() {
         let manifest = Manifest::from_toml(
             &example()
                 .replace("\"base\"", "\"hyperliquid\"")
@@ -556,7 +556,7 @@ exclude = ["GB"]
         )
         .expect("it parses");
         assert_eq!(manifest.check(&catalogue(), "testnet"), Ok(()));
-        assert!(manifest.check(&catalogue(), "mainnet").is_err());
+        assert_eq!(manifest.check(&catalogue(), "mainnet"), Ok(()));
         assert!(manifest.check(&catalogue(), "local").is_err());
         // Ontario is refused on top of the platform's own list.
         assert!(

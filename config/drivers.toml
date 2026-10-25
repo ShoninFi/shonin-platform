@@ -37,7 +37,9 @@ valuation = "on-chain"
 [drivers.hyperliquid]
 label = "Hyperliquid"
 chain = "hyperliquid"
-networks = ["testnet"]
+# On mainnet, the ETH perp (1) and the HYPE/USDC pair (107), by mainnet's
+# numbers (config/mainnet.toml).
+networks = ["testnet", "mainnet"]
 # What the driver contract's `restricted()` answers, from Hyperliquid's terms:
 # read them again before it is approved on mainnet.
 restricted = ["CA-ON", "SANCTIONED", "US"]
@@ -51,8 +53,10 @@ valuation = "on-chain"
 label = "Robinhood Chain stock tokens"
 chain = "robinhood"
 # On the testnet, the testnet's stock tokens against USDG in Uniswap pools
-# kept at the mainnet feeds' prices.
-networks = ["testnet"]
+# kept at the mainnet feeds' prices; on mainnet, NVDA and AAPL against USDG
+# (config/mainnet.toml). Read the venue's terms again before the driver is
+# approved on mainnet.
+networks = ["testnet", "mainnet"]
 restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
 custody = "station"
 exit = "contract"
@@ -64,7 +68,8 @@ valuation = "on-chain"
 [drivers.uniswap-base]
 label = "Uniswap v3 on Base"
 chain = "base"
-networks = ["testnet"]
+# Read the venue's terms again before the driver is approved on mainnet.
+networks = ["testnet", "mainnet"]
 restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
 custody = "station"
 exit = "contract"

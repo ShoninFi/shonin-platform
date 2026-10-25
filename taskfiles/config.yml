@@ -36,14 +36,29 @@ vars:
   # each deployment file records its own. Unset, a deploy takes the
   # generation of the chains it keeps, or 0. Also read from GENERATION in the
   # environment, or SHONIN_GENERATION in the environment or .env (which the
-  # devnet reads itself).
+  # devnet reads itself). Never on mainnet: there it is the task's own
+  # argument alone (GENERATION=1), so one exported for the testnets can't
+  # reach a mainnet command.
   GENERATION:
-    sh: echo "${GENERATION:-}"
+    sh: '{{if ne .NETWORK "mainnet"}}echo "${GENERATION:-}"{{end}}'
   GENERATION_ARG: '{{if .GENERATION}}--generation "{{.GENERATION}}"{{end}}'
   # The services serve every vault chain of the network. Set VAULT_CHAIN=base
   # (or hyperliquid, robinhood) on a task to serve, or seed, just one.
   VAULT_CHAIN: ""
   VAULT_CHAIN_ARG: '{{if .VAULT_CHAIN}}--vault-chain "{{.VAULT_CHAIN}}"{{end}}'
+  # A mainnet command's own arguments (see MAINNET_ARGS), given on the task's
+  # command line alone.
+  ADMIN: ""
+  DEPLOYER_KEYFILE: ""
+  CONFIRM_MAINNET: ""
+  ON_FORK: ""
+  # On a fork rehearsal alone: replace a recorded deployment file whose
+  # contracts are not on the fork.
+  OVERWRITE_FORK_RECORD: ""
+  # Solana's: the owner's program keypairs (<library name>-keypair.json
+  # each), and on a fork the stand-in admin's keypair.
+  MAINNET_PROGRAM_KEYPAIRS: ""
+  ADMIN_KEYFILE: ""
 
   # Paths
   PATH_ROOT: "{{.ROOT_DIR}}"
@@ -100,7 +115,31 @@ vars:
   # ...). Every service reads the one for its chain. Mainnet addresses are
   # committed under config/deployments/mainnet; local and testnet ones never
   # are, and stay under .shonin/<network> (gitignored).
-  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
+  # A mainnet rehearsal on local forks (ON_FORK=1) writes under
+  # .shonin/mainnet-fork instead, and never beside the committed addresses.
+  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "deployments"}}{{else}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{end}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
+  # Where the mainnet deploy writes the admin's prepared steps (and their
+  # commands for the hardware wallet): never committed.
+  PATH_MAINNET_ADMIN_STEPS: '{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "admin-steps"}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "admin-steps"}}{{end}}'
+  # What every mainnet command takes, from the task's own arguments alone:
+  # ADMIN=<the hardware key's address>, GENERATION=1, and to send either
+  # ON_FORK=1 (local forks only) or DEPLOYER_KEYFILE=<path> with
+  # CONFIRM_MAINNET=<the chain ids, comma-separated>.
+  MAINNET_ARGS: >-
+    {{if .ADMIN}}--admin {{shellQuote .ADMIN}}{{end}}
+    {{if .DEPLOYER_KEYFILE}}--deployer-keyfile {{shellQuote .DEPLOYER_KEYFILE}}{{end}}
+    {{if .CONFIRM_MAINNET}}--confirm-mainnet {{shellQuote .CONFIRM_MAINNET}}{{end}}
+    {{if .ON_FORK}}--on-fork{{end}}
+    {{if .GENERATION}}--mainnet-generation {{.GENERATION}}{{end}}
+  # Where the mainnet Solana deploy builds and keeps its working files (the
+  # ids list, the mainnet build, a rehearsal's throwaway deployer): a dry
+  # run's, a fork rehearsal's and a real send's apart. Never committed.
+  # The local Surfpool fork contracts:solana:mainnet-fork runs, which an
+  # ON_FORK=1 Solana rehearsal uses unless SHONIN_RPC_SOLANA_MAINNET_BETA is
+  # set.
+  SOLANA_FORK_RPC: "http://127.0.0.1:19210"
+  SOLANA_FORK_WS: "ws://127.0.0.1:19211"
+  PATH_MAINNET_SOLANA: '{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "solana"}}{{else if .CONFIRM_MAINNET}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "solana"}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet-dry-run" "solana"}}{{end}}'
   # Where the local Solana cluster (Surfpool) runs and logs, wiped on every
   # start.
   PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
@@ -143,6 +182,9 @@ vars:
   # programs: a program's id is compiled in, so a build with the local ids
   # would look for devnet's programs where they aren't (it refuses). The
   # Solana deploy itself uses DEVNET, since it writes those ids.
+  # The same, built for mainnet with the program ids the list
+  # SHONIN_MAINNET_IDS names (the mainnet Solana deploy sets it).
+  DEVNET_MAINNET: "cargo run -p shonin-devnet --features mainnet -- {{.DEVNET_ARGS}}"
   DEVNET_SOLANA: >-
     cargo run -p shonin-devnet {{if eq .NETWORK "testnet"}}--features devnet{{end}} --
     {{.DEVNET_ARGS}}

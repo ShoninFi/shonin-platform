@@ -92,7 +92,10 @@ pub fn deployed_final(program: &str) -> bool {
 
 /// Whether the program at `id` is final, and if not, who may still replace
 /// it, from its program-data account; `None` if no program is there.
-async fn upgrade_authority(client: &SolanaClient, id: &Pubkey) -> Result<Option<Option<Pubkey>>> {
+pub(crate) async fn upgrade_authority(
+    client: &SolanaClient,
+    id: &Pubkey,
+) -> Result<Option<Option<Pubkey>>> {
     if !client
         .account(id)
         .await?
@@ -167,8 +170,9 @@ pub struct Settings {
     /// its placeholders; a public cluster's are none: a real image's digest
     /// is proposed once it is built (`chains:image`).
     pub images: Vec<([u8; 32], ImageKind)>,
-    /// The operator's project, as the registry holds it.
-    pub project: [u8; 32],
+    /// The operator's project, as the registry holds it: none on mainnet
+    /// until the operator's project exists.
+    pub project: Option<[u8; 32]>,
     pub funding: Funding,
 }
 
@@ -177,6 +181,9 @@ pub struct Settings {
 pub enum Funding {
     /// From the cluster's faucet: a development cluster's.
     Airdrop,
+    /// None: mainnet has no roles to fund. The deployer pays for its own
+    /// deploy, and every other key is the owner's.
+    Nothing,
     /// By transfer from the deployer, the Solana funder, which keeps
     /// `reserve` lamports for itself: each role topped up to its amount, and
     /// left alone once it holds it.
@@ -211,7 +218,7 @@ impl Settings {
                 ])
                 .map(|(service, kind)| (image_digest(service), kind))
                 .collect(),
-            project: project_id(),
+            project: Some(project_id()),
             funding: Funding::Airdrop,
         })
     }
@@ -251,10 +258,52 @@ impl Settings {
             price_notice: 0,
             terms: testnet_terms(),
             images: Vec::new(),
-            project: crate::admin::project_id(checked_project(project)?).0,
+            project: Some(crate::admin::project_id(checked_project(project)?).0),
             funding: Funding::Transfer { reserve, roles },
         })
     }
+}
+
+/// Circle's USDC on Solana mainnet-beta.
+pub const CIRCLE_MAINNET_USDC: Pubkey =
+    Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+/// The registry's timelock and its floor on mainnet: two days, the floor
+/// fixed for good.
+pub const MAINNET_TIMELOCK: u64 = 2 * DAY;
+/// The notice a new price list is published with on mainnet: thirty days.
+pub const MAINNET_PRICE_NOTICE: u64 = 30 * DAY;
+/// What publishing costs on mainnet: a flat dollar, as on the EVM mainnets.
+pub const MAINNET_PUBLISH_FEE: u64 = PUBLISH_FEE;
+
+impl Settings {
+    /// Mainnet-beta's: Circle's USDC as the dollar and no stand-ins, the
+    /// registry's timelock and its floor two days (the floor fixed for
+    /// good), thirty days' notice on the price list, the EVM mainnets' vault
+    /// terms, no image until a real digest is proposed, the operator's
+    /// project only once it exists (`project`), and nothing funded: every
+    /// key but the deployer is the owner's.
+    pub fn mainnet(project: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            mint: Dollar::Public(CIRCLE_MAINNET_USDC),
+            timelock: MAINNET_TIMELOCK,
+            min_timelock: MAINNET_TIMELOCK,
+            blessing_ttl: BLESSING_TTL,
+            price_notice: MAINNET_PRICE_NOTICE,
+            terms: mainnet_terms(),
+            images: Vec::new(),
+            project: project
+                .map(|project| checked_project(project).map(|p| crate::admin::project_id(p).0))
+                .transpose()?,
+            funding: Funding::Nothing,
+        })
+    }
+}
+
+/// The terms every mainnet vault is created with: the EVM mainnets' (the
+/// same fees, minimums and timers as the testnets').
+pub fn mainnet_terms() -> vault::state::Terms {
+    testnet_terms()
 }
 
 /// Whether the cluster's admin mints the platform's dollar: the stand-in
@@ -564,6 +613,7 @@ async fn programs_in_place(
 /// of its amount.
 async fn fund(client: &SolanaClient, keys: &RoleKeys, funding: &Funding) -> Result<Vec<Role>> {
     match funding {
+        Funding::Nothing => Ok(Vec::new()),
         Funding::Airdrop => {
             let mut everyone = vec![keys.deployer.pubkey()];
             everyone.extend(ROLES.iter().map(|role| keys.address(*role)));
@@ -959,12 +1009,13 @@ async fn set_up(
             proposals.push(platform.ix_propose_image(*digest, *kind));
         }
     }
-    if client
-        .account(&registry::read::project_address(&settings.project))
-        .await?
-        .is_none()
+    if let Some(project) = settings.project
+        && client
+            .account(&registry::read::project_address(&project))
+            .await?
+            .is_none()
     {
-        proposals.push(platform.ix_propose_project(settings.project));
+        proposals.push(platform.ix_propose_project(project));
     }
     if !proposals.is_empty() {
         client
@@ -1201,6 +1252,22 @@ activation_usd = 2.0
     }
 
     #[test]
+    fn mainnet_settings_take_circle_s_usdc_a_two_day_floor_and_no_placeholder() {
+        let settings = Settings::mainnet(None).unwrap();
+        assert_eq!(settings.mint.pubkey(), CIRCLE_MAINNET_USDC);
+        assert!(!settings.mint.stand_ins());
+        assert_eq!(settings.timelock, 2 * DAY);
+        assert_eq!(settings.min_timelock, 2 * DAY);
+        assert_eq!(settings.price_notice, 30 * DAY);
+        assert!(settings.images.is_empty());
+        assert_eq!(settings.project, None);
+        assert_eq!(settings.funding, Funding::Nothing);
+        let with = Settings::mainnet(Some("shonin-fi")).unwrap();
+        assert_eq!(with.project, Some(crate::admin::project_id("shonin-fi").0));
+        assert!(Settings::mainnet(Some("Not A Project")).is_err());
+    }
+
+    #[test]
     fn a_public_cluster_is_set_up_with_no_placeholder_image() {
         assert!(testnet().images.is_empty());
         // A development cluster's placeholders are all it has.
@@ -1218,10 +1285,10 @@ activation_usd = 2.0
         let settings = testnet();
         assert_eq!(
             settings.project,
-            crate::admin::project_id("shonin-testnet").0,
+            Some(crate::admin::project_id("shonin-testnet").0),
             "the project is proposed as chains:project proposes it on the EVM"
         );
-        assert_ne!(settings.project, project_id());
+        assert_ne!(settings.project, Some(project_id()));
         for typo in [
             "",
             "Shonin-Testnet",

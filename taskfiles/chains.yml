@@ -62,10 +62,37 @@ tasks:
           --log-path ./logs --log-level warn
 
   deploy:
-    desc: "Deploy the EVM contracts to every EVM chain of the network, and locally the Solana programs (local, or NETWORK=testnet; mainnet refuses)"
+    desc: "Deploy the EVM contracts to every EVM chain of the network, and locally the Solana programs (local, or NETWORK=testnet). With NETWORK=mainnet, exactly what ships on each EVM chain (or VAULT_CHAIN=<name>'s), with ADMIN=<the hardware key's address> and GENERATION=1 required on the command line (never taken from the environment; no other generation is accepted): alone a dry run printing every contract, its arguments and address and the admin's steps; ON_FORK=1 rehearses on local forks (SHONIN_RPC_EVM_<id>=http://127.0.0.1:<port>), writing under .shonin/mainnet-fork, with a throwaway deployer or DEPLOYER_KEYFILE naming one of anvil's public keys (OVERWRITE_FORK_RECORD=1 replaces a rehearsal's deployment file whose contracts are not on the fork); DEPLOYER_KEYFILE=<path> CONFIRM_MAINNET=<chain ids> sends for real and writes config/deployments/mainnet. PROJECT=<id> adds the operator's project to the admin's steps"
     cmds:
       - task: :contracts:build
-      - "{{.DEVNET}} deploy"
+      - >-
+        {{if eq .NETWORK "mainnet"}}{{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-deploy {{.MAINNET_ARGS}}
+        --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}"
+        {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+        {{if .OVERWRITE_FORK_RECORD}}--overwrite-fork-record{{end}}{{else}}{{.DEVNET}} deploy{{end}}
+
+  admin-steps:
+    desc: "Mainnet: the admin's steps the deploy prepared (initialising each station factory, proposing each driver and the project). With ON_FORK=1 sent as ADMIN, impersonated, on the local forks, and WARP=1 then moves the forks' clocks past the timelock; otherwise nothing is sent: each step still to do is printed as its command for the hardware wallet (cast send --ledger) and written to .shonin/mainnet/admin-steps/admin-steps-evm-<id>.sh (NETWORK=mainnet ADMIN=<address>)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the admin's prepared steps are mainnet's (NETWORK={{.NETWORK}})."
+    cmds:
+      - >-
+        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-admin-steps {{.MAINNET_ARGS}}
+        --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}"
+        {{if .WARP}}--warp{{end}}
+
+  verify-deploy:
+    desc: "Mainnet, read-only: every address and setting of each EVM chain's deployment read back and compared with its file, this build's plan and config/mainnet.toml: code present, admin and fees ADMIN, timelock and floor two days, thirty days' notice on prices, the generation, the checker's pins and no other checker, no development contract, each driver's listings and whether it is in force (IN_FORCE=1 requires it, and PROJECT's). ON_FORK=1 reads the rehearsal's; without it every endpoint must be the mainnet's, none local or anvil (NETWORK=mainnet ADMIN=<address> GENERATION=1)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the read-back is mainnet's (NETWORK={{.NETWORK}}); the testnets have task chains:smoke."
+    cmds:
+      - task: :contracts:build
+      - >-
+        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-verify {{.MAINNET_ARGS}}
+        {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+        {{if .IN_FORCE}}--expect-in-force{{end}}
 
   solana-setup:
     desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), Circle's devnet USDC as the dollar (no stand-in venue or driver, nothing minted: dollars come from Circle's faucet), the registry (no timelock, the development checker), the operator's project, the orca driver, every role's dollar account, then deployments/solana-devnet.json with the roles. Orca's pool is seeded and kept by testnet-market (task chains:testnet-market-setup STEPS=gas,pools). No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
