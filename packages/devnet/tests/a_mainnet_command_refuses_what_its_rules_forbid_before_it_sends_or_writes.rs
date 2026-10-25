@@ -270,6 +270,15 @@ fn the_read_back_requires_the_admin_and_the_generation() {
 
 #[test]
 fn a_recorded_deployment_whose_factory_has_no_code_is_refused_not_overwritten() {
+    // The refusal compares the file with the addresses planned from the
+    // compiled contracts, so it needs them built.
+    if !repo()
+        .join("contracts/evm/out/RiscZeroGroth16Verifier.sol/RiscZeroGroth16Verifier.json")
+        .exists()
+    {
+        eprintln!("the contracts are not built (task contracts:build): skipping");
+        return;
+    }
     let _node = anvil(18649);
     let dir = scratch("recorded");
     let deployments = dir.join(".shonin/mainnet-fork/deployments");
