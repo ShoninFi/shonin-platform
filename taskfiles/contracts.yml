@@ -90,135 +90,363 @@ tasks:
       DEPLOYER_KEYPAIR: '{{joinPath .PATH_ROOT ".shonin" .NETWORK "solana-deployer.json"}}'
       DEVNET_PROGRAMS: '{{joinPath .PATH_ROOT ".shonin" "testnet" "solana-programs"}}'
     cmds:
+      - task: solana:mainnet-deploy
+        if: '[ "{{.NETWORK}}" = mainnet ]'
+      - cmd: |
+          set -e
+          { read -r rpc; read -r record; } <<EOF
+          $({{.DEVNET}} --vault-chain solana chain)
+          EOF
+          case "{{.NETWORK}}" in
+            local)
+              # The devnet deploys every program, sets the platform up and
+              # writes the deployment file, as `task dev` does.
+              cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build && cd "{{.PATH_ROOT}}"
+              {{.DEVNET}} --vault-chain solana deploy
+              exit 0 ;;
+            testnet) ;;
+            *)
+              echo "NETWORK={{.NETWORK}} is not a network this task deploys to."
+              exit 1 ;;
+          esac
+          # Devnet. The deployer and every program are keys of
+          # SHONIN_TESTNET_SOLANA_MNEMONIC, each program at its fixed index
+          # (packages/devnet/src/devnet_keys.rs), so everyone deploying from it
+          # deploys the same ids. Fund the deployer first (`task chains:accounts
+          # NETWORK=testnet` shows it). The keypairs go under .shonin, never into
+          # target/deploy, whose keypairs are this machine's local ones.
+          #
+          # Each program's devnet-id is written from its key (and a different
+          # one already there is refused: it was another mnemonic's), each
+          # program is built with --features devnet beside its keypair, then
+          # deployed: a final one once, an upgradeable one again on every run.
+          # Their ids are recorded in the cluster's deployment file. Nothing is
+          # set up: no dollar, markets, images, project or roles, so the
+          # services still wait for a deployment that names its roles.
+          deployer="{{.DEPLOYER_KEYPAIR}}"
+          dir="{{.DEVNET_PROGRAMS}}"
+          mkdir -p "$dir" "$(dirname "$deployer")"
+          {{.DEVNET}} solana-keypair --role deployer --out "$deployer" >/dev/null
+          {{.DEVNET}} solana-program-keypairs --out "$dir" > "$dir/programs"
+          cd "{{.PATH_CONTRACTS_SOLANA}}"
+          while read -r name id kind; do
+            file="programs/$(echo "$name" | tr _ -)/devnet-id"
+            if [ -s "$file" ]; then
+              committed=$(tr -d '[:space:]' < "$file")
+              if [ "$committed" != "$id" ]; then
+                echo "$file holds $committed, and the mnemonic's key for $name is $id: is SHONIN_TESTNET_SOLANA_MNEMONIC the team's?"
+                exit 1
+              fi
+            else
+              echo "$id" > "$file"
+              echo "wrote $file: commit it, so every devnet build has $name at $id"
+            fi
+          done < "$dir/programs"
+          while read -r name id kind; do
+            cargo build-sbf --manifest-path "programs/$(echo "$name" | tr _ -)/Cargo.toml" \
+              --features devnet --sbf-out-dir "$dir" < /dev/null
+          done < "$dir/programs"
+          programs='{}'
+          while read -r name id kind; do
+            if [ "$kind" = final ] && solana program show "$id" --url "$rpc" < /dev/null >/dev/null 2>&1; then
+              echo "$name is already at $id, final"
+            else
+              final=""
+              [ "$kind" = final ] && final="--final"
+              # An upgrade larger than the program's account fails: grow the
+              # account first, with room for a few more upgrades.
+              if [ "$kind" != final ]; then
+                have=$(solana program show "$id" --url "$rpc" --output json < /dev/null 2>/dev/null | jq -r '.dataLen // 0')
+                need=$(wc -c < "$dir/$name.so" | tr -d ' ')
+                if [ "$have" -gt 0 ] && [ "$need" -gt "$have" ]; then
+                  solana program extend "$id" $((need - have + 32768)) --url "$rpc" \
+                    --keypair "$deployer" --commitment confirmed < /dev/null
+                fi
+              fi
+              # Straight to the cluster's leaders (QUIC), with a priority fee:
+              # a program's hundreds of buffer writes sent through an RPC
+              # endpoint stall at its rate limit on devnet.
+              solana program deploy --commitment confirmed --url "$rpc" \
+                --with-compute-unit-price 20000 --max-sign-attempts 50 \
+                --keypair "$deployer" --program-id "$dir/$name-keypair.json" $final "$dir/$name.so" < /dev/null
+              echo "$name is at $id"
+            fi
+            programs=$(echo "$programs" | jq --arg name "$name" --arg id "$id" '. + {($name): $id}')
+          done < "$dir/programs"
+          mkdir -p "$(dirname "$record")"
+          [ -s "$record" ] || echo '{}' > "$record"
+          jq --argjson programs "$programs" '.programs = $programs' "$record" > "$record.new"
+          mv "$record.new" "$record"
+          echo "(recorded in $record)"
+        if: '[ "{{.NETWORK}}" != mainnet ]'
+
+  solana:mainnet-deploy:
+    internal: true
+    vars:
+      STATE: '{{.PATH_MAINNET_SOLANA}}'
+      # On a fork, left out, the tool makes and takes its own throwaway
+      # program keypairs under .shonin/mainnet-fork (a fork takes no other).
+      KEYPAIRS: '{{.MAINNET_PROGRAM_KEYPAIRS}}'
+    cmds:
+      # The ids are the owner's keypairs' (checked against any committed
+      # mainnet-id, none written yet), a fork's throwaways (made by the
+      # tool), or a dry run's stand-ins.
       - |
         set -e
-        if [ "{{.NETWORK}}" = mainnet ]; then
-          # Mainnet. The ids are the owner's keypairs' (checked against any
-          # committed mainnet-id, none written yet), or a dry run's stand-ins;
-          # the programs and the deploy tool are built with them, then the
-          # deploy runs in the mode the flags give.
-          state="{{.PATH_MAINNET_SOLANA}}"
-          mkdir -p "$state"
-          {{if .ON_FORK}}
-          # The rehearsal's fork: contracts:solana:mainnet-fork's, unless set.
-          export SHONIN_RPC_SOLANA_MAINNET_BETA="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
-          export SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"
+        state="{{.STATE}}"
+        mkdir -p "$state"
+        {{.DEVNET}} --vault-chain solana mainnet-solana-ids {{.MAINNET_ARGS}} \
+          {{if .KEYPAIRS}}--program-keypairs {{shellQuote .KEYPAIRS}}{{end}} \
+          --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
+          --stand-ins "$state/stand-in-program-keypairs" --out "$state/program-ids"
+      # The verifiable build, the only one mainnet is given: what anyone can
+      # rebuild from the commit and compare with what mainnet runs.
+      - task: solana:verifiable-build
+        vars:
+          IDS: '{{.STATE}}/program-ids'
+          OUT: '{{.STATE}}/programs'
+          WORK: '{{.STATE}}/verifiable-build'
+          COMMITTED_ONLY: '{{.CONFIRM_MAINNET}}'
+      - |
+        set -e
+        {{if .ON_FORK}}
+        # The rehearsal's fork: contracts:solana:mainnet-fork's, unless set.
+        export SHONIN_RPC_SOLANA_MAINNET_BETA="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
+        export SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"
+        {{end}}
+        export SHONIN_MAINNET_IDS="{{.STATE}}/program-ids"
+        cd "{{.PATH_ROOT}}"
+        {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-deploy {{.MAINNET_ARGS}} \
+          {{if .KEYPAIRS}}--program-keypairs {{shellQuote .KEYPAIRS}}{{end}} \
+          --programs-dir "{{.STATE}}/programs" --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
+          --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}" --state-dir "{{.STATE}}" \
+          {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+
+  solana:verifiable-build:
+    internal: true
+    # IDS: the ids file (<library name> <id> a line); OUT: where the .so
+    # files and their record go; WORK: a scratch directory, emptied;
+    # COMMITTED_ONLY: non-empty to refuse uncommitted changes (a real send,
+    # a verification) rather than rehearse them.
+    preconditions:
+      - sh: 'command -v solana-verify >/dev/null && docker info >/dev/null 2>&1'
+        msg: "the mainnet programs are built verifiably: needs solana-verify (cargo install solana-verify --locked) and Docker running."
+    cmds:
+      - |
+        set -eu
+        cd "{{.PATH_ROOT}}"
+        work="{{.WORK}}"
+        out="{{.OUT}}"
+        rm -rf "$work" "$out"
+        mkdir -p "$work/src" "$out"
+        src="$work/src"
+        if [ -n "$(git status --porcelain -- contracts/solana packages Cargo.toml Cargo.lock)" ]; then
+          {{if .COMMITTED_ONLY}}
+          echo "contracts/solana, packages, Cargo.toml or Cargo.lock has uncommitted changes: mainnet is given a commit's verifiable build alone. Commit them first. Nothing was built."
+          exit 1
           {{end}}
-          {{.DEVNET}} --vault-chain solana mainnet-solana-ids {{.MAINNET_ARGS}} \
-            {{if .MAINNET_PROGRAM_KEYPAIRS}}--program-keypairs {{shellQuote .MAINNET_PROGRAM_KEYPAIRS}}{{end}} \
-            --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
-            --stand-ins "$state/stand-in-program-keypairs" --out "$state/program-ids"
-          export SHONIN_MAINNET_IDS="$state/program-ids"
-          out="$state/programs"
-          rm -rf "$out" && mkdir -p "$out"
-          cd "{{.PATH_CONTRACTS_SOLANA}}"
-          grep -v '^#' "$SHONIN_MAINNET_IDS" | while read -r name id; do
-            cargo build-sbf --manifest-path "programs/$(echo "$name" | tr _ -)/Cargo.toml" \
-              --features mainnet --sbf-out-dir "$out" < /dev/null
-          done
-          # cargo build-sbf leaves a keypair of its own beside each program:
-          # the ids are the owner's, so these are never used.
-          rm -f "$out"/*-keypair.json
-          cd "{{.PATH_ROOT}}"
-          {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-deploy {{.MAINNET_ARGS}} \
-            {{if .MAINNET_PROGRAM_KEYPAIRS}}--program-keypairs {{shellQuote .MAINNET_PROGRAM_KEYPAIRS}}{{end}} \
-            --programs-dir "$out" --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
-            --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}" --state-dir "$state" \
-            {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
-          exit 0
-        fi
-        { read -r rpc; read -r record; } <<EOF
-        $({{.DEVNET}} --vault-chain solana chain)
-        EOF
-        case "{{.NETWORK}}" in
-          local)
-            # The devnet deploys every program, sets the platform up and
-            # writes the deployment file, as `task dev` does.
-            cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build && cd "{{.PATH_ROOT}}"
-            {{.DEVNET}} --vault-chain solana deploy
-            exit 0 ;;
-          testnet) ;;
-          *)
-            echo "NETWORK={{.NETWORK}} is not a network this task deploys to."
-            exit 1 ;;
-        esac
-        # Devnet. The deployer and every program are keys of
-        # SHONIN_TESTNET_SOLANA_MNEMONIC, each program at its fixed index
-        # (packages/devnet/src/devnet_keys.rs), so everyone deploying from it
-        # deploys the same ids. Fund the deployer first (`task chains:accounts
-        # NETWORK=testnet` shows it). The keypairs go under .shonin, never into
-        # target/deploy, whose keypairs are this machine's local ones.
-        #
-        # Each program's devnet-id is written from its key (and a different
-        # one already there is refused: it was another mnemonic's), each
-        # program is built with --features devnet beside its keypair, then
-        # deployed: a final one once, an upgradeable one again on every run.
-        # Their ids are recorded in the cluster's deployment file. Nothing is
-        # set up: no dollar, markets, images, project or roles, so the
-        # services still wait for a deployment that names its roles.
-        deployer="{{.DEPLOYER_KEYPAIR}}"
-        dir="{{.DEVNET_PROGRAMS}}"
-        mkdir -p "$dir" "$(dirname "$deployer")"
-        {{.DEVNET}} solana-keypair --role deployer --out "$deployer" >/dev/null
-        {{.DEVNET}} solana-program-keypairs --out "$dir" > "$dir/programs"
-        cd "{{.PATH_CONTRACTS_SOLANA}}"
-        while read -r name id kind; do
-          file="programs/$(echo "$name" | tr _ -)/devnet-id"
-          if [ -s "$file" ]; then
-            committed=$(tr -d '[:space:]' < "$file")
-            if [ "$committed" != "$id" ]; then
-              echo "$file holds $committed, and the mnemonic's key for $name is $id: is SHONIN_TESTNET_SOLANA_MNEMONIC the team's?"
+          # A rehearsal of uncommitted changes: the working tree's files,
+          # recorded as such, which a real send refuses. What is copied into
+          # what the container sees, by rule alone:
+          # - the tracked files under the build's inputs that are regular
+          #   files in the working tree (a deleted one is left out; a link or
+          #   a directory in a tracked file's place is refused);
+          # - a submodule under the inputs as the commit HEAD records it,
+          #   never its working directory;
+          # - new (never ignored) files under the inputs named .rs, .toml or
+          #   .lock, nothing else.
+          # Any of them named like a key (keypair or id.json, in any letter
+          # case) or holding a Solana keypair (a JSON array of 64 numbers)
+          # is refused before anything is copied.
+          source="{{.WORKING_TREE}}"
+          inputs="contracts/solana packages Cargo.toml Cargo.lock rust-toolchain.toml"
+          # The key files among the files listed in $1 (one a line), relative
+          # to the directory $2.
+          keys() {
+            # A failure to read any of them stops the build.
+            (
+              cd "$2"
+              grep -iE '(^|/)[^/]*(keypair|id\.json)[^/]*$' "$1" || true
+              tr '\n' '\0' < "$1" | LC_ALL=C xargs -0 awk '
+                function judge() {
+                  if (name != "" && !over && body ~ /^\[[0-9]+(,[0-9]+)*\]$/ && gsub(/,/, ",", body) == 63) print name
+                }
+                FNR == 1 { judge(); name = FILENAME; body = ""; over = 0 }
+                !over { gsub(/[ \t\r]/, ""); body = body $0; if (length(body) > 1024) over = 1 }
+                END { judge() }
+              ' /dev/null
+            )
+          }
+          refuse_keys() {
+            if [ -s "$1" ]; then
+              echo "a key file is in the build's sources (move it out of the checkout): $(sort -u "$1" | tr '\n' ' ')Nothing was built."
               exit 1
             fi
-          else
-            echo "$id" > "$file"
-            echo "wrote $file: commit it, so every devnet build has $name at $id"
+          }
+          git -c core.quotePath=false ls-files -c -s -- $inputs > "$work/tracked"
+          git -c core.quotePath=false ls-files -o --exclude-standard -- $inputs > "$work/new"
+          if cut -f2- "$work/tracked" | cat - "$work/new" | grep '^"' > "$work/quoted"; then
+            echo "a file under the build's inputs has a name git quotes: $(tr '\n' ' ' < "$work/quoted")rename it. Nothing was built."
+            exit 1
           fi
-        done < "$dir/programs"
-        while read -r name id kind; do
-          cargo build-sbf --manifest-path "programs/$(echo "$name" | tr _ -)/Cargo.toml" \
-            --features devnet --sbf-out-dir "$dir" < /dev/null
-        done < "$dir/programs"
-        programs='{}'
-        while read -r name id kind; do
-          if [ "$kind" = final ] && solana program show "$id" --url "$rpc" < /dev/null >/dev/null 2>&1; then
-            echo "$name is already at $id, final"
-          else
-            final=""
-            [ "$kind" = final ] && final="--final"
-            # An upgrade larger than the program's account fails: grow the
-            # account first, with room for a few more upgrades.
-            if [ "$kind" != final ]; then
-              have=$(solana program show "$id" --url "$rpc" --output json < /dev/null 2>/dev/null | jq -r '.dataLen // 0')
-              need=$(wc -c < "$dir/$name.so" | tr -d ' ')
-              if [ "$have" -gt 0 ] && [ "$need" -gt "$have" ]; then
-                solana program extend "$id" $((need - have + 32768)) --url "$rpc" \
-                  --keypair "$deployer" --commitment confirmed < /dev/null
-              fi
+          grep -v '^160000 ' "$work/tracked" | cut -f2- | sort -u > "$work/files" || true
+          grep -E '\.(rs|toml|lock)$' "$work/new" >> "$work/files" || true
+          if grep -vE '\.(rs|toml|lock)$' "$work/new" > "$work/left-out"; then
+            echo "left out of the build (new files that aren't .rs, .toml or .lock): $(tr '\n' ' ' < "$work/left-out")"
+          fi
+          : > "$work/export"
+          while IFS= read -r file; do
+            if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+              echo "$file is not a regular file in the working tree: the build copies regular files alone. Nothing was built."
+              exit 1
             fi
-            # Straight to the cluster's leaders (QUIC), with a priority fee:
-            # a program's hundreds of buffer writes sent through an RPC
-            # endpoint stall at its rate limit on devnet.
-            solana program deploy --commitment confirmed --url "$rpc" \
-              --with-compute-unit-price 20000 --max-sign-attempts 50 \
-              --keypair "$deployer" --program-id "$dir/$name-keypair.json" $final "$dir/$name.so" < /dev/null
-            echo "$name is at $id"
-          fi
-          programs=$(echo "$programs" | jq --arg name "$name" --arg id "$id" '. + {($name): $id}')
-        done < "$dir/programs"
-        mkdir -p "$(dirname "$record")"
-        [ -s "$record" ] || echo '{}' > "$record"
-        jq --argjson programs "$programs" '.programs = $programs' "$record" > "$record.new"
+            if [ -f "$file" ]; then echo "$file" >> "$work/export"; fi
+          done < "$work/files"
+          keys "$work/export" "$PWD" > "$work/keys"
+          refuse_keys "$work/keys"
+          # Each submodule under the inputs, from the commit HEAD records,
+          # held apart until it too is checked.
+          grep '^160000 ' "$work/tracked" | cut -f2- | sort -u > "$work/submodules" || true
+          while IFS= read -r path; do
+            commit=$(git rev-parse --verify --quiet "HEAD:$path") \
+              || { echo "the submodule $path isn't in the commit HEAD: commit it first. Nothing was built."; exit 1; }
+            [ -e "$path/.git" ] \
+              || { echo "the submodule $path isn't checked out (git submodule update --init $path). Nothing was built."; exit 1; }
+            if git -C "$path" ls-tree -r "$commit" | grep -q '^160000 '; then
+              echo "the submodule $path holds submodules of its own, which the working-tree build doesn't export. Nothing was built."
+              exit 1
+            fi
+            held="$work/submodules.d/$path"
+            mkdir -p "$held"
+            git -C "$path" archive -o "$work/submodule.tar" "$commit"
+            tar -xf "$work/submodule.tar" -C "$held"
+            ( cd "$held" && find . -type f | sed 's|^\./||' ) > "$work/submodule-files"
+            keys "$work/submodule-files" "$held" > "$work/keys"
+            refuse_keys "$work/keys"
+          done < "$work/submodules"
+          tar -cf - -T "$work/export" | tar -xf - -C "$src"
+          while IFS= read -r path; do
+            mkdir -p "$src/$path"
+            cp -R "$work/submodules.d/$path/." "$src/$path/"
+          done < "$work/submodules"
+          # (the working-tree export ends here)
+          echo "Building the working tree, with uncommitted changes: a rehearsal's build, which a real send refuses."
+        else
+          source=$(git rev-parse HEAD)
+          git archive "$source" | tar -xf - -C "$src"
+          echo "Building commit $source."
+        fi
+        # The ids go into the export as each program's mainnet-id (the
+        # container sees only the export).
+        grep -v '^#' "{{.IDS}}" | while read -r name id; do
+          echo "$id" > "$src/contracts/solana/programs/$(echo "$name" | tr _ -)/mainnet-id"
+        done
+        sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+        record="$out/verifiable-build"
+        printf 'source %s\nimage %s\n' "$source" "{{.SOLANA_VERIFY_IMAGE}}" > "$record.new"
+        grep -v '^#' "{{.IDS}}" | while read -r name id; do
+          echo "== $name ($id): verifiable build"
+          solana-verify build "$src" --workspace-path "$src/contracts/solana" --library-name "$name" \
+            --base-image "{{.SOLANA_VERIFY_IMAGE}}" -- --features mainnet < /dev/null > "$work/$name.log" 2>&1 \
+            || { tail -20 "$work/$name.log"; echo "the verifiable build of $name failed ($work/$name.log)"; exit 1; }
+          cp "$src/contracts/solana/target/deploy/$name.so" "$out/"
+          echo "$name $(sha "$out/$name.so")" >> "$record.new"
+        done
         mv "$record.new" "$record"
-        echo "(recorded in $record)"
+        echo "(the verifiable build of $source, in $out)"
 
   solana:mainnet-fork:
     desc: "A local Surfpool fork of mainnet-beta for ON_FORK=1 rehearsals of the Solana mainnet deploy, on 127.0.0.1:19210 (websocket 19211), the address the rehearsal tasks use by default. Its datasource is a read-only forwarder on 127.0.0.1:19209 that passes on reads alone (get… methods) to mainnet-beta's public endpoint, or SHONIN_FORK_UPSTREAM_SOLANA, one request each, and refuses everything else. Runs until stopped (needs surfpool)"
     cmds:
       - "{{.DEVNET}} solana-mainnet-fork --port 19210 --ws-port 19211 --proxy-port 19209"
 
+  solana:verify-build:
+    desc: "Mainnet: the verifiable build of the eight programs that ship (solana-verify build in the pinned image SOLANA_VERIFY_IMAGE, --features mainnet, from a clean export of the commit checked out with each program's mainnet id), each one's hash compared with the program deployed at its id. On mainnet the ids are the committed mainnet-id files and the cluster is mainnet-beta's public endpoint; the build data each program's verification needs on chain is printed as prepared commands (solana-verify export-pda-tx, for UPLOADER=<address> to sign, then remote submit-job), never sent. ON_FORK=1 takes the rehearsal's ids and reads the local Surfpool fork. Fails when any hash differs. Sends nothing (NETWORK=mainnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the verifiable build is mainnet's (NETWORK={{.NETWORK}})."
+      - sh: 'command -v solana-verify >/dev/null && docker info >/dev/null 2>&1'
+        msg: "needs solana-verify (cargo install solana-verify --locked) and Docker running."
+    vars:
+      STATE: '{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "solana" "verify-build"}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "solana" "verify-build"}}{{end}}'
+      FORK_IDS: '{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "solana" "program-ids"}}'
+    cmds:
+      - |
+        set -eu
+        programs="shonin_registry shonin_publishing shonin_prices shonin_profiles shonin_station shonin_vault shonin_cs_verifier shonin_orca_driver"
+        state="{{.STATE}}"
+        cd "{{.PATH_ROOT}}"
+        # What a verifier rebuilds is a commit: the programs' sources must
+        # be committed as they are.
+        if [ -n "$(git status --porcelain -- contracts/solana packages Cargo.toml Cargo.lock)" ]; then
+          echo "contracts/solana or packages has uncommitted changes: a verifiable build is of a commit. Commit them first. Nothing was built."
+          exit 1
+        fi
+        commit=$(git rev-parse HEAD)
+        rm -rf "$state" && mkdir -p "$state/programs"
+        ids="$state/ids"
+        {{if .ON_FORK}}
+        rpc="${SHONIN_RPC_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_RPC}}}"
+        case "$rpc" in
+          http://127.0.0.1:*|http://localhost:*) ;;
+          *) echo "ON_FORK=1 reads a local fork alone, and the endpoint is not on this machine. Nothing was built."; exit 1 ;;
+        esac
+        # Asked, not judged from its spelling: a local Surfpool fork of
+        # mainnet-beta.
+        rpc=$({{.DEVNET}} --vault-chain solana mainnet-solana-cluster --on-fork --rpc "$rpc")
+        [ -s "{{.FORK_IDS}}" ] || { echo "no rehearsal's ids at {{.FORK_IDS}}: run the fork deploy first."; exit 1; }
+        grep -v '^#' "{{.FORK_IDS}}" > "$ids"
+        {{else}}
+        # The public endpoint, asked: mainnet-beta's genesis, on no local
+        # address, and no fork (whatever its address).
+        rpc=$({{.DEVNET}} --vault-chain solana mainnet-solana-cluster)
+        : > "$ids"
+        for name in $programs; do
+          file="contracts/solana/programs/$(echo "$name" | tr _ -)/mainnet-id"
+          [ -s "$file" ] || { echo "$file is not committed: the verifiable build comes after the real send writes and commits the mainnet ids. Nothing was built."; exit 1; }
+          echo "$name $(tr -d '[:space:]' < "$file")" >> "$ids"
+        done
+        {{end}}
+        # A clean export of the commit, with the ids as committed mainnet-id
+        # files (on a fork, the rehearsal's, in the export alone).
+        src="$state/src"
+        mkdir -p "$src"
+        git archive "$commit" | tar -x -C "$src"
+        while read -r name id; do
+          echo "$id" > "$src/contracts/solana/programs/$(echo "$name" | tr _ -)/mainnet-id"
+        done < "$ids"
+        failed=0
+        printf '%-20s %-45s %-66s %s\n' program id "verifiable build" deployed > "$state/hashes"
+        while read -r name id; do
+          echo "== $name ($id): verifiable build"
+          solana-verify build "$src" --workspace-path "$src/contracts/solana" --library-name "$name" \
+            --base-image "{{.SOLANA_VERIFY_IMAGE}}" -- --features mainnet < /dev/null > "$state/$name.log" 2>&1 \
+            || { tail -20 "$state/$name.log"; echo "the verifiable build of $name failed ($state/$name.log)"; exit 1; }
+          cp "$src/contracts/solana/target/deploy/$name.so" "$state/programs/"
+          built=$(solana-verify get-executable-hash "$state/programs/$name.so" < /dev/null)
+          deployed=$(solana-verify get-program-hash --url "$rpc" "$id" < /dev/null 2>/dev/null || echo "(not read)")
+          printf '%-20s %-45s %-66s %s\n' "$name" "$id" "$built" "$deployed" >> "$state/hashes"
+          [ "$built" = "$deployed" ] || failed=1
+        done < "$ids"
+        echo
+        cat "$state/hashes"
+        echo "(commit $commit; image {{.SOLANA_VERIFY_IMAGE}}; builds in $state/programs)"
+        {{if not .ON_FORK}}
+        echo
+        echo "The on-chain verification, prepared (nothing was sent): for each program, the build data signed by UPLOADER, then OtterSec's job."
+        while read -r name id; do
+          echo "solana-verify export-pda-tx {{.PLATFORM_REPO_URL}} --commit-hash $commit --program-id $id --uploader {{.UPLOADER | default "<uploader>"}} --library-name $name --workspace-path contracts/solana --base-image {{.SOLANA_VERIFY_IMAGE}} --encoding base58 -- --features mainnet"
+          echo "solana-verify remote submit-job --program-id $id --uploader {{.UPLOADER | default "<uploader>"}}"
+        done < "$ids"
+        {{end}}
+        if [ "$failed" = 1 ]; then
+          echo "A deployed program is not its verifiable build: a verifier can't reproduce it from the source."
+          exit 1
+        fi
+        echo "every program deployed is its verifiable build"
+
   solana:admin-steps:
-    desc: "Mainnet's Solana admin steps (proposing Orca's driver, and PROJECT's project): with ON_FORK=1 sent from the stand-in admin ADMIN_KEYFILE=<keypair> (which must be ADMIN) on the local fork, WARP=1 then moving its clock past the timelock; otherwise nothing is sent: each step still to do is printed (program, accounts, data) and written to .shonin/mainnet/admin-steps/admin-steps-solana-mainnet-beta.json for the hardware key (NETWORK=mainnet ADMIN=<address>)"
+    desc: "Mainnet's Solana admin steps (proposing Orca's driver, PROJECT's project, and with DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder a real image): with ON_FORK=1 sent from the stand-in admin ADMIN_KEYFILE=<keypair> (which must be ADMIN) on the local fork, WARP=1 then moving its clock past the timelock; otherwise nothing is sent: each step still to do is printed (program, accounts, data) and written to .shonin/mainnet/admin-steps/admin-steps-solana-mainnet-beta.json for the hardware key (NETWORK=mainnet ADMIN=<address>)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
         msg: "the admin's prepared steps are mainnet's (NETWORK={{.NETWORK}})."
@@ -233,7 +461,22 @@ tasks:
         --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}"
         {{if .ADMIN_KEYFILE}}--admin-keyfile {{shellQuote .ADMIN_KEYFILE}}{{end}}
         {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
+        {{if .DIGEST}}--image-digest {{shellQuote .DIGEST}} --image-kind {{shellQuote .KIND}}{{end}}
         {{if .WARP}}--warp{{end}}
+
+  solana:record-keeper:
+    desc: "Mainnet: record the keeper's hot Solana key (KEEPER=<public key>) as the keeper in Solana's deployment file, held to ADMIN, changing nothing else and sending nothing: alone it prints what it would write, WRITE=1 writes config/deployments/mainnet (commit it), ON_FORK=1 the rehearsal's file; another keeper already recorded is replaced only with REPLACE=1. contracts:solana:verify-deploy checks it"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "recording the keeper is mainnet's (NETWORK={{.NETWORK}})."
+    requires:
+      vars: [KEEPER]
+    cmds:
+      - >-
+        {{.DEVNET}} --vault-chain solana mainnet-record-keeper {{.MAINNET_ARGS}}
+        --keeper {{shellQuote .KEEPER}}
+        {{if .REPLACE}}--replace{{end}}
+        {{if .WRITE}}--write{{end}}
 
   solana:verify-deploy:
     desc: "Mainnet's Solana read-back, read-only: each of the eight programs final at its recorded id and running this build, the registry's admin ADMIN, its timelock and floor two days, the Confidential Space checker its only checker with its pins, no development checker, USDC everywhere, fees and the vault factory ADMIN's, thirty days' notice on prices, Orca's driver's pool and price account and whether it is proposed (IN_FORCE=1: in force, and PROJECT's project proposed). ON_FORK=1 reads the rehearsal's (NETWORK=mainnet ADMIN=<address>)"

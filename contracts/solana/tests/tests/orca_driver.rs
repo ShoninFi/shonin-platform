@@ -1276,11 +1276,19 @@ fn the_driver_names_the_cluster_s_own_token_programs() {
 }
 
 #[test]
-fn orca_s_terms_restrict_sanctioned_persons_and_its_close_comes_home_by_contract() {
+fn orca_s_driver_holds_at_the_station_and_its_close_comes_home_by_contract() {
     let description = shonin_orca_driver::logic::description();
     assert_eq!(description.name, orca());
     assert_eq!(description.custody, shonin_driver::Custody::Station);
     assert_eq!(description.exit_path, shonin_driver::ExitPath::Contract);
+}
+
+#[test]
+fn the_deployed_driver_answers_its_venue_s_restricted_list_as_a_vault_asks_it() {
+    let (mut env, _) = world();
+    let answered = env.driver_restricted(&shonin_orca_driver::ID);
+    assert_eq!(answered, shonin_orca_driver::restricted_codes());
+    assert!(answered.len() <= shonin_driver::MAX_RESTRICTED);
 }
 
 /// The crowded ticks (the one at or below `from` and each a spacing below

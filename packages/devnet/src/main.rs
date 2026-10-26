@@ -26,13 +26,18 @@ mod fund_wallet;
 mod hyperliquid_vaults;
 mod mainnet_evm;
 mod mainnet_guard;
+mod mainnet_keeper;
 mod mainnet_solana;
+mod mainnet_source;
 mod market;
 mod publish;
 mod read_proxy;
 mod seed;
 mod smoke;
 mod solana;
+// A mainnet station is made in the current layout and its program has no
+// `migrate_station`.
+#[cfg(not(feature = "mainnet"))]
 mod solana_migrate;
 mod solana_orca;
 mod solana_seed;
@@ -266,8 +271,26 @@ enum Command {
         admin_steps_dir: PathBuf,
         #[arg(long)]
         project: Option<String>,
+        /// A real image digest (`sha256:<64 hex>`) to propose as a step too,
+        /// with --image-kind.
+        #[arg(long, requires = "image_kind")]
+        image_digest: Option<String>,
+        /// executor, builder, reviewer or unwinder.
+        #[arg(long, requires = "image_digest")]
+        image_kind: Option<String>,
         #[arg(long)]
         warp: bool,
+    },
+    /// Mainnet's Solana cluster for a command that only reads it (the
+    /// verifiable build's comparison): the endpoint `--rpc` names, or else
+    /// the public one, checked as mainnet-beta's (its genesis) and, with
+    /// --on-fork, a local Surfpool fork, otherwise a public node that is no
+    /// fork. Prints the endpoint checked. Sends nothing.
+    MainnetSolanaCluster {
+        #[arg(long)]
+        on_fork: bool,
+        #[arg(long)]
+        rpc: Option<String>,
     },
     /// Mainnet's Solana read-back: every program final at its recorded id
     /// and running the deployed build, and every setting, from the cluster.
@@ -287,6 +310,43 @@ enum Command {
     /// Mainnet: read every address and setting of the deployment back from
     /// each chain and compare it with its file, this build's plan and the
     /// outside contracts' file. Read-only.
+    /// Mainnet: record the keeper's hot key in the deployment files once it
+    /// exists (each EVM chain's, or with --vault-chain solana Solana's),
+    /// changing nothing else and sending nothing. Alone it prints what it
+    /// would write; --write writes it (the committed files, or with
+    /// --on-fork the rehearsal's).
+    MainnetRecordKeeper {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// The keeper's address: an EVM address, or on Solana its public key.
+        #[arg(long)]
+        keeper: String,
+        /// Record it in place of another keeper already recorded.
+        #[arg(long)]
+        replace: bool,
+        #[arg(long)]
+        write: bool,
+    },
+    /// Mainnet: propose a real image digest on each EVM chain's registry
+    /// (or --vault-chain's) as the admin's step, from the deployment files:
+    /// with --on-fork sent as the admin, impersonated (--warp then moves the
+    /// forks' clocks past the timelock); otherwise never sent, each step
+    /// still to do printed for the hardware wallet and written beside the
+    /// deploy's admin steps.
+    MainnetImage {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// `sha256:<64 hex>`, as the container registry names the image.
+        #[arg(long)]
+        digest: String,
+        /// executor, builder, reviewer, unwinder or holder.
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+        #[arg(long)]
+        warp: bool,
+    },
     MainnetVerify {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -297,6 +357,24 @@ enum Command {
         /// Require the driver (and project) in force, the timelock passed.
         #[arg(long)]
         expect_in_force: bool,
+    },
+    /// Mainnet: the source of every EVM contract the deploy created,
+    /// verified on each chain's explorers (`config/mainnet.toml`), from the
+    /// deployment file held to ADMIN, GENERATION and this build. Alone a
+    /// dry run printing every submission; with --on-fork the rehearsal's
+    /// file, a dry run only; with --submit the committed file, submitted.
+    /// Sends no transaction.
+    MainnetVerifySource {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long, default_value = "config/mainnet.toml")]
+        venues: PathBuf,
+        /// The Foundry project the contracts' sources are in.
+        #[arg(long, default_value = "contracts/evm")]
+        contracts_root: PathBuf,
+        /// Submit to the explorers (the committed deployment file only).
+        #[arg(long)]
+        submit: bool,
     },
     /// On the testnets, set Solana devnet up from the programs already
     /// deployed there, as a development cluster is set up: every role funded
@@ -650,10 +728,14 @@ async fn main() -> Result<()> {
             Command::MainnetDeploy { .. }
                 | Command::MainnetAdminSteps { .. }
                 | Command::MainnetVerify { .. }
+                | Command::MainnetRecordKeeper { .. }
+                | Command::MainnetImage { .. }
+                | Command::MainnetVerifySource { .. }
                 | Command::MainnetSolanaIds { .. }
                 | Command::MainnetSolanaDeploy { .. }
                 | Command::MainnetSolanaAdminSteps { .. }
                 | Command::MainnetSolanaVerify { .. }
+                | Command::MainnetSolanaCluster { .. }
         )
     );
     if mainnet_command && target.network != NetworkName::Mainnet {
@@ -686,6 +768,20 @@ async fn main() -> Result<()> {
             &stand_ins,
             &out,
         ),
+        Some(Command::MainnetSolanaCluster { on_fork, rpc }) => {
+            let (key, mut config) = solana_mainnet()?;
+            let mode = if on_fork {
+                mainnet_guard::Mode::Fork
+            } else {
+                mainnet_guard::Mode::DryRun
+            };
+            config.rpc = rpc.unwrap_or_else(|| config.public_rpc.clone());
+            config.logs_rpc = None;
+            config.ws = None;
+            mainnet_solana::check_cluster(mode, &key, &config).await?;
+            println!("{}", config.rpc);
+            Ok(())
+        }
         Some(Command::MainnetSolanaDeploy {
             mainnet,
             program_keypairs,
@@ -715,9 +811,21 @@ async fn main() -> Result<()> {
             admin_keyfile,
             admin_steps_dir,
             project,
+            image_digest,
+            image_kind,
             warp,
         }) => {
             let (key, config) = solana_mainnet()?;
+            let image = match (image_digest, image_kind) {
+                (Some(digest), Some(kind)) => {
+                    let digest = admin::image_digest(&digest)?;
+                    let kind = admin::solana::kind_of(admin::kind_named(&kind)?).ok_or_else(|| {
+                        anyhow!("the Solana registry has no holder kind (the root key's record is on the canonical chain)")
+                    })?;
+                    Some((digest.0, kind))
+                }
+                _ => None,
+            };
             mainnet_solana::admin(
                 &key,
                 &config,
@@ -725,9 +833,53 @@ async fn main() -> Result<()> {
                 admin_keyfile.as_deref(),
                 &admin_steps_dir,
                 project.as_deref(),
+                image,
                 warp,
             )
             .await
+        }
+        Some(Command::MainnetRecordKeeper {
+            mainnet,
+            keeper,
+            replace,
+            write,
+        }) => {
+            let flags = mainnet.flags();
+            let solana = target.key.kind == ChainKind::Solana;
+            let (mode, admin) = if solana {
+                let decided = mainnet_solana::decide(&flags)?;
+                (decided.mode, decided.admin.to_string())
+            } else {
+                let ids: Vec<u64> = evm_chains(&target)
+                    .iter()
+                    .filter_map(|(key, _)| key.evm_chain_id())
+                    .collect();
+                let (mode, admin) = mainnet_guard::decide_without_generation(&flags, &ids)?;
+                (mode, admin.to_string())
+            };
+            let files: Vec<(PathBuf, bool)> = if solana {
+                let (key, _) = solana_mainnet()?;
+                vec![(
+                    target
+                        .deployments_dir
+                        .join(format!("{}.json", key.file_stem())),
+                    true,
+                )]
+            } else {
+                only(&target, one, evm_chains(&target))
+                    .iter()
+                    .map(|(key, _)| (Deployments::file_in(&target.deployments_dir, key), false))
+                    .collect()
+            };
+            mainnet_keeper::run(
+                &files,
+                mode,
+                &target.deployments_dir,
+                &keeper,
+                &admin,
+                replace,
+                write,
+            )
         }
         Some(Command::MainnetSolanaVerify {
             mainnet,
@@ -779,6 +931,50 @@ async fn main() -> Result<()> {
                 &mainnet.flags(),
                 warp,
             )
+            .await
+        }
+        Some(Command::MainnetImage {
+            mainnet,
+            digest,
+            kind,
+            admin_steps_dir,
+            warp,
+        }) => {
+            mainnet_evm::image(
+                only(&target, one, evm_chains(&target)),
+                &target.deployments_dir,
+                &admin_steps_dir,
+                &mainnet.flags(),
+                admin::image_digest(&digest)?,
+                &kind,
+                warp,
+            )
+            .await
+        }
+        Some(Command::MainnetVerifySource {
+            mainnet,
+            venues,
+            contracts_root,
+            submit,
+        }) => {
+            let explorers = mainnet_source::read_explorers(
+                &std::fs::read_to_string(&venues)
+                    .with_context(|| format!("reading {}", venues.display()))?,
+            )?;
+            let venues = mainnet_evm::Venues::read(&venues)?;
+            let contracts_root = std::fs::canonicalize(&contracts_root)
+                .with_context(|| format!("finding {}", contracts_root.display()))?;
+            mainnet_source::run(mainnet_source::Inputs {
+                chains: only(&target, one, evm_chains(&target)),
+                names: chain_names(&target),
+                artifacts: &args.artifacts,
+                venues: &venues,
+                explorers,
+                deployments_dir: &target.deployments_dir,
+                contracts_root: &contracts_root,
+                flags: mainnet.flags(),
+                submit,
+            })
             .await
         }
         Some(Command::MainnetVerify {
@@ -835,11 +1031,16 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(not(feature = "mainnet"))]
         Some(Command::MigrateStations { dry_run }) => {
             on_each_cluster(&target, one, |client, _| async move {
                 solana_migrate::run(&client, dry_run).await
             })
             .await
+        }
+        #[cfg(feature = "mainnet")]
+        Some(Command::MigrateStations { .. }) => {
+            bail!("a mainnet station program has no migrate_station: there is nothing to migrate")
         }
         Some(Command::Deploy) => {
             let names = chain_names(&target);

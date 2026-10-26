@@ -37,8 +37,8 @@ contract AFullBandSaleSellsAtMostItsListingsMaximumTest is Test {
     /// EIP-7825's per-transaction gas cap, which Base applies.
     uint256 internal constant TX_GAS_CAP = 16_777_216;
     /// What the driver's reads in a full unwind spend at the most for its
-    /// most listings: under 300,000 a listing on a Base fork.
-    uint256 internal constant DRIVER_READS = 600_000;
+    /// most listings: under 300,000 a listing on a Base fork (293,472 measured).
+    uint256 internal constant DRIVER_READS = 700_000;
     /// The station's and the vault's own work around the driver's part.
     uint256 internal constant AROUND = 1_000_000;
 
@@ -211,6 +211,32 @@ contract AFullBandSaleSellsAtMostItsListingsMaximumTest is Test {
         );
         RobinhoodDriver.Venue memory venue = _venue();
         vm.expectRevert(RobinhoodDriver.NoMaxSale.selector);
+        new RobinhoodDriver(venue, listings);
+    }
+
+    /// A window of zero would leave no pool with a time-weighted price, so
+    /// no full-band sale and no exit value, for good: it is refused.
+    function test_a_time_weighted_window_of_zero_is_refused() public {
+        RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](1);
+        listings[0] = RobinhoodDriver.Listing(
+            address(nvda), IAggregatorV3(address(nvdaFeed)), IUniswapV3Pool(address(nvdaPool)), NVDA_MAX
+        );
+        RobinhoodDriver.Venue memory venue = _venue();
+        venue.twapWindow = 0;
+        vm.expectRevert(RobinhoodDriver.NoTwapWindow.selector);
+        new RobinhoodDriver(venue, listings);
+    }
+
+    /// A feed age of zero would trust no feed after its own block, so every
+    /// valuation would be void: it is refused.
+    function test_a_feed_age_of_zero_is_refused() public {
+        RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](1);
+        listings[0] = RobinhoodDriver.Listing(
+            address(nvda), IAggregatorV3(address(nvdaFeed)), IUniswapV3Pool(address(nvdaPool)), NVDA_MAX
+        );
+        RobinhoodDriver.Venue memory venue = _venue();
+        venue.maxFeedAge = 0;
+        vm.expectRevert(RobinhoodDriver.NoMaxFeedAge.selector);
         new RobinhoodDriver(venue, listings);
     }
 

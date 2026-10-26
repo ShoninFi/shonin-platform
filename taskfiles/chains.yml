@@ -94,6 +94,41 @@ tasks:
         {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
         {{if .IN_FORCE}}--expect-in-force{{end}}
 
+  record-keeper:
+    desc: "Mainnet: record the keeper's hot EVM key (KEEPER=<address>) as the keeper in each EVM chain's deployment file (or VAULT_CHAIN=<name>'s), held to ADMIN, changing nothing else and sending nothing: alone it prints what it would write, WRITE=1 writes config/deployments/mainnet (commit it), ON_FORK=1 the rehearsal's files; a different keeper already recorded is replaced only with REPLACE=1. The keeper holds no other role; chains:verify-deploy checks it"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "recording the keeper is mainnet's (NETWORK={{.NETWORK}}); the testnets' roles come from the mnemonic."
+    requires:
+      vars: [KEEPER]
+    cmds:
+      - >-
+        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-record-keeper {{.MAINNET_ARGS}}
+        --keeper {{shellQuote .KEEPER}}
+        {{if .REPLACE}}--replace{{end}}
+        {{if .WRITE}}--write{{end}}
+
+  verify-source:
+    desc: "Mainnet: the source of every EVM contract the deploy created (the platform's contracts, the vault's libraries, the checker and its RISC Zero verifier, the driver, the contracts at one address on every chain) verified on each chain's explorers as config/mainnet.toml lists them (Etherscan's v2 API, Sourcify), from the deployment file, held to ADMIN, GENERATION and this build, with the compiler settings, libraries and constructor arguments the deploy used. Alone a dry run printing each submission and its command; ON_FORK=1 reads the rehearsal's file and checks its code on the forks, a dry run only (an explorer can't see a fork); SUBMIT=1 submits, from the committed config/deployments/mainnet alone, with ETHERSCAN_API_KEY from .env (never printed); a contract already verified is skipped. Sends no transaction (NETWORK=mainnet ADMIN=<address> GENERATION=1)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "source verification is mainnet's (NETWORK={{.NETWORK}})."
+      - sh: '[ -z "{{.SUBMIT}}" ] || [ -z "{{.ON_FORK}}" ]'
+        msg: "ON_FORK=1 with SUBMIT=1: an explorer can't see a fork. Nothing was submitted."
+    env:
+      # Read by forge alone, from its environment, on a submission.
+      ETHERSCAN_API_KEY: '{{if .SUBMIT}}{{.ETHERSCAN_API_KEY}}{{end}}'
+    cmds:
+      - task: :contracts:build
+      # An empty task-level value leaves a key exported in the shell in
+      # place: without SUBMIT the key is taken out of the environment.
+      - >-
+        {{if not .SUBMIT}}unset ETHERSCAN_API_KEY;{{end}}
+        {{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-verify-source {{.MAINNET_ARGS}}
+        --venues "{{joinPath .PATH_ROOT "config" "mainnet.toml"}}"
+        --contracts-root "{{.PATH_CONTRACTS_EVM}}"
+        {{if .SUBMIT}}--submit{{end}}
+
   solana-setup:
     desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), Circle's devnet USDC as the dollar (no stand-in venue or driver, nothing minted: dollars come from Circle's faucet), the registry (no timelock, the development checker), the operator's project, the orca driver, every role's dollar account, then deployments/solana-devnet.json with the roles. Orca's pool is seeded and kept by testnet-market (task chains:testnet-market-setup STEPS=gas,pools). No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
     preconditions:
@@ -126,11 +161,19 @@ tasks:
       - "{{.DEVNET_SOLANA}} propose-checker"
 
   image:
-    desc: "Propose a real image digest on every chain's registry (each EVM chain's, and Solana's once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder|holder; NETWORK=testnet); already proposed is done. Solana has no holder kind. The root key's test requester is proposed as KIND=reviewer: the canonical chain's registry is the one its exchange checks"
+    desc: "Propose a real image digest on every chain's registry (each EVM chain's, and Solana's once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder|holder; NETWORK=testnet); already proposed is done. With NETWORK=mainnet ADMIN=<the hardware key's address>, each EVM chain's proposal from its deployment file as the hardware key's step (cast send --ledger, printed and written to .shonin/mainnet/admin-steps/image-evm-<id>.sh, never sent), or with ON_FORK=1 sent as the impersonated admin on the forks (WARP=1 then past the timelock); Solana's mainnet image is task contracts:solana:admin-steps NETWORK=mainnet DIGEST=… KIND=…. Solana has no holder kind. The root key's test requester is proposed as KIND=reviewer: the canonical chain's registry is the one its exchange checks"
     requires:
       vars: [DIGEST, KIND]
     cmds:
-      - "{{.DEVNET_SOLANA}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}"
+      # On mainnet the hardware key proposes it: the image's admin step, from
+      # the deployment files, prepared (cast send --ledger) or on a fork
+      # (ON_FORK=1, WARP=1) sent as the impersonated admin. Solana's is
+      # contracts:solana:admin-steps with DIGEST and KIND.
+      - >-
+        {{if eq .NETWORK "mainnet"}}{{.DEVNET}} {{.VAULT_CHAIN_ARG}} mainnet-image {{.MAINNET_ARGS}}
+        --digest {{shellQuote .DIGEST}} --kind {{shellQuote .KIND}}
+        --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}"
+        {{if .WARP}}--warp{{end}}{{else}}{{.DEVNET_SOLANA}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}{{end}}
 
   revoke-image:
     desc: "Revoke an image digest on every chain's registry (Solana's too, once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex>; NETWORK=testnet); already revoked is done. Revoked takes effect at once and for good: keys blessed from it stop counting, and a root key recorded from it stops being live, on the chains revoked"

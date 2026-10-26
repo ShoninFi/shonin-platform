@@ -190,6 +190,21 @@ impl Venues {
                     uniswap.listings.len()
                 );
             }
+            // The driver's constructor refuses either at zero: a zero window
+            // would anchor a sale's price limit to the spot price it moves,
+            // and a zero age would refuse every price.
+            if uniswap.twap_window == 0 {
+                bail!(
+                    "chain {chain_id} ({}) gives the driver no twap_window, and the driver refuses zero",
+                    chain.label
+                );
+            }
+            if uniswap.max_feed_age == 0 {
+                bail!(
+                    "chain {chain_id} ({}) gives the driver no max_feed_age, and the driver refuses zero",
+                    chain.label
+                );
+            }
             for listing in &uniswap.listings {
                 if listing.max_sale.is_zero() {
                     bail!(
@@ -537,6 +552,10 @@ alloy::sol! {
         function initializer() external view returns (address);
         function initialize(address attestation_, address asset_, address vaultFactory_, address implementation_) external;
     }
+    interface IMainnetUniswapPool {
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+        function observe(uint32[] calldata secondsAgos) external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+    }
     interface IMainnetRobinhoodDriver {
         struct Stock {
             address token;
@@ -577,6 +596,7 @@ pub enum StepKind {
     InitialiseStationFactory,
     ProposeDriver,
     ProposeProject,
+    ProposeImage,
 }
 
 /// One transaction only the admin may send, prepared for the hardware key.
@@ -674,6 +694,240 @@ pub fn admin_steps(plan: &ChainPlan, project: Option<&str>) -> Vec<AdminStep> {
         });
     }
     steps
+}
+
+/// Whether a listed pool serves the TWAP a full-band sale's price limit is
+/// anchored to: a window that isn't zero (a zero window would anchor the
+/// limit to the spot price, which a sale moves), more than one observation
+/// kept, and `observe([window, 0])` answering (its oldest observation is
+/// older than the window).
+pub fn judge_twap(window: u32, cardinality: u16, observed: bool) -> Result<(), String> {
+    if window == 0 {
+        return Err("the driver's TWAP window is 0".to_string());
+    }
+    if cardinality < 2 {
+        return Err(format!(
+            "the pool keeps {cardinality} observation(s): no TWAP over any window"
+        ));
+    }
+    if !observed {
+        return Err(format!(
+            "observe([{window}, 0]) is refused: the pool's {cardinality} observations don't reach              back {window} s"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an image's proposal is done, from what the registry holds: not
+/// proposed is to do; proposed as this kind is done; proposed as another
+/// kind, or revoked, is refused (an image is proposed once, and a revoked one
+/// never again).
+pub fn judge_image(
+    digest: B256,
+    kind: u8,
+    proposed: bool,
+    held_kind: u8,
+    revoked: bool,
+) -> Result<bool> {
+    if !proposed {
+        return Ok(false);
+    }
+    if held_kind != kind {
+        bail!(
+            "the image {digest} is already proposed as another kind ({held_kind}); an image is proposed once"
+        );
+    }
+    if revoked {
+        bail!("the image {digest} was revoked; a revoked image can't be proposed again");
+    }
+    Ok(true)
+}
+
+/// The admin's step proposing a real image digest on a chain's registry,
+/// from its deployment record: never a placeholder, only a digest given.
+pub fn image_step(
+    chain_id: u64,
+    registry: Address,
+    digest: B256,
+    kind: chain::bindings::attestation::ImageKind,
+    kind_name: &str,
+) -> AdminStep {
+    use chain::bindings::attestation::IAttestationRegistry;
+    AdminStep {
+        chain_id,
+        to: registry,
+        data: IAttestationRegistry::proposeImageCall {
+            imageDigest: digest,
+            kind,
+        }
+        .abi_encode()
+        .into(),
+        value: U256::ZERO,
+        purpose: format!(
+            "propose the {kind_name} image {digest}; it can be blessed once the timelock has passed"
+        ),
+        kind: StepKind::ProposeImage,
+    }
+}
+
+/// `mainnet-image`: a real image digest proposed on each EVM chain's
+/// registry as an admin step, built from the chain's deployment file (held
+/// to ADMIN) and the registry as it stands. On a fork sent as the admin,
+/// impersonated (with `warp`, the clock then moved past the timelock); on
+/// mainnet never sent: each step still to do is printed as its command for
+/// the hardware wallet and written to `image-evm-<id>.sh` beside the
+/// deploy's admin steps.
+pub async fn image(
+    chains: Vec<(ChainKey, ChainConfig)>,
+    deployments_dir: &Path,
+    admin_steps_dir: &Path,
+    flags: &mainnet_guard::Flags,
+    digest: B256,
+    kind_name: &str,
+    warp: bool,
+) -> Result<()> {
+    let kind = crate::admin::kind_named(kind_name)?;
+    let ids: Vec<u64> = chains
+        .iter()
+        .filter_map(|(key, _)| key.evm_chain_id())
+        .collect();
+    let (mode, admin) = mainnet_guard::decide_without_generation(flags, &ids)?;
+    if mode == Mode::Send {
+        bail!(
+            "an image is proposed by the hardware key, never sent from here on mainnet. Run this \
+             without DEPLOYER_KEYFILE and CONFIRM_MAINNET to print its commands."
+        );
+    }
+    if warp && mode != Mode::Fork {
+        bail!("only a fork's clock can be moved (ON_FORK=1)");
+    }
+    mainnet_guard::check_admin_steps_dir(mode, admin_steps_dir)?;
+    if mode == Mode::Fork && mainnet_guard::is_committed_dir(deployments_dir) {
+        bail!(
+            "a fork rehearsal reads the fork's deployment files, never config/deployments/mainnet"
+        );
+    }
+    for (key, config) in chains {
+        let id = key.evm_chain_id().unwrap_or_default();
+        let file = Deployments::file_in(deployments_dir, &key);
+        let deployments = Deployments::from_json(
+            &std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}: deploy first", file.display()))?,
+        )?;
+        if deployments.roles.admin != admin {
+            bail!(
+                "{} records the admin {}, not ADMIN={admin}",
+                file.display(),
+                deployments.roles.admin
+            );
+        }
+        mainnet_guard::check_chain(mode, &config, id).await?;
+        let client =
+            chain::connect_with(&key, &config, NetworkName::Mainnet, Signing::ReadOnly).await?;
+        mainnet_guard::check_chain_id(&config.label, id, client.chain_id)?;
+        let steps = AdminSteps {
+            chain_id: id,
+            admin,
+            registry: deployments.attestation,
+            from_block: deployments.deployed_block,
+            steps: vec![image_step(
+                id,
+                deployments.attestation,
+                digest,
+                kind,
+                kind_name,
+            )],
+        };
+        println!("{} ({key}): the {kind_name} image {digest}", config.label);
+        if mode == Mode::Fork {
+            send_impersonated(&client, &steps).await?;
+            if warp {
+                let timelock = client
+                    .read(steps.registry, IMainnetRegistry::timelockCall {})
+                    .await?;
+                client
+                    .raw_request("evm_increaseTime", serde_json::json!([timelock + 60]))
+                    .await?;
+                client
+                    .raw_request("evm_mine", serde_json::json!([]))
+                    .await?;
+                println!(
+                    "  the fork's clock moved {} s, past the registry's timelock",
+                    timelock + 60
+                );
+            }
+            continue;
+        }
+        let step = &steps.steps[0];
+        let done = step_done(&client, &steps, step).await?;
+        let command = ledger_command(step, admin, &config.public_rpc);
+        println!(
+            "  {}: {}\n    {command}",
+            if done { "done" } else { "to send" },
+            step.purpose
+        );
+        std::fs::create_dir_all(admin_steps_dir)?;
+        let script_file = admin_steps_dir.join(format!("image-evm-{id}.sh"));
+        let mut script = String::from("#!/bin/sh\nset -e\n");
+        if !done {
+            script.push_str(&format!("# {}\n{command}\n", step.purpose));
+        }
+        mainnet_guard::write_file(&script_file, script)?;
+        println!(
+            "  nothing was sent: the hardware key's command is in {}",
+            script_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// Read a listed pool's observations and ask it for the TWAP over
+/// `window`, judged by [`judge_twap`]: its observation count, or why not.
+/// How a pool that would refuse the send is named, in the dry run and in
+/// the send's refusal alike.
+const REFUSED_AT_THE_SEND: &str = "REFUSED at the send";
+
+/// Whether each listing pool of the chain's Uniswap venue answers the TWAP
+/// over the venue's window: one line a listing, those that don't starting
+/// with [`REFUSED_AT_THE_SEND`]. A real send and a fork refuse on any.
+async fn pools_answer_the_twap(
+    client: &Client,
+    venues: &Venues,
+    chain_id: u64,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(uniswap) = &venues.chain(chain_id)?.uniswap {
+        for listing in &uniswap.listings {
+            lines.push(
+                match pool_twap(client, listing.pool, uniswap.twap_window).await {
+                    Ok(cardinality) => format!(
+                        "{}'s pool answers the {} s TWAP ({cardinality} observations)",
+                        listing.symbol, uniswap.twap_window
+                    ),
+                    Err(why) => format!("{REFUSED_AT_THE_SEND}: {}'s pool: {why}", listing.symbol),
+                },
+            );
+        }
+    }
+    Ok(lines)
+}
+
+async fn pool_twap(client: &Client, pool: Address, window: u32) -> Result<u16, String> {
+    let cardinality = client
+        .read(pool, IMainnetUniswapPool::slot0Call {})
+        .await
+        .map(|slot| slot.observationCardinality)
+        .unwrap_or(0);
+    let observed = client
+        .read(
+            pool,
+            IMainnetUniswapPool::observeCall {
+                secondsAgos: vec![window, 0],
+            },
+        )
+        .await
+        .is_ok();
+    judge_twap(window, cardinality, observed).map(|()| cardinality)
 }
 
 /// The command that sends one admin step from the hardware wallet.
@@ -822,6 +1076,13 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
                         ),
                         Err(error) => println!("  {error:#}"),
                     }
+                    // The pools the driver's full-band sale is limited by:
+                    // each must answer the TWAP over the listing's window,
+                    // or the send refuses before anything is sent.
+                    for line in pools_answer_the_twap(&client, inputs.venues, plan.chain_id).await?
+                    {
+                        println!("  {line}");
+                    }
                 }
                 Err(error) => println!("  (the chain was not read: {error:#})"),
             }
@@ -881,6 +1142,17 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
             inputs.overwrite_fork_record,
         )
         .await?;
+        // The driver is immutable: a listing pool that can't answer its TWAP
+        // would leave every full-band sale reverting, so it is refused here,
+        // before anything is sent to any chain, as the dry run says.
+        let refused: Vec<String> = pools_answer_the_twap(&client, inputs.venues, plan.chain_id)
+            .await?
+            .into_iter()
+            .filter(|line| line.starts_with(REFUSED_AT_THE_SEND))
+            .collect();
+        if !refused.is_empty() {
+            bail!("{}: {}. Nothing was sent.", plan.label, refused.join("; "));
+        }
         connected.push((key, config, plan, client));
     }
 
@@ -1128,11 +1400,7 @@ fn write_deployment(
 }
 
 fn write_json(file: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
-    }
-    std::fs::write(file, serde_json::to_string_pretty(value)?)
-        .with_context(|| format!("writing {}", file.display()))
+    mainnet_guard::write_file(file, serde_json::to_string_pretty(value)?)
 }
 
 fn print_plan(
@@ -1387,6 +1655,25 @@ async fn step_done(client: &Client, steps: &AdminSteps, step: &AdminStep) -> Res
                 .context("looking for the driver's proposal")?
                 .is_empty())
         }
+        StepKind::ProposeImage => {
+            use chain::bindings::attestation::IAttestationRegistry;
+            let wanted = IAttestationRegistry::proposeImageCall::abi_decode(&step.data)?;
+            let image = client
+                .read(
+                    step.to,
+                    IAttestationRegistry::imageOfCall {
+                        imageDigest: wanted.imageDigest,
+                    },
+                )
+                .await?;
+            judge_image(
+                wanted.imageDigest,
+                wanted.kind as u8,
+                image.allowedAt != 0,
+                image.kind as u8,
+                image.revoked,
+            )
+        }
         StepKind::ProposeProject => {
             let asking = TransactionRequest::default()
                 .from(steps.admin)
@@ -1504,8 +1791,7 @@ pub async fn admin(
                     }
                 }
                 let script_file = file.with_extension("sh");
-                std::fs::write(&script_file, script)
-                    .with_context(|| format!("writing {}", script_file.display()))?;
+                mainnet_guard::write_file(&script_file, script)?;
                 println!(
                     "  nothing was sent: the hardware key's commands are in {}",
                     script_file.display()
@@ -1685,6 +1971,41 @@ async fn verify_chain(
         deployments.roles.admin == admin && deployments.roles.platform == admin,
         format!("{}", deployments.roles.admin),
     );
+    // The keeper's hot key, once recorded (`task chains:record-keeper`): a
+    // key of its own, holding no other role, an account with no code.
+    let keeper = deployments.roles.keeper;
+    if keeper == Address::ZERO {
+        check(
+            &mut checks,
+            "the keeper: not recorded yet (task chains:record-keeper)",
+            true,
+            "",
+        );
+    } else {
+        check(
+            &mut checks,
+            "the keeper holds no other role",
+            keeper != admin && keeper != deployments.roles.platform && keeper != record.deployer,
+            keeper.to_string(),
+        );
+        // An account delegated by EIP-7702 has code too (0xef0100 and the
+        // delegate's address): it runs another's code, and is refused.
+        let code = client
+            .provider()
+            .get_code_at(keeper)
+            .await
+            .context("reading the keeper's code")?;
+        check(
+            &mut checks,
+            "the keeper is an account with no code and no delegation",
+            code.is_empty(),
+            if code.starts_with(&[0xef, 0x01, 0x00]) && code.len() == 23 {
+                format!("{keeper} delegated to {}", Address::from_slice(&code[3..]))
+            } else {
+                keeper.to_string()
+            },
+        );
+    }
     check(
         &mut checks,
         format!("the file's generation is {generation}"),
@@ -2026,6 +2347,21 @@ async fn verify_chain(
                 format!("{} listed", listed.len()),
             );
             for listing in &uniswap.listings {
+                // The full-band sale's price limit is anchored to the pool's
+                // TWAP over the driver's window: the pool must answer for it.
+                let judged = pool_twap(client, listing.pool, window).await;
+                check(
+                    &mut checks,
+                    format!(
+                        "{}'s pool answers the {window} s TWAP the sale is limited by",
+                        listing.symbol
+                    ),
+                    judged.is_ok(),
+                    match judged {
+                        Ok(cardinality) => format!("{cardinality} observations"),
+                        Err(why) => why,
+                    },
+                );
                 let max_sale = client
                     .read(
                         at,
@@ -2137,6 +2473,42 @@ async fn verify_chain(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_image_proposed_as_another_kind_or_revoked_is_refused_and_one_proposed_is_done() {
+        let digest = B256::repeat_byte(7);
+        assert!(!judge_image(digest, 0, false, 0, false).unwrap());
+        assert!(judge_image(digest, 0, true, 0, false).unwrap());
+        assert!(judge_image(digest, 0, true, 1, false).is_err());
+        assert!(judge_image(digest, 0, true, 0, true).is_err());
+    }
+
+    #[test]
+    fn an_image_step_is_the_registry_s_proposal_for_the_hardware_wallet() {
+        use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
+        let registry = Address::repeat_byte(5);
+        let digest = B256::repeat_byte(6);
+        let step = image_step(8453, registry, digest, ImageKind::Executor, "executor");
+        assert_eq!(step.to, registry);
+        assert_eq!(step.kind, StepKind::ProposeImage);
+        let call = IAttestationRegistry::proposeImageCall::abi_decode(&step.data).unwrap();
+        assert_eq!(call.imageDigest, digest);
+        let admin = Address::repeat_byte(9);
+        let command = ledger_command(&step, admin, "https://mainnet.base.org");
+        assert!(command.starts_with(&format!("cast send --ledger --from {admin} --chain 8453")));
+    }
+
+    #[test]
+    fn a_zero_twap_window_or_a_pool_that_can_t_answer_it_is_refused() {
+        assert!(judge_twap(1800, 5000, true).is_ok());
+        assert!(judge_twap(0, 5000, true).unwrap_err().contains("is 0"));
+        assert!(judge_twap(1800, 1, true).is_err());
+        assert!(
+            judge_twap(1800, 7200, false)
+                .unwrap_err()
+                .contains("refused")
+        );
+    }
+
     use super::*;
 
     fn artifacts() -> Option<PathBuf> {
@@ -2330,6 +2702,36 @@ mod tests {
                 ("AAPL".to_string(), tokens(100)),
             ]
         );
+    }
+
+    #[test]
+    fn a_driver_with_no_twap_window_or_no_feed_age_is_refused_at_the_dry_run() {
+        assert!(venues().check_listings().is_ok());
+        for chain_id in ["8453", "4663"] {
+            let mut window = venues();
+            window
+                .evm
+                .chains
+                .get_mut(chain_id)
+                .unwrap()
+                .uniswap
+                .as_mut()
+                .unwrap()
+                .twap_window = 0;
+            let error = window.check_listings().unwrap_err().to_string();
+            assert!(error.contains("no twap_window"), "{error}");
+            let mut age = venues();
+            age.evm
+                .chains
+                .get_mut(chain_id)
+                .unwrap()
+                .uniswap
+                .as_mut()
+                .unwrap()
+                .max_feed_age = 0;
+            let error = age.check_listings().unwrap_err().to_string();
+            assert!(error.contains("no max_feed_age"), "{error}");
+        }
     }
 
     #[test]

@@ -138,6 +138,17 @@ vars:
   # ON_FORK=1 Solana rehearsal uses unless SHONIN_RPC_SOLANA_MAINNET_BETA is
   # set.
   SOLANA_FORK_RPC: "http://127.0.0.1:19210"
+  # The verifiable build of the Solana programs (`solana-verify build`): the
+  # Solana Foundation's image for the Solana CLI the programs are built with,
+  # pinned by digest (solana-verify's own pin for 3.1.13), and the public
+  # repository a verifier rebuilds them from.
+  SOLANA_VERIFY_IMAGE: "solanafoundation/solana-verifiable-build@sha256:1a0ea3dd15017e57e9b17d67267e7d2d7ab4f083499f3f29c847ddd54f01db31"
+  PLATFORM_REPO_URL: "https://github.com/ShoninFi/shonin-platform"
+  # The eight programs that ship on mainnet, by library name, and what a
+  # verifiable build of uncommitted changes records as its source (a real
+  # send refuses it).
+  SOLANA_MAINNET_PROGRAMS: "shonin_registry shonin_publishing shonin_prices shonin_profiles shonin_station shonin_vault shonin_cs_verifier shonin_orca_driver"
+  WORKING_TREE: "working-tree"
   SOLANA_FORK_WS: "ws://127.0.0.1:19211"
   PATH_MAINNET_SOLANA: '{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "solana"}}{{else if .CONFIRM_MAINNET}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "solana"}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet-dry-run" "solana"}}{{end}}'
   # Where the local Solana cluster (Surfpool) runs and logs, wiped on every

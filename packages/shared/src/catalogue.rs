@@ -198,10 +198,73 @@ mod tests {
             assert_eq!(driver.custody, Custody::Station);
             assert_eq!(driver.exit, Exit::Contract);
         }
-        // One contract: what its `restricted()` answers, on both chains.
+        // One contract: what its `restricted()` answers, on both chains, in
+        // the same order as `RobinhoodDriver.restricted()`.
         assert_eq!(base.restricted, robinhood.restricted);
+        assert_eq!(
+            robinhood.restricted,
+            vec![
+                "BY",
+                "CA",
+                "CH",
+                "CU",
+                "GB",
+                "IR",
+                "KP",
+                "MM",
+                "RU",
+                "SANCTIONED",
+                "SD",
+                "SS",
+                "SY",
+                "UA",
+                "US",
+                "VE",
+            ]
+        );
         // A name the registry can hold: 32 bytes at most.
         assert!("uniswap-base".len() <= 32);
+    }
+
+    #[test]
+    fn orca_s_list_is_its_driver_program_s() {
+        // The same codes, in the same order, as the Orca driver's `restricted`.
+        assert_eq!(
+            Catalogue::published().drivers["orca"].restricted,
+            vec![
+                "AF",
+                "BA",
+                "BI",
+                "BY",
+                "CD",
+                "CF",
+                "CG",
+                "CU",
+                "GN",
+                "GW",
+                "HT",
+                "IQ",
+                "IR",
+                "KP",
+                "LB",
+                "LY",
+                "ML",
+                "MM",
+                "NI",
+                "SANCTIONED",
+                "SD",
+                "SO",
+                "SS",
+                "SY",
+                "UA-09",
+                "UA-14",
+                "UA-40",
+                "UA-43",
+                "VE",
+                "YE",
+                "ZW",
+            ]
+        );
     }
 
     #[test]

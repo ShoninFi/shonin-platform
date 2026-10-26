@@ -115,14 +115,19 @@ label = "Base"
 rpc = "https://mainnet.base.org"
 dollar = "USDC"
 
+# Hyperliquid's own endpoint takes log queries of at most 1,000 blocks.
 [chains."evm:999"]
 label = "Hyperliquid"
 rpc = "https://rpc.hyperliquid.xyz/evm"
+log_range = 1000
 dollar = "USDC"
 
+# Robinhood Chain's own endpoint takes any width but answers at most 10,000
+# logs a query, so a query is held to 10,000 blocks.
 [chains."evm:4663"]
 label = "Robinhood Chain"
 rpc = "https://rpc.mainnet.chain.robinhood.com"
+log_range = 10000
 dollar = "USDG"
 
 [chains."solana:mainnet-beta"]
@@ -315,15 +320,23 @@ head_lag_max_ms = 10000
 head_ahead_max_ms = 5000
 keeper_balance_floor_micro = 200000
 
+# A mainnet floor covers ten of the keeper's dearest sends (a full unwind
+# at the chain's per-transaction gas cap) at twenty times the chain's usual
+# gas price, and ten vault-key stakes, and is never below the testnet's floor
+# for the same coin.
 [rpc.chains."evm:8453"]
 head_lag_max_ms = 4000
+keeper_balance_floor_micro = 25000
 
 [rpc.chains."evm:999"]
 receipt_poll_ms = 1000
+keeper_balance_floor_micro = 200000
 
 [rpc.chains."evm:4663"]
 receipt_poll_ms = 500
+keeper_balance_floor_micro = 70000
 
 [rpc.chains."solana:mainnet-beta"]
 head_lag_max_ms = 10000
 head_ahead_max_ms = 5000
+keeper_balance_floor_micro = 500000

@@ -192,7 +192,7 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
     uint256 internal constant MAX_LISTINGS = 2;
     /// What the Robinhood driver's reads in a full unwind (its value and
     /// its close) spend, at the most, for that many tokens.
-    uint256 internal constant DRIVER_READS = 600_000;
+    uint256 internal constant DRIVER_READS = 700_000;
     /// What the worst full unwind leaves of the cap, at the least.
     uint256 internal constant MARGIN = 750_000;
 

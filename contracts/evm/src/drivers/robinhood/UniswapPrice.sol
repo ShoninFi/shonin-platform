@@ -11,9 +11,18 @@ library UniswapPrice {
     int24 internal constant MIN_TICK = -887_272;
     int24 internal constant MAX_TICK = 887_272;
 
-    /// The pool's mean tick over the last `window` seconds. Reverts if the
-    /// pool's observations don't reach that far back.
-    function meanTick(IUniswapV3Pool pool, uint32 window) internal view returns (int24 tick) {
+    /// The pool's mean tick over the last `window` seconds, a fractional
+    /// mean rounded towards negative infinity, as the pool does. Reverts if
+    /// the pool's observations don't reach that far back.
+    function meanTick(IUniswapV3Pool pool, uint32 window) internal view returns (int24) {
+        return meanTick(pool, window, false);
+    }
+
+    /// The pool's mean tick over the last `window` seconds, a fractional
+    /// mean rounded up (towards positive infinity) when `up`, and down
+    /// otherwise. Reverts if the pool's observations don't reach that far
+    /// back.
+    function meanTick(IUniswapV3Pool pool, uint32 window, bool up) internal view returns (int24 tick) {
         uint32[] memory ago = new uint32[](2);
         ago[0] = window;
         ago[1] = 0;
@@ -21,8 +30,11 @@ library UniswapPrice {
         int56 delta = cumulatives[1] - cumulatives[0];
         int56 span = int56(uint56(window));
         tick = int24(delta / span);
-        // Round towards negative infinity, as the pool does.
-        if (delta < 0 && (delta % span != 0)) tick--;
+        // Solidity's division truncates towards zero.
+        if (delta % span != 0) {
+            if (delta < 0 && !up) tick--;
+            else if (delta > 0 && up) tick++;
+        }
     }
 
     /// How much of `quote` `amount` of `base` buys at `tick`, where the

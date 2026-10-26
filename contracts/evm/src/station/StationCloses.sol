@@ -246,6 +246,14 @@ library StationCloses {
         if (s.stage.stagedAt != 0) _lapse(s);
         uint16 band = IStation(address(this)).stoppedBand();
         for (uint256 i = 0; i < drivers.length; i++) {
+            // Each driver's part once a call. Nothing stops a contract
+            // calling again within the same transaction, which is no worse
+            // than calling in the next one: a delayed driver's part waits
+            // out `movableAt`, and every other part sells within the bounds
+            // its driver sets for any close, with its own gas floor.
+            for (uint256 j = 0; j < i; j++) {
+                if (drivers[j] == drivers[i]) revert NotAllowed();
+            }
             address driver = s.pinned(drivers[i]);
             if (band >= BPS && gasleft() < PART_FLOOR && !_delayed(driver)) revert ShortOfGas();
             try IStation(address(this)).closeAll(drivers[i], band) returns (bool outside) {

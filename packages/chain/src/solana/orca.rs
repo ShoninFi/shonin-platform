@@ -1624,10 +1624,16 @@ mod tests {
         assert_eq!(listed.exit, Exit::Contract);
         assert_eq!(described.valuation, ValuationKind::OnChain);
         assert_eq!(listed.valuation, Valuation::OnChain);
-        // What the driver's `restricted()` answers: Orca's terms exclude
-        // sanctioned persons and name no country.
-        assert_eq!(listed.restricted, vec!["SANCTIONED".to_string()]);
-        assert!(!listed.networks.contains(&"mainnet".to_string()));
+        // What the driver's `restricted()` answers, code for code.
+        let answered: Vec<String> = shonin_orca_driver::restricted_codes()
+            .iter()
+            .map(|code| {
+                let end = code.iter().position(|b| *b == 0).unwrap_or(32);
+                String::from_utf8(code[..end].to_vec()).unwrap()
+            })
+            .collect();
+        assert_eq!(listed.restricted, answered);
+        assert!(listed.networks.contains(&"mainnet".to_string()));
     }
 
     #[test]

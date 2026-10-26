@@ -9,6 +9,7 @@
 #
 # Nothing here is secret, and nothing here is Shonin's own: Shonin's
 # addresses are written by the deploy under config/deployments/mainnet/.
+# Each chain also lists the explorers its contracts' source is verified on.
 
 # --- Every EVM chain ---------------------------------------------------------
 
@@ -29,6 +30,10 @@ label = "Base"
 # Circle's USDC.
 dollar = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 dollar_symbol = "USDC"
+# Where `task chains:verify-source` publishes the source of every contract
+# the deploy created: Etherscan's v2 API (one ETHERSCAN_API_KEY for every
+# chain) and Sourcify (keyless).
+explorers = ["etherscan", "sourcify"]
 
 # `uniswap-base`: the Robinhood driver's contract, listing WETH against
 # USDC in Uniswap v3's 0.05% pool at Chainlink's ETH/USD price. ETH/USD on
@@ -58,6 +63,11 @@ label = "Robinhood Chain"
 # Paxos's USDG.
 dollar = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 dollar_symbol = "USDG"
+# Etherscan's v2 API and Sourcify. The chain's own explorer is a
+# Blockscout instance, which can take verified source from Sourcify; its
+# API refuses scripted requests, and Blockscout's hosted API needs a key
+# of its own.
+explorers = ["etherscan", "sourcify"]
 
 # `robinhood`: stock tokens against USDG in Uniswap v3's 0.05% pools at
 # Chainlink's prices. The stock feeds stop over weekends and holidays,
@@ -95,6 +105,7 @@ label = "Hyperliquid"
 # Circle's USDC on HyperEVM.
 dollar = "0xb88339CB7199b77E23DB6E890353E22632Ba630f"
 dollar_symbol = "USDC"
+explorers = ["etherscan", "sourcify"]
 
 # `hyperliquid`: the ETH perp and the HYPE/USDC spot pair, by mainnet's
 # numbers (testnet numbers them differently).

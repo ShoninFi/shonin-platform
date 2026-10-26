@@ -306,6 +306,187 @@ pub fn read_program_keypairs(dir: &Path) -> Result<Vec<(&'static str, Pubkey, Pa
     Ok(out)
 }
 
+/// Where a fork rehearsal's own program keypairs are made when none is
+/// named: under the fork root.
+pub fn throwaway_keypairs_dir(fork_root: &Path) -> PathBuf {
+    fork_root.join("solana").join("throwaway-program-keypairs")
+}
+
+/// The record of every throwaway program id this tool has made, one
+/// `<library name> <id>` a line, under the fork root: a fork takes these
+/// alone, and a real send never any of them.
+pub fn throwaway_record(fork_root: &Path) -> PathBuf {
+    fork_root.join("solana").join("throwaway-program-ids")
+}
+
+/// The throwaway ids recorded under `fork_root`.
+fn throwaways_made(fork_root: &Path) -> Result<std::collections::BTreeSet<Pubkey>> {
+    let record = throwaway_record(fork_root);
+    mainnet_guard::refuse_linked_file(&record)?;
+    let Ok(text) = std::fs::read_to_string(&record) else {
+        return Ok(Default::default());
+    };
+    text.lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|id| {
+            id.parse::<Pubkey>()
+                .map_err(|_| anyhow!("{} holds {id}, not a Solana address", record.display()))
+        })
+        .collect()
+}
+
+/// Make, as throwaways, the program keypairs missing from `dir`, a
+/// directory under `fork_root`: each a new key, recorded as made here
+/// before its file is created, and its file created here (never over a
+/// file or a link already there), readable by its owner alone. A file
+/// already there is left as it is, and taken only if this tool made it
+/// ([`check_program_keypairs`]).
+pub fn make_throwaway_keypairs(dir: &Path, fork_root: &Path) -> Result<()> {
+    use std::io::Write;
+    if !mainnet_guard::is_under(dir, fork_root) {
+        bail!(
+            "a fork rehearsal's program keypairs are made under .shonin/mainnet-fork alone, and \
+             {} is elsewhere: the owner's keypairs never come onto a fork. Nothing was sent.",
+            dir.display()
+        );
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+    let record = throwaway_record(fork_root);
+    for program in SHIPPING {
+        let file = dir.join(format!("{}-keypair.json", program.name));
+        if std::fs::symlink_metadata(&file).is_ok() {
+            continue;
+        }
+        let pair = Keypair::new();
+        mainnet_guard::refuse_linked_file(&record)?;
+        if let Some(parent) = record.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&record)
+            .and_then(|mut out| writeln!(out, "{} {}", program.name, pair.pubkey()))
+            .with_context(|| format!("recording {}", record.display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let bytes: Vec<String> = pair.to_bytes().iter().map(u8::to_string).collect();
+        options
+            .open(&file)
+            .and_then(|mut out| out.write_all(format!("[{}]", bytes.join(",")).as_bytes()))
+            .with_context(|| format!("making {}", file.display()))?;
+    }
+    Ok(())
+}
+
+/// Refuse program keypairs that don't suit the mode, before anything is
+/// built or sent, file by file. A fork rehearsal takes the throwaways this
+/// tool made alone ([`make_throwaway_keypairs`]): each a regular file of
+/// its own (no symlink, no other name on disk), under this repository's
+/// `.shonin/mainnet-fork`, whose id the tool recorded as made there, and
+/// none holding the keypair of a committed `mainnet-id`, which is mainnet's
+/// own program. Anything else (the owner's keypairs, linked or copied in)
+/// is refused. A real send never takes one of those throwaways, however its
+/// file is reached.
+pub fn check_program_keypairs(
+    mode: Mode,
+    dir: &Path,
+    ids: &[(&str, Pubkey)],
+    sources: &Path,
+    fork_root: &Path,
+) -> Result<()> {
+    let under_fork = mainnet_guard::is_under(dir, fork_root);
+    let made = throwaways_made(fork_root)?;
+    let file_of = |name: &str| dir.join(format!("{name}-keypair.json"));
+    match mode {
+        Mode::Fork => {
+            if !under_fork {
+                bail!(
+                    "a fork rehearsal takes throwaway program keypairs from under \
+                     .shonin/mainnet-fork alone (the tool makes them when \
+                     MAINNET_PROGRAM_KEYPAIRS is left out), and {} is elsewhere: the owner's \
+                     keypairs never come onto a fork. Nothing was sent.",
+                    dir.display()
+                );
+            }
+            for (name, id) in ids {
+                let file = file_of(name);
+                mainnet_guard::refuse_linked_file(&file).map_err(|error| {
+                    anyhow!(
+                        "{error:#} A fork rehearsal takes the keypairs this tool made alone: \
+                         the owner's keypairs never come onto a fork. Nothing was sent."
+                    )
+                })?;
+                let real = std::fs::canonicalize(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                if !mainnet_guard::is_under(&real, fork_root) || !made.contains(id) {
+                    bail!(
+                        "{} ({id}) is not a throwaway this tool made: a fork rehearsal takes \
+                         those alone, and the owner's keypairs never come onto a fork. Remove \
+                         it and run the rehearsal again (the tool makes its own). Nothing was \
+                         sent.",
+                        file.display()
+                    );
+                }
+            }
+            for program in SHIPPING {
+                let committed = committed_id(sources, program.name)?;
+                if let Some((name, id)) = ids
+                    .iter()
+                    .find(|(_, id)| committed.is_some_and(|held| held == *id))
+                {
+                    bail!(
+                        "{} holds the keypair of {name} ({id}), committed as {}'s mainnet id: \
+                         that is mainnet's program, never a fork's. Use throwaway keypairs. \
+                         Nothing was sent.",
+                        dir.display(),
+                        program.name
+                    );
+                }
+            }
+        }
+        Mode::Send if under_fork => bail!(
+            "{} is under .shonin/mainnet-fork, where a rehearsal's throwaway keypairs are: a real \
+             send takes the owner's. Nothing was sent.",
+            dir.display()
+        ),
+        Mode::Send => {
+            for (name, id) in ids {
+                let file = file_of(name);
+                let real = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                if made.contains(id) || mainnet_guard::is_under(&real, fork_root) {
+                    bail!(
+                        "{} ({id}) is one of a fork rehearsal's throwaways, however it is \
+                         reached: a real send takes the owner's. Nothing was sent.",
+                        file.display()
+                    );
+                }
+            }
+        }
+        Mode::DryRun => {}
+    }
+    Ok(())
+}
+
+/// This repository's own `contracts/solana/programs`, the one place each
+/// program's `mainnet-id` is committed: every mode reads it, and a real
+/// send writes it, there alone.
+pub fn check_sources(sources: &Path) -> Result<()> {
+    if !same_place(sources, &committed_sources()) {
+        bail!(
+            "each program's mainnet-id is read from, and written to, this repository's \
+             contracts/solana/programs alone, not {}. Nothing was sent.",
+            sources.display()
+        );
+    }
+    Ok(())
+}
+
 /// A program's `mainnet-id` file, beside its `Cargo.toml` under `sources`
 /// (`contracts/solana/programs`).
 pub fn committed_file(sources: &Path, program: &str) -> PathBuf {
@@ -368,9 +549,45 @@ pub fn ids(
     out: &Path,
 ) -> Result<()> {
     let decided = decide(flags)?;
-    let ids: Vec<(&str, Pubkey)> = match (decided.mode, program_keypairs) {
+    check_sources(sources)?;
+    ids_from(
+        decided.mode,
+        program_keypairs,
+        sources,
+        stand_ins,
+        out,
+        &mainnet_guard::fork_root(),
+    )
+}
+
+/// [`ids`] in `mode`, with the committed ids read from `sources` and a
+/// fork's throwaways under `fork_root`. On a fork the throwaways are made
+/// here, in the directory named or else the default one, never taken from
+/// anywhere else.
+fn ids_from(
+    mode: Mode,
+    program_keypairs: Option<&Path>,
+    sources: &Path,
+    stand_ins: &Path,
+    out: &Path,
+    fork_root: &Path,
+) -> Result<()> {
+    let default_throwaways = throwaway_keypairs_dir(fork_root);
+    let program_keypairs = match (mode, program_keypairs) {
+        (Mode::Fork, given) => {
+            let dir = given.unwrap_or(&default_throwaways);
+            make_throwaway_keypairs(dir, fork_root)?;
+            println!("(the fork's throwaway program keypairs: {})", dir.display());
+            Some(dir)
+        }
+        (_, given) => given,
+    };
+    let ids: Vec<(&str, Pubkey)> = match (mode, program_keypairs) {
         (_, Some(dir)) => {
             let pairs = read_program_keypairs(dir)?;
+            let found: Vec<(&str, Pubkey)> =
+                pairs.iter().map(|(name, id, _)| (*name, *id)).collect();
+            check_program_keypairs(mode, dir, &found, sources, fork_root)?;
             for (name, id, _) in &pairs {
                 let text = std::fs::read_to_string(committed_file(sources, name)).ok();
                 if agrees_with_committed(name, id, text.as_deref())? {
@@ -419,7 +636,7 @@ pub fn ids(
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(out, ids_list(&ids)).with_context(|| format!("writing {}", out.display()))?;
+    mainnet_guard::write_file(out, ids_list(&ids))?;
     Ok(())
 }
 
@@ -553,6 +770,263 @@ pub fn check_build(name: &str, id: &Pubkey, code: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// --- The verifiable build ------------------------------------------------------
+
+/// The image the programs' verifiable build runs in (`solana-verify build`),
+/// pinned by digest: `SOLANA_VERIFY_IMAGE` in `taskfiles/config.yml`, which a
+/// test holds to this.
+pub const VERIFIABLE_IMAGE: &str = "solanafoundation/solana-verifiable-build@sha256:1a0ea3dd15017e57e9b17d67267e7d2d7ab4f083499f3f29c847ddd54f01db31";
+
+/// The record the verifiable build writes beside the programs it built:
+/// what it was built from, in which image, and each program's SHA-256.
+pub const VERIFIABLE_RECORD: &str = "verifiable-build";
+
+/// What the source of a verifiable build was.
+pub const WORKING_TREE: &str = "working-tree";
+
+/// A verifiable build's record, as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiableBuild {
+    /// The commit exported, or [`WORKING_TREE`] for a rehearsal of
+    /// uncommitted changes.
+    pub source: String,
+    pub image: String,
+    /// Each program's SHA-256, hex, by library name.
+    pub hashes: BTreeMap<String, String>,
+}
+
+/// What a build must have been made from to be deployed or read back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildSource {
+    /// A rehearsal or a dry run: a commit or the working tree.
+    Any,
+    /// A read-back of mainnet: a commit (the mainnet ids are committed
+    /// after it, so not necessarily the one checked out now).
+    ACommit,
+    /// A real send: the commit checked out, with nothing uncommitted under
+    /// the programs' inputs.
+    Head { head: String, clean: bool },
+}
+
+fn is_commit(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read a verifiable build's record: `source <commit|working-tree>`,
+/// `image <reference>`, then `<library name> <sha256>` a program.
+pub fn parse_verifiable_record(text: &str) -> Result<VerifiableBuild> {
+    let mut source = None;
+    let mut image = None;
+    let mut hashes = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(char::is_whitespace)
+            .map(|(key, value)| (key, value.trim()))
+            .ok_or_else(|| {
+                anyhow!("the verifiable build's record has a line without a value: {line}")
+            })?;
+        match key {
+            "source" => source = Some(value.to_string()),
+            "image" => image = Some(value.to_string()),
+            name => {
+                hashes.insert(name.to_string(), value.to_lowercase());
+            }
+        }
+    }
+    Ok(VerifiableBuild {
+        source: source.ok_or_else(|| anyhow!("the verifiable build's record names no source"))?,
+        image: image.ok_or_else(|| anyhow!("the verifiable build's record names no image"))?,
+        hashes,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex(&sha2::Sha256::digest(bytes))
+}
+
+/// Refuse programs in `programs_dir` that aren't the verifiable build, before
+/// anything is sent: the build's record must be there, made in the pinned
+/// image, list the eight programs and nothing else, and each `<name>.so` must
+/// be the file it recorded (a host `cargo build-sbf` put in its place is
+/// refused: no verifier can reproduce it). `source` says what it must have
+/// been built from.
+/// Where a deploy holds the programs it checked.
+pub const HELD_PROGRAMS: &str = "checked-programs";
+
+/// Copy each program of the verifiable build `build` from `programs_dir`
+/// into a directory of the deploy's own under `state_dir`, made afresh
+/// (readable by its owner alone), each file created here read-only, and
+/// only once its bytes are read and hashed as the record's: what is planned
+/// and deployed from then on is these bytes, whatever happens to the build
+/// directory meanwhile. Returns the directory.
+pub fn hold_checked_build(
+    programs_dir: &Path,
+    build: &VerifiableBuild,
+    state_dir: &Path,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    let held = state_dir.join(HELD_PROGRAMS);
+    if std::fs::symlink_metadata(&held).is_ok() {
+        std::fs::remove_dir_all(&held).with_context(|| format!("emptying {}", held.display()))?;
+    }
+    std::fs::create_dir_all(state_dir)?;
+    let mut make = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        make.mode(0o700);
+    }
+    make.create(&held)
+        .with_context(|| format!("making {}", held.display()))?;
+    for program in SHIPPING {
+        let name = format!("{}.so", program.name);
+        let code = std::fs::read(programs_dir.join(&name))
+            .with_context(|| format!("reading {}", programs_dir.join(&name).display()))?;
+        if build.hashes.get(program.name).map(String::as_str) != Some(sha256_hex(&code).as_str()) {
+            bail!(
+                "{} changed after it was checked: it is no longer the file the verifiable build \
+                 made. Nothing was sent.",
+                programs_dir.join(&name).display()
+            );
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o400);
+        }
+        options
+            .open(held.join(&name))
+            .and_then(|mut out| out.write_all(&code))
+            .with_context(|| format!("holding {}", held.join(&name).display()))?;
+    }
+    Ok(held)
+}
+
+pub fn check_verifiable_build(
+    programs_dir: &Path,
+    source: &BuildSource,
+) -> Result<VerifiableBuild> {
+    let record = programs_dir.join(VERIFIABLE_RECORD);
+    let text = std::fs::read_to_string(&record).map_err(|_| {
+        anyhow!(
+            "{} is missing: the programs are not the verifiable build (solana-verify build in the \
+             pinned image), which is the only build mainnet is given. Build them with the task. \
+             Nothing was sent.",
+            record.display()
+        )
+    })?;
+    let build = parse_verifiable_record(&text)?;
+    if build.image != VERIFIABLE_IMAGE {
+        bail!(
+            "the programs were built in {}, not the pinned image {VERIFIABLE_IMAGE}: a verifier \
+             rebuilds in the pinned one. Nothing was sent.",
+            build.image
+        );
+    }
+    let mut names: Vec<&str> = build.hashes.keys().map(String::as_str).collect();
+    let mut expected: Vec<&str> = SHIPPING.iter().map(|program| program.name).collect();
+    names.sort_unstable();
+    expected.sort_unstable();
+    if names != expected {
+        bail!(
+            "the verifiable build records {}, not the eight programs that ship. Nothing was sent.",
+            names.join(", ")
+        );
+    }
+    for program in SHIPPING {
+        let so = programs_dir.join(format!("{}.so", program.name));
+        let code = std::fs::read(&so)
+            .with_context(|| format!("{} is missing: build the programs first", so.display()))?;
+        if sha256_hex(&code) != build.hashes[program.name] {
+            bail!(
+                "{} is not the file the verifiable build made (its SHA-256 differs from the \
+                 record's): only the verifiable build is deployed. Nothing was sent.",
+                so.display()
+            );
+        }
+    }
+    match source {
+        BuildSource::Any => {}
+        BuildSource::ACommit if !is_commit(&build.source) => bail!(
+            "the programs were built from {}, not a commit: what mainnet runs is a commit's \
+             verifiable build.",
+            build.source
+        ),
+        BuildSource::ACommit => {}
+        BuildSource::Head { head, clean } => {
+            if !is_commit(&build.source) {
+                bail!(
+                    "the programs were built from {}, not a commit: a real send deploys a \
+                     commit's verifiable build alone. Commit the changes and build again. \
+                     Nothing was sent.",
+                    build.source
+                );
+            }
+            if !build.source.eq_ignore_ascii_case(head) {
+                bail!(
+                    "the programs were built from commit {}, and {head} is checked out: build \
+                     again from the commit being deployed. Nothing was sent.",
+                    build.source
+                );
+            }
+            if !clean {
+                bail!(
+                    "contracts/solana, packages, Cargo.toml or Cargo.lock has uncommitted \
+                     changes: a real send deploys a commit's verifiable build alone. Nothing was \
+                     sent."
+                );
+            }
+        }
+    }
+    Ok(build)
+}
+
+/// This repository's checked-out commit, and whether anything the programs
+/// are built from is uncommitted.
+fn repository_state() -> Result<BuildSource> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let git = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .context("running git")?;
+        if !out.status.success() {
+            bail!("git {} failed", args.join(" "));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let head = git(&["rev-parse", "HEAD"])?;
+    let changes = git(&[
+        "status",
+        "--porcelain",
+        "--",
+        "contracts/solana",
+        "packages",
+        "Cargo.toml",
+        "Cargo.lock",
+    ])?;
+    Ok(BuildSource::Head {
+        head,
+        clean: changes.is_empty(),
+    })
+}
+
+/// What a mode requires the deployed build to have been made from.
+fn build_source_for(mode: Mode) -> Result<BuildSource> {
+    match mode {
+        Mode::Send => repository_state(),
+        Mode::Fork | Mode::DryRun => Ok(BuildSource::Any),
+    }
 }
 
 /// Read each program's build and what the cluster holds at its id, with its
@@ -836,8 +1310,7 @@ fn write_admin_steps(dir: &Path, admin: &Pubkey, steps: &[AdminStep]) -> Result<
         admin: admin.to_string(),
         steps: steps.to_vec(),
     };
-    std::fs::write(&file, serde_json::to_string_pretty(&written)?)
-        .with_context(|| format!("writing {}", file.display()))?;
+    mainnet_guard::write_file(&file, serde_json::to_string_pretty(&written)?)?;
     Ok(file)
 }
 
@@ -846,6 +1319,13 @@ fn write_admin_steps(dir: &Path, admin: &Pubkey, steps: &[AdminStep]) -> Result<
 /// Connect to the cluster for `mode`: its endpoints suit the mode (a fork's
 /// on this machine, a real send's not), its genesis is mainnet-beta's, and
 /// the node is Surfpool on a fork and not on a real send.
+/// Check the cluster a read-only command reads, as [`connect`] checks it:
+/// every endpoint suits the mode (on a fork local and Surfpool, otherwise
+/// public and no fork) and serves mainnet-beta's genesis.
+pub async fn check_cluster(mode: Mode, key: &ChainKey, config: &ChainConfig) -> Result<()> {
+    connect(mode, key, config).await.map(|_| ())
+}
+
 async fn connect(mode: Mode, key: &ChainKey, config: &ChainConfig) -> Result<SolanaClient> {
     if key.to_string() != CHAIN_KEY {
         bail!("the mainnet Solana commands run on {CHAIN_KEY}, not {key}");
@@ -1634,18 +2114,12 @@ fn same_place(a: &Path, b: &Path) -> bool {
 }
 
 /// Refuse directories that don't suit the mode, before anything is sent or
-/// written: a real send writes each `mainnet-id` under this repository's
-/// own programs alone; the admin's steps of a fork never go where the
+/// written: every mode reads each `mainnet-id` from this repository's own
+/// programs alone, where a real send writes it; the admin's steps of a fork never go where the
 /// hardware key's are kept (`.shonin/mainnet/admin-steps`) or under the
 /// committed addresses, and the hardware key's never come from the fork's.
 pub fn check_dirs(mode: Mode, sources: &Path, admin_steps_dir: &Path) -> Result<()> {
-    if mode == Mode::Send && !same_place(sources, &committed_sources()) {
-        bail!(
-            "a real mainnet send writes each mainnet-id under this repository's \
-             contracts/solana/programs, not {}. Nothing was sent.",
-            sources.display()
-        );
-    }
+    check_sources(sources)?;
     mainnet_guard::check_admin_steps_dir(mode, admin_steps_dir)
 }
 
@@ -1661,8 +2135,26 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
     // first.
     mainnet_guard::check_config_endpoints(mode, inputs.config)?;
     check_dirs(mode, inputs.sources, inputs.admin_steps_dir)?;
-    let keypairs = match (&inputs.program_keypairs, mode) {
-        (Some(dir), _) => Some(read_program_keypairs(dir)?),
+    // A fork takes the throwaways the ids step made, in the directory named
+    // or the default one.
+    let program_keypairs = match (&inputs.program_keypairs, mode) {
+        (None, Mode::Fork) => Some(throwaway_keypairs_dir(&mainnet_guard::fork_root())),
+        (given, _) => given.clone(),
+    };
+    let keypairs = match (&program_keypairs, mode) {
+        (Some(dir), _) => {
+            let pairs = read_program_keypairs(dir)?;
+            let found: Vec<(&str, Pubkey)> =
+                pairs.iter().map(|(name, id, _)| (*name, *id)).collect();
+            check_program_keypairs(
+                mode,
+                dir,
+                &found,
+                inputs.sources,
+                &mainnet_guard::fork_root(),
+            )?;
+            Some(pairs)
+        }
         (None, Mode::DryRun) => None,
         (None, _) => bail!(
             "MAINNET_PROGRAM_KEYPAIRS=<dir> is required to send: the owner's keypair for each \
@@ -1730,11 +2222,29 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
         }
     }
 
+    // Only the verifiable build is deployed: the one anyone can rebuild from
+    // the commit and compare with what mainnet runs.
+    let build = check_verifiable_build(inputs.programs_dir, &build_source_for(mode)?)?;
+    // What is deployed is the bytes checked, held where nothing else writes:
+    // the build directory may change between the check and the deploy.
+    let programs_dir = hold_checked_build(inputs.programs_dir, &build, inputs.state_dir)?;
+    let programs_dir = programs_dir.as_path();
+    if build.source == WORKING_TREE {
+        println!(
+            "The programs are the verifiable build of the working tree, with uncommitted \
+             changes: a rehearsal's. A real send deploys a commit's alone."
+        );
+    } else {
+        println!(
+            "The programs are the verifiable build of commit {} ({}).",
+            build.source, build.image
+        );
+    }
     let client = connect(mode, inputs.key, inputs.config).await?;
     for line in check_outside(&client).await? {
         tracing::info!("{line}");
     }
-    let planned = plan(&client, &ids, inputs.programs_dir).await?;
+    let planned = plan(&client, &ids, programs_dir).await?;
     let admin_steps = planned_admin_steps(admin, settings.project);
     print_plan(
         &planned,
@@ -1929,8 +2439,7 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
             let file = committed_file(inputs.sources, p.program.name);
             let held = std::fs::read_to_string(&file).ok();
             if !agrees_with_committed(p.program.name, &p.id, held.as_deref())? {
-                std::fs::write(&file, format!("{}\n", p.id))
-                    .with_context(|| format!("writing {}", file.display()))?;
+                mainnet_guard::write_file(&file, format!("{}\n", p.id))?;
                 println!("wrote {}: commit it", file.display());
             }
         }
@@ -2087,8 +2596,7 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
     });
     std::fs::create_dir_all(&deployments_dir)?;
     let file = deployments_dir.join(format!("{}.json", inputs.key.file_stem()));
-    std::fs::write(&file, serde_json::to_string_pretty(&written)?)
-        .with_context(|| format!("writing {}", file.display()))?;
+    mainnet_guard::write_file(&file, serde_json::to_string_pretty(&written)?)?;
     println!("The deployment is written to {}", file.display());
 
     let steps: Vec<AdminStep> =
@@ -2157,6 +2665,7 @@ fn roles(deployer: &Pubkey, admin: &Pubkey) -> SolanaRoles {
 /// ADMIN), and with `warp` the fork's clock moved past the timelock; on
 /// mainnet never sent: each step still to do is printed and written for the
 /// hardware key.
+#[allow(clippy::too_many_arguments)]
 pub async fn admin(
     key: &ChainKey,
     config: &ChainConfig,
@@ -2164,6 +2673,7 @@ pub async fn admin(
     admin_keyfile: Option<&Path>,
     admin_steps_dir: &Path,
     project: Option<&str>,
+    image: Option<([u8; 32], registry::state::ImageKind)>,
     warp: bool,
 ) -> Result<()> {
     let decided = decide(flags)?;
@@ -2181,7 +2691,40 @@ pub async fn admin(
     }
     check_dirs(decided.mode, &committed_sources(), admin_steps_dir)?;
     let client = connect(decided.mode, key, config).await?;
-    let steps = admin_instructions(&client, decided.admin, project_id, project).await?;
+    let mut steps = admin_instructions(&client, decided.admin, project_id, project).await?;
+    if let Some((digest, kind)) = image {
+        // A real image digest, given: proposed once, as one kind, and a
+        // revoked one never again.
+        let held: Option<registry::state::ImageRecord> =
+            client.load(&registry::read::image_address(&digest)).await?;
+        let shown = hex(&digest);
+        match held.filter(|image| image.proposed) {
+            Some(image) if image.kind != kind => bail!(
+                "the image {shown} is already proposed as another kind ({:?}); an image is \
+                 proposed once. Nothing was sent.",
+                image.kind
+            ),
+            Some(image) if image.revoked => bail!(
+                "the image {shown} was revoked; a revoked image can't be proposed again. Nothing \
+                 was sent."
+            ),
+            Some(_) => println!("The image {shown} is proposed already."),
+            None => {
+                let ix = platform(decided.admin).ix_propose_image(digest, kind);
+                steps.push((
+                    AdminStep::of(
+                        "propose-image",
+                        format!(
+                            "registry.propose_image: the {kind:?} image {shown}; it can be blessed \
+                             once the timelock has passed"
+                        ),
+                        &ix,
+                    ),
+                    ix,
+                ));
+            }
+        }
+    }
     let file = write_admin_steps(
         admin_steps_dir,
         &decided.admin,
@@ -2284,6 +2827,20 @@ pub async fn verify(
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let deployments = SolanaDeployments::from_json(&text)?;
+    // What each program is compared with byte for byte is the verifiable
+    // build the deploy deployed: on mainnet a commit's.
+    let build = check_verifiable_build(
+        programs_dir,
+        &if mode == Mode::Fork {
+            BuildSource::Any
+        } else {
+            BuildSource::ACommit
+        },
+    )?;
+    println!(
+        "Compared with the verifiable build of {} ({}).",
+        build.source, build.image
+    );
     let client = connect(mode, key, config).await?;
     let ids = compiled_ids();
     let now = client.now().await?;
@@ -2432,6 +2989,27 @@ pub async fn verify(
         roles.admin == admin.to_string() && roles.platform == admin.to_string(),
         roles.admin.clone(),
     );
+    // The keeper's hot key, once recorded (`task contracts:solana:record-
+    // keeper`): one a key can sign for, holding no other role.
+    if roles.keeper.is_empty() || roles.keeper == Pubkey::default().to_string() {
+        check(
+            &mut checks,
+            "the keeper: not recorded yet (task contracts:solana:record-keeper)",
+            true,
+            "",
+        );
+    } else {
+        let signs = roles
+            .keeper
+            .parse::<Pubkey>()
+            .is_ok_and(|keeper| keeper.is_on_curve());
+        check(
+            &mut checks,
+            "the keeper is a key that signs and holds no other role",
+            signs && ![&roles.admin, &roles.platform, &roles.deployer].contains(&&roles.keeper),
+            roles.keeper.clone(),
+        );
+    }
 
     let failed = checks.iter().filter(|c| !c.ok).count();
     for c in &checks {
@@ -2572,6 +3150,356 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A programs directory holding the eight programs (stand-in bytes) and
+    /// the verifiable build's record of them, from `source`.
+    fn verifiable_dir(name: &str, source: &str) -> PathBuf {
+        let dir = scratch(name);
+        let mut record = format!("source {source}\nimage {VERIFIABLE_IMAGE}\n");
+        for program in SHIPPING {
+            let code = format!("the verifiable build of {}", program.name);
+            std::fs::write(dir.join(format!("{}.so", program.name)), &code).unwrap();
+            record.push_str(&format!(
+                "{} {}\n",
+                program.name,
+                sha256_hex(code.as_bytes())
+            ));
+        }
+        std::fs::write(dir.join(VERIFIABLE_RECORD), record).unwrap();
+        dir
+    }
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn the_deploy_sends_the_bytes_it_checked_whatever_the_build_directory_holds_after() {
+        let dir = verifiable_dir("held", COMMIT);
+        let build = check_verifiable_build(&dir, &BuildSource::Any).unwrap();
+        let state = dir.join("state");
+        let held = hold_checked_build(&dir, &build, &state).unwrap();
+        assert_ne!(held, dir);
+        // The build directory changes after the check: what is held doesn't.
+        let checked = std::fs::read(dir.join("shonin_vault.so")).unwrap();
+        std::fs::write(dir.join("shonin_vault.so"), b"swapped after the check").unwrap();
+        assert_eq!(
+            std::fs::read(held.join("shonin_vault.so")).unwrap(),
+            checked
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&held), 0o700);
+            assert_eq!(mode(&held.join("shonin_vault.so")), 0o400);
+        }
+        // Holding it again from the changed directory is refused.
+        let error = hold_checked_build(&dir, &build, &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed after it was checked"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_the_verifiable_build_is_deployed_and_a_host_build_in_its_place_is_refused() {
+        let dir = verifiable_dir("verifiable", COMMIT);
+        let head = BuildSource::Head {
+            head: COMMIT.to_string(),
+            clean: true,
+        };
+        let build = check_verifiable_build(&dir, &head).unwrap();
+        assert_eq!(build.source, COMMIT);
+        assert_eq!(build.hashes.len(), 8);
+
+        // A host build put in one program's place: its bytes aren't the
+        // record's.
+        std::fs::write(dir.join("shonin_vault.so"), b"a host cargo build-sbf").unwrap();
+        for source in [BuildSource::Any, BuildSource::ACommit, head.clone()] {
+            let error = check_verifiable_build(&dir, &source)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shonin_vault.so is not the file"), "{error}");
+        }
+
+        // No record at all: programs from anywhere but the verifiable build.
+        let bare = verifiable_dir("verifiable-bare", COMMIT);
+        std::fs::remove_file(bare.join(VERIFIABLE_RECORD)).unwrap();
+        let error = check_verifiable_build(&bare, &BuildSource::Any)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the verifiable build"), "{error}");
+
+        // Built in another image.
+        let other = verifiable_dir("verifiable-image", COMMIT);
+        let text = std::fs::read_to_string(other.join(VERIFIABLE_RECORD))
+            .unwrap()
+            .replace(
+                VERIFIABLE_IMAGE,
+                "solanafoundation/solana-verifiable-build:latest",
+            );
+        std::fs::write(other.join(VERIFIABLE_RECORD), text).unwrap();
+        let error = check_verifiable_build(&other, &BuildSource::Any)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the pinned image"), "{error}");
+
+        // A program left out of the record.
+        let short = verifiable_dir("verifiable-short", COMMIT);
+        let text: String = std::fs::read_to_string(short.join(VERIFIABLE_RECORD))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("shonin_station "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(short.join(VERIFIABLE_RECORD), text).unwrap();
+        let error = check_verifiable_build(&short, &BuildSource::Any)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the eight programs"), "{error}");
+        for dir in [dir, bare, other, short] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_real_send_deploys_the_checked_out_commit_s_verifiable_build_alone() {
+        let tree = verifiable_dir("verifiable-tree", WORKING_TREE);
+        // A rehearsal may build the working tree; a send and a read-back of
+        // mainnet may not.
+        assert!(check_verifiable_build(&tree, &BuildSource::Any).is_ok());
+        for source in [
+            BuildSource::ACommit,
+            BuildSource::Head {
+                head: COMMIT.to_string(),
+                clean: true,
+            },
+        ] {
+            let error = check_verifiable_build(&tree, &source)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a commit"), "{error}");
+        }
+        let built = verifiable_dir("verifiable-commit", COMMIT);
+        let other_head = BuildSource::Head {
+            head: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            clean: true,
+        };
+        let error = check_verifiable_build(&built, &other_head)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is checked out"), "{error}");
+        let dirty = BuildSource::Head {
+            head: COMMIT.to_string(),
+            clean: false,
+        };
+        let error = check_verifiable_build(&built, &dirty)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uncommitted"), "{error}");
+        // The read-back of mainnet takes the commit's build, whatever is
+        // checked out since (the mainnet ids are committed after it).
+        assert!(check_verifiable_build(&built, &BuildSource::ACommit).is_ok());
+        // A send's requirement comes from the repository; a rehearsal's
+        // takes any source.
+        assert!(matches!(
+            build_source_for(Mode::Send).unwrap(),
+            BuildSource::Head { .. }
+        ));
+        assert_eq!(build_source_for(Mode::Fork).unwrap(), BuildSource::Any);
+        let _ = std::fs::remove_dir_all(tree);
+        let _ = std::fs::remove_dir_all(built);
+    }
+
+    #[test]
+    fn the_pinned_image_is_the_one_the_tasks_build_in() {
+        let config = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../taskfiles/config.yml"),
+        )
+        .unwrap();
+        assert!(
+            config.contains(&format!("SOLANA_VERIFY_IMAGE: \"{VERIFIABLE_IMAGE}\"")),
+            "taskfiles/config.yml's SOLANA_VERIFY_IMAGE is not {VERIFIABLE_IMAGE}"
+        );
+    }
+
+    fn keypairs_in(dir: &Path) -> Vec<(&'static str, Pubkey)> {
+        std::fs::create_dir_all(dir).unwrap();
+        SHIPPING
+            .iter()
+            .map(|program| {
+                let keypair = Keypair::new();
+                keys::write_keypair(
+                    &keypair,
+                    &dir.join(format!("{}-keypair.json", program.name)),
+                )
+                .unwrap();
+                (program.name, keypair.pubkey())
+            })
+            .collect()
+    }
+
+    /// The ids of the keypairs in `dir`, as the commands read them.
+    fn ids_of(dir: &Path) -> Vec<(&'static str, Pubkey)> {
+        read_program_keypairs(dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, id, _)| (name, id))
+            .collect()
+    }
+
+    #[test]
+    fn a_fork_takes_only_the_throwaways_the_tool_made_and_a_send_never_takes_them() {
+        let root = scratch("keypairs");
+        let fork_root = root.join(".shonin/mainnet-fork");
+        let sources = root.join("programs");
+        std::fs::create_dir_all(&sources).unwrap();
+        let throwaway = throwaway_keypairs_dir(&fork_root);
+        make_throwaway_keypairs(&throwaway, &fork_root).unwrap();
+        let throwaway_ids = ids_of(&throwaway);
+        let owners = root.join("owner-keys");
+        let owner_ids = keypairs_in(&owners);
+
+        // A fork takes the tool's throwaways, however their directory is
+        // spelled, and making them again changes none.
+        check_program_keypairs(Mode::Fork, &throwaway, &throwaway_ids, &sources, &fork_root)
+            .unwrap();
+        let spelled =
+            root.join("programs/../.shonin/mainnet-fork/solana/throwaway-program-keypairs");
+        check_program_keypairs(Mode::Fork, &spelled, &throwaway_ids, &sources, &fork_root).unwrap();
+        make_throwaway_keypairs(&throwaway, &fork_root).unwrap();
+        assert_eq!(ids_of(&throwaway), throwaway_ids);
+        // A directory anywhere else is the owner's, and refused on a fork;
+        // the tool never makes its throwaways there either.
+        let error = check_program_keypairs(Mode::Fork, &owners, &owner_ids, &sources, &fork_root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never come onto a fork"), "{error}");
+        assert!(make_throwaway_keypairs(&root.join("elsewhere"), &fork_root).is_err());
+        // Under the fork's directory, the owner's keypairs are refused
+        // however they got there: linked in, hard-linked in, or copied in.
+        for (how, place) in [("linked", 0), ("hard-linked", 1), ("copied", 2)] {
+            let dir = fork_root.join(format!("solana/{how}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for program in SHIPPING {
+                let name = format!("{}-keypair.json", program.name);
+                let (from, to) = (owners.join(&name), dir.join(&name));
+                match place {
+                    0 => std::os::unix::fs::symlink(&from, &to).unwrap(),
+                    1 => std::fs::hard_link(&from, &to).unwrap(),
+                    _ => {
+                        std::fs::copy(&from, &to).unwrap();
+                    }
+                }
+            }
+            // Making the throwaways leaves what is there as it is.
+            make_throwaway_keypairs(&dir, &fork_root).unwrap();
+            assert_eq!(ids_of(&dir), owner_ids, "{how}");
+            let error = check_program_keypairs(Mode::Fork, &dir, &owner_ids, &sources, &fork_root)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("never come onto a fork"), "{how}: {error}");
+        }
+        // Even one of the tool's throwaways is refused once its id is
+        // committed as a mainnet id: that is mainnet's own program.
+        let held = sources.join("shonin-vault");
+        std::fs::create_dir_all(&held).unwrap();
+        let vault = throwaway_ids
+            .iter()
+            .find(|(name, _)| *name == "shonin_vault")
+            .unwrap()
+            .1;
+        std::fs::write(held.join("mainnet-id"), format!("{vault}\n")).unwrap();
+        let error =
+            check_program_keypairs(Mode::Fork, &throwaway, &throwaway_ids, &sources, &fork_root)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("committed as shonin_vault's mainnet id"),
+            "{error}"
+        );
+        std::fs::remove_file(held.join("mainnet-id")).unwrap();
+        // A real send takes the owner's and never the fork's throwaways:
+        // not their directory, not their files linked from elsewhere, and
+        // not a copy of them.
+        check_program_keypairs(Mode::Send, &owners, &owner_ids, &sources, &fork_root).unwrap();
+        let error =
+            check_program_keypairs(Mode::Send, &throwaway, &throwaway_ids, &sources, &fork_root)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("a real send takes the owner's"), "{error}");
+        for (how, place) in [("linked", 0), ("copied", 2)] {
+            let dir = root.join(format!("owner-{how}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for program in SHIPPING {
+                let name = format!("{}-keypair.json", program.name);
+                let (from, to) = (throwaway.join(&name), dir.join(&name));
+                if place == 0 {
+                    std::os::unix::fs::symlink(&from, &to).unwrap();
+                } else {
+                    std::fs::copy(&from, &to).unwrap();
+                }
+            }
+            let error =
+                check_program_keypairs(Mode::Send, &dir, &throwaway_ids, &sources, &fork_root)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("a real send takes the owner's"),
+                "{how}: {error}"
+            );
+        }
+        check_program_keypairs(Mode::DryRun, &owners, &owner_ids, &sources, &fork_root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_dry_run_after_the_deploy_builds_with_the_committed_ids() {
+        let root = scratch("committed-ids");
+        let sources = root.join("programs");
+        let mut committed = Vec::new();
+        for program in SHIPPING {
+            let id = Keypair::new().pubkey();
+            let held = sources.join(program.name.replace('_', "-"));
+            std::fs::create_dir_all(&held).unwrap();
+            std::fs::write(held.join("mainnet-id"), format!("{id}\n")).unwrap();
+            committed.push((program.name, id));
+        }
+        let out = root.join("ids");
+        ids_from(
+            Mode::DryRun,
+            None,
+            &sources,
+            &root.join("stand-ins"),
+            &out,
+            &root.join(".shonin/mainnet-fork"),
+        )
+        .unwrap();
+        let listed = std::fs::read_to_string(&out).unwrap();
+        for (name, id) in committed {
+            assert!(
+                listed.contains(&format!("{name} {id}")),
+                "the dry run listed a stand-in for {name} beside its committed id {id}:\n{listed}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_mode_reads_the_committed_ids_from_this_repository_s_programs_alone() {
+        check_sources(&committed_sources()).unwrap();
+        let spelled = committed_sources().join("../programs");
+        check_sources(&spelled).unwrap();
+        let elsewhere = scratch("sources");
+        assert!(check_sources(&elsewhere).is_err());
+        assert!(check_sources(&elsewhere.join("missing")).is_err());
+        for mode in [Mode::DryRun, Mode::Fork, Mode::Send] {
+            assert!(
+                check_dirs(mode, &elsewhere, &elsewhere.join("steps")).is_err(),
+                "{mode:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(elsewhere);
+    }
+
     #[test]
     fn a_different_committed_mainnet_id_is_refused_and_the_same_one_is_kept() {
         let id = Pubkey::new_unique();
@@ -2598,15 +3526,17 @@ mod tests {
             .unwrap();
             std::fs::create_dir_all(sources.join(program.name.replace('_', "-"))).unwrap();
         }
-        let mut given = flags();
-        given.on_fork = true;
+        // A dry run with the owner's keypairs (a fork takes throwaways from
+        // under .shonin/mainnet-fork alone).
         let out = dir.join("ids");
-        ids(
-            &given,
+        let fork_root = dir.join(".shonin/mainnet-fork");
+        ids_from(
+            Mode::DryRun,
             Some(&keypairs),
             &sources,
             &dir.join("stand-ins"),
             &out,
+            &fork_root,
         )
         .unwrap();
         let listed = std::fs::read_to_string(&out).unwrap();
@@ -2622,17 +3552,28 @@ mod tests {
         )
         .unwrap();
         assert!(
-            ids(
-                &given,
+            ids_from(
+                Mode::DryRun,
                 Some(&keypairs),
                 &sources,
                 &dir.join("stand-ins"),
-                &out
+                &out,
+                &fork_root,
             )
             .is_err()
         );
-        // To send, the keypairs must be given.
-        assert!(ids(&given, None, &sources, &dir.join("stand-ins"), &out).is_err());
+        // To send, the keypairs must be given (a fork makes its own).
+        assert!(
+            ids_from(
+                Mode::Send,
+                None,
+                &sources,
+                &dir.join("stand-ins"),
+                &out,
+                &fork_root
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3007,7 +3948,10 @@ mod tests {
         let steps = dir.join("admin-steps");
         assert!(check_dirs(Mode::Send, &committed_sources(), &steps).is_ok());
         assert!(check_dirs(Mode::Send, &dir, &steps).is_err());
-        assert!(check_dirs(Mode::Fork, &dir, &steps).is_ok());
+        assert!(check_dirs(Mode::Fork, &dir, &steps).is_err());
+        assert!(check_dirs(Mode::Fork, &committed_sources(), &steps).is_ok());
+        let dir_ = dir.clone();
+        let dir = committed_sources();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         // A fork's admin steps never where the hardware key's are kept, by
         // any spelling, and the hardware key's never from the fork's.
@@ -3031,6 +3975,6 @@ mod tests {
             .is_err()
         );
         assert!(check_dirs(Mode::DryRun, &dir, &real).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_);
     }
 }

@@ -4092,6 +4092,7 @@ fn refused_as_too_wide(error: &str) -> bool {
         "exceeds the limit",
         "response size",
         "query returned more than",
+        "matched by query exceeds limit",
         "block span",
         "blocks are not supported",
     ]
@@ -4470,6 +4471,16 @@ mod tests {
         assert!(!refused_as_invalid_range(
             "rate limited: invalid block range"
         ));
+    }
+
+    #[test]
+    fn a_range_matching_more_logs_than_the_endpoint_serves_is_refused_for_its_width() {
+        let many = "server returned an error response: error code -32000: logs matched by query exceeds limit of 10000";
+        assert!(refused_as_too_wide(many));
+        assert!(!refused_as_not_there_yet(many));
+        assert!(!refused_as_invalid_range(many));
+        assert!(!is_rate_limit(-32000, many));
+        assert!(!is_missing_history(-32000, many));
     }
 
     #[test]
