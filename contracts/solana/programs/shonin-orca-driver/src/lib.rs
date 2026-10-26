@@ -233,10 +233,12 @@ pub mod shonin_orca_driver {
         answer(&logic::allowlist())
     }
 
-    /// Orca's terms of use exclude anyone on a sanctions list, and name no
-    /// country; the vault's baseline still applies.
+    /// Who Orca's terms of use and its list of blocked regions exclude:
+    /// sanctioned persons, and people in the regions it blocks, Crimea,
+    /// Sevastopol, Donetsk and Luhansk by their ISO 3166-2 codes and Congo as
+    /// both of its countries. The vault's baseline still applies.
     pub fn restricted(_ctx: Context<Empty>) -> Result<()> {
-        answer(&vec![code(b"SANCTIONED")])
+        answer(&restricted_codes())
     }
 
     pub fn describe(_ctx: Context<Empty>) -> Result<()> {
@@ -284,6 +286,46 @@ pub mod shonin_orca_driver {
     ) -> Result<()> {
         answer(&Plan::default())
     }
+}
+
+/// What the venue's terms exclude, sorted.
+const RESTRICTED: [&[u8]; 31] = [
+    b"AF",
+    b"BA",
+    b"BI",
+    b"BY",
+    b"CD",
+    b"CF",
+    b"CG",
+    b"CU",
+    b"GN",
+    b"GW",
+    b"HT",
+    b"IQ",
+    b"IR",
+    b"KP",
+    b"LB",
+    b"LY",
+    b"ML",
+    b"MM",
+    b"NI",
+    b"SANCTIONED",
+    b"SD",
+    b"SO",
+    b"SS",
+    b"SY",
+    b"UA-09",
+    b"UA-14",
+    b"UA-40",
+    b"UA-43",
+    b"VE",
+    b"YE",
+    b"ZW",
+];
+
+/// The restricted list `restricted` answers: zero-padded codes, sorted.
+pub fn restricted_codes() -> Vec<[u8; 32]> {
+    RESTRICTED.iter().map(|text| code(text)).collect()
 }
 
 /// A restricted code, zero-padded.
@@ -1894,7 +1936,54 @@ mod tests {
     }
 
     #[test]
-    fn the_restricted_list_names_sanctioned_persons_only() {
-        assert_eq!(&code(b"SANCTIONED")[..10], b"SANCTIONED");
+    fn the_restricted_list_is_the_venue_s_blocked_regions_and_sanctioned_persons_sorted_within_the_return_data(
+    ) {
+        let list = restricted_codes();
+        let text: Vec<&str> = list
+            .iter()
+            .map(|code| {
+                let end = code.iter().position(|b| *b == 0).unwrap_or(32);
+                std::str::from_utf8(&code[..end]).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "AF",
+                "BA",
+                "BI",
+                "BY",
+                "CD",
+                "CF",
+                "CG",
+                "CU",
+                "GN",
+                "GW",
+                "HT",
+                "IQ",
+                "IR",
+                "KP",
+                "LB",
+                "LY",
+                "ML",
+                "MM",
+                "NI",
+                "SANCTIONED",
+                "SD",
+                "SO",
+                "SS",
+                "SY",
+                "UA-09",
+                "UA-14",
+                "UA-40",
+                "UA-43",
+                "VE",
+                "YE",
+                "ZW",
+            ]
+        );
+        assert!(list.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(list.len() <= shonin_driver::MAX_RESTRICTED);
+        assert!(list.try_to_vec().unwrap().len() <= MAX_RETURN_DATA);
     }
 }

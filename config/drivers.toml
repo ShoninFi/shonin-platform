@@ -54,10 +54,13 @@ label = "Robinhood Chain stock tokens"
 chain = "robinhood"
 # On the testnet, the testnet's stock tokens against USDG in Uniswap pools
 # kept at the mainnet feeds' prices; on mainnet, NVDA and AAPL against USDG
-# (config/mainnet.toml). Read the venue's terms again before the driver is
-# approved on mainnet.
+# (config/mainnet.toml).
 networks = ["testnet", "mainnet"]
-restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
+# What the driver contract's `restricted()` answers, from the stock tokens'
+# terms: US persons; people in Canada, Switzerland and the UK; the issuer's
+# prohibited investors, since the station holds the tokens and the issuer may
+# freeze or burn tokens such an investor holds; and sanctioned persons.
+restricted = ["BY", "CA", "CH", "CU", "GB", "IR", "KP", "MM", "RU", "SANCTIONED", "SD", "SS", "SY", "UA", "US", "VE"]
 custody = "station"
 exit = "contract"
 valuation = "on-chain"
@@ -68,9 +71,10 @@ valuation = "on-chain"
 [drivers.uniswap-base]
 label = "Uniswap v3 on Base"
 chain = "base"
-# Read the venue's terms again before the driver is approved on mainnet.
+# Uniswap's terms exclude sanctioned persons only; the contract's list is
+# wider, and safe.
 networks = ["testnet", "mainnet"]
-restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
+restricted = ["BY", "CA", "CH", "CU", "GB", "IR", "KP", "MM", "RU", "SANCTIONED", "SD", "SS", "SY", "UA", "US", "VE"]
 custody = "station"
 exit = "contract"
 valuation = "on-chain"
@@ -89,9 +93,19 @@ valuation = "attested-read"
 label = "Orca"
 chain = "solana"
 # Locally Orca's own program, loaded by the devnet, and a stand-in for Pyth;
-# on devnet the pool the driver lists, which `solana-setup` creates.
-networks = ["local", "testnet"]
-restricted = ["SANCTIONED"]
+# on devnet the pool the driver lists, which `solana-setup` creates; on
+# mainnet Orca's SOL/USDC pool at tick spacing 4 and Pyth's SOL/USD account,
+# compiled into the driver's mainnet build.
+networks = ["local", "testnet", "mainnet"]
+# What the driver program's `restricted` answers: sanctioned persons, and the
+# regions Orca blocks, Crimea, Sevastopol, Donetsk and Luhansk by their
+# ISO 3166-2 codes and Congo as both of its countries.
+restricted = [
+    "AF", "BA", "BI", "BY", "CD", "CF", "CG", "CU", "GN", "GW",
+    "HT", "IQ", "IR", "KP", "LB", "LY", "ML", "MM", "NI", "SANCTIONED",
+    "SD", "SO", "SS", "SY", "UA-09", "UA-14", "UA-40", "UA-43", "VE", "YE",
+    "ZW",
+]
 custody = "station"
 exit = "contract"
 valuation = "on-chain"

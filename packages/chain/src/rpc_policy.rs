@@ -1097,7 +1097,13 @@ mod tests {
                     ("keeper_balance_floor_micro", 2_000),
                 ],
             ),
-            ("evm:8453", &[("head_lag_max_ms", 4_000)]),
+            (
+                "evm:8453",
+                &[
+                    ("head_lag_max_ms", 4_000),
+                    ("keeper_balance_floor_micro", 25_000),
+                ],
+            ),
             ("evm:31338", &[("receipt_poll_ms", 1_000)]),
             (
                 "evm:998",
@@ -1106,7 +1112,13 @@ mod tests {
                     ("keeper_balance_floor_micro", 200_000),
                 ],
             ),
-            ("evm:999", &[("receipt_poll_ms", 1_000)]),
+            (
+                "evm:999",
+                &[
+                    ("receipt_poll_ms", 1_000),
+                    ("keeper_balance_floor_micro", 200_000),
+                ],
+            ),
             ("evm:31339", &[("receipt_poll_ms", 500)]),
             (
                 "evm:46630",
@@ -1115,7 +1127,13 @@ mod tests {
                     ("keeper_balance_floor_micro", 2_000),
                 ],
             ),
-            ("evm:4663", &[("receipt_poll_ms", 500)]),
+            (
+                "evm:4663",
+                &[
+                    ("receipt_poll_ms", 500),
+                    ("keeper_balance_floor_micro", 70_000),
+                ],
+            ),
             (
                 "solana:localnet",
                 &[("head_lag_max_ms", 10_000), ("head_ahead_max_ms", 5_000)],
@@ -1130,7 +1148,11 @@ mod tests {
             ),
             (
                 "solana:mainnet-beta",
-                &[("head_lag_max_ms", 10_000), ("head_ahead_max_ms", 5_000)],
+                &[
+                    ("head_lag_max_ms", 10_000),
+                    ("head_ahead_max_ms", 5_000),
+                    ("keeper_balance_floor_micro", 500_000),
+                ],
             ),
         ];
         assert_eq!(configs.iter().count(), expected.len());

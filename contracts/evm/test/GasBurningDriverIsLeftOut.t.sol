@@ -125,6 +125,19 @@ contract GasBurningDriverIsLeftOutTest is StationBase {
         assertGe(other.cash(), 20_000e6, "the idle dollars did not come home");
     }
 
+    /// Each driver's part runs at most once a call: an unwind that names a
+    /// driver twice is refused whole, and the same unwind naming it once
+    /// goes through.
+    function test_an_unwind_naming_a_driver_twice_is_refused() public {
+        (Station two, FakeVault other) = _stationWith(locals());
+        _trade(two);
+        _stop(two, other);
+        vm.expectRevert(bytes4(keccak256("NotAllowed()")));
+        two.unwindStopped(_names("local", "local"));
+        two.unwindStopped(_only("local"));
+        assertGe(other.cash(), 99_000e6, "the money did not come home");
+    }
+
     function test_only_a_stopped_station_unwinds_by_name() public {
         vm.expectRevert(Station.NotHalted.selector);
         station.unwindStopped(locals());

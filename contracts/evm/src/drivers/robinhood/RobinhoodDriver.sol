@@ -74,19 +74,21 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// per token, well within the sixteen dollar-units a station lets a
     /// close leave above the stayers' share for that rounding.
     uint256 public constant MAX_LISTINGS = 2;
-    /// How far one sale of a stopped station's full unwind may move its
-    /// pool's price: this many of the pool's tick spacings from the price
-    /// the close is prepared at, in the sale's direction (about 5% at the
-    /// 0.05% fee's spacing of ten ticks). A sale's gas grows with every
-    /// initialised tick it crosses, so a sale that takes all of a thin
-    /// pool's liquidity would otherwise walk to the tick limit across
-    /// however many range boundaries lie on its side (or anyone has minted
-    /// there), and could never fit the gas the station gives it. Within
-    /// this distance it crosses at most this many and one more, every
-    /// spacing initialised, and fits that allowance with room to spare,
-    /// whatever the pool's spacing. What the limit leaves
-    /// unsold is sold by the next unwind, from the price this one left.
-    uint256 public constant SALE_SPACINGS = 50;
+    /// How far one sale of a stopped station's full unwind may go: this
+    /// many of the pool's tick spacings past the nearer of the pool's price
+    /// and its time-weighted price, in the sale's direction (about 2.5% at
+    /// the 0.05% fee's spacing of ten ticks). Anyone may send that unwind and
+    /// its sale has no minimum out, so the time-weighted bound is what keeps
+    /// its price: no caller can move it within the transaction that sells.
+    /// The bound from the pool's price keeps the walk within this many
+    /// spacings however the pool was moved, and so within this many
+    /// initialised ticks crossed and one more: a sale's gas grows with each,
+    /// dearest for a tick never crossed since fees were taken in both
+    /// tokens (both its fee slots written from zero), and at this distance
+    /// even that walk fits the gas the station gives each call with a third
+    /// of it to spare, whatever the pool's spacing. What the limit leaves
+    /// unsold is sold by a later unwind.
+    uint256 public constant SALE_SPACINGS = 25;
     /// The pool's bounds on a swap's price limit (exclusive).
     uint160 private constant MIN_SQRT_RATIO = 4_295_128_739;
     uint160 private constant MAX_SQRT_RATIO =
@@ -136,6 +138,10 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     error BadPool();
     error TooMany();
     error NoMaxSale();
+    /// A `twapWindow` of zero: no pool's time-weighted price could be read.
+    error NoTwapWindow();
+    /// A `maxFeedAge` of zero: no feed would ever be trusted.
+    error NoMaxFeedAge();
 
     struct Venue {
         IERC20 dollar;
@@ -162,6 +168,8 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     }
 
     constructor(Venue memory venue, Listing[] memory listings) {
+        if (venue.twapWindow == 0) revert NoTwapWindow();
+        if (venue.maxFeedAge == 0) revert NoMaxFeedAge();
         dollar = venue.dollar;
         router = venue.router;
         safeSingleton = venue.safeSingleton;
@@ -228,15 +236,30 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         list[4] = rolesOf(msg.sender);
     }
 
-    /// Who the stock tokens' terms exclude: US persons, and further people in
-    /// Canada, Switzerland and the UK, and sanctioned persons. Sorted.
+    /// Who the stock tokens' terms exclude: US persons; people in Canada,
+    /// Switzerland and the UK; the issuer's prohibited investors, in Belarus,
+    /// Cuba, Iran, Myanmar, North Korea, Russia, South Sudan, Sudan, Syria,
+    /// Ukraine and Venezuela, since the station holds the tokens and the
+    /// issuer may freeze or burn tokens such an investor holds; and
+    /// sanctioned persons. Sorted.
     function restricted() external pure returns (bytes32[] memory list) {
-        list = new bytes32[](5);
-        list[0] = "CA";
-        list[1] = "CH";
-        list[2] = "GB";
-        list[3] = "SANCTIONED";
-        list[4] = "US";
+        list = new bytes32[](16);
+        list[0] = "BY";
+        list[1] = "CA";
+        list[2] = "CH";
+        list[3] = "CU";
+        list[4] = "GB";
+        list[5] = "IR";
+        list[6] = "KP";
+        list[7] = "MM";
+        list[8] = "RU";
+        list[9] = "SANCTIONED";
+        list[10] = "SD";
+        list[11] = "SS";
+        list[12] = "SY";
+        list[13] = "UA";
+        list[14] = "US";
+        list[15] = "VE";
     }
 
     function custody() external pure returns (Custody) {
@@ -327,10 +350,12 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// leaver, never on the dollars the Safe keeps for everyone. Blocked
     /// when any holding worth more than dust has a feed that can't be
     /// trusted or a market further from its feed than the band, on either
-    /// side. At the full band, everything is sold at any price, at most
-    /// `maxSale` of a token per close and no further than `SALE_SPACINGS`
-    /// from the pool's price, so each sale fits the gas the station gives
-    /// it; a close that sells anything is reported blocked beside its calls
+    /// side. At the full band, everything is sold whatever the feed says, at
+    /// most `maxSale` of a token per close and no further than
+    /// `SALE_SPACINGS` past the nearer of the pool's price and its
+    /// time-weighted price, so each sale fits the gas the station gives it
+    /// and none is made below the time-weighted price less those spacings;
+    /// a close that sells anything is reported blocked beside its calls
     /// (what the sale leaves at its price limit is only known once it is
     /// made), and the next unwind sells on, done once nothing is left to
     /// sell. Each call stands
@@ -435,8 +460,9 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
 
     /// One stock's part of a close: approve the router and sell the
     /// fraction, paid to the station; at the full band no more than
-    /// `maxSale` and no further than `SALE_SPACINGS` from the pool's price,
-    /// and `more`, since either may leave some to sell.
+    /// `maxSale` and no further than `_priceLimit`, and `more`, since either
+    /// may leave some to sell (with no sale at all when the limit allows
+    /// none now).
     function _sale(
         address station,
         address safe,
@@ -458,6 +484,7 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
             if (amountIn > maxSale[stock.token]) amountIn = maxSale[stock.token];
             priceLimit = _priceLimit(stock);
             more = true;
+            if (priceLimit == 0) return (sale, false, false, true);
         }
         uint256 minOut = banded ? amountIn.mulDiv(price, stock.scale).mulDiv(BPS - bandBps, BPS) : 0;
         sale[0] = _exec(station, stock.token, abi.encodeCall(IERC20.approve, (router, amountIn)));
@@ -482,21 +509,49 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         sells = true;
     }
 
-    /// The price a full-band sale of `stock` stops at: `SALE_SPACINGS` of
-    /// its pool's tick spacings past the pool's current tick, in the sale's
-    /// direction (down when the stock is the pool's token0), within the
-    /// bounds the pool takes.
+    /// The price a full-band sale of `stock` stops at, or nothing when no
+    /// sale should be made now: `SALE_SPACINGS` of its pool's tick spacings
+    /// past the pool's current tick or past its time-weighted tick over
+    /// `twapWindow`, whichever is nearer, in the sale's direction (down when
+    /// the stock is the pool's token0), within the bounds the pool takes.
+    /// The time-weighted bound is one no caller can move within the
+    /// transaction that sells, so the sale never takes less than that price
+    /// whoever sends the unwind and however the pool was moved first; the
+    /// bound from the current tick keeps the walk, and so its gas, within
+    /// `SALE_SPACINGS` whichever way the pool was moved. A pool already at
+    /// or past the time-weighted bound, or whose time-weighted price can't
+    /// be read, gets no sale: the next unwind tries again. A fractional
+    /// time-weighted tick is rounded towards the Safe (up for a sale walking
+    /// down, down for one walking up), so the bound is never past the
+    /// time-weighted price less `SALE_SPACINGS`, not even by a tick.
     function _priceLimit(Stock memory stock) private view returns (uint160) {
-        (, int24 tick,,,,,) = stock.pool.slot0();
-        int256 distance = int256(SALE_SPACINGS) * int256(stock.pool.tickSpacing());
-        if (stock.token < address(dollar)) {
-            int256 target = int256(tick) - distance;
-            if (target <= UniswapPrice.MIN_TICK) return MIN_SQRT_RATIO + 1;
-            return UniswapPrice.sqrtRatioAtTick(int24(target));
+        (uint160 sqrtPrice, int24 tick,,,,,) = stock.pool.slot0();
+        bool down = stock.token < address(dollar);
+        int24 mean;
+        try this.twapTick(stock.pool, down) returns (int24 answer) {
+            mean = answer;
+        } catch {
+            return 0;
         }
-        int256 above = int256(tick) + distance;
-        if (above >= UniswapPrice.MAX_TICK) return MAX_SQRT_RATIO - 1;
-        return UniswapPrice.sqrtRatioAtTick(int24(above));
+        int256 distance = int256(SALE_SPACINGS) * int256(stock.pool.tickSpacing());
+        if (down) {
+            int256 target = (tick > mean ? int256(tick) : int256(mean)) - distance;
+            uint160 limit = target <= UniswapPrice.MIN_TICK
+                ? MIN_SQRT_RATIO + 1
+                : UniswapPrice.sqrtRatioAtTick(int24(target));
+            return limit < sqrtPrice ? limit : 0;
+        }
+        int256 above = (tick < mean ? int256(tick) : int256(mean)) + distance;
+        uint160 upper =
+            above >= UniswapPrice.MAX_TICK ? MAX_SQRT_RATIO - 1 : UniswapPrice.sqrtRatioAtTick(int24(above));
+        return upper > sqrtPrice ? upper : 0;
+    }
+
+    /// `pool`'s time-weighted tick over `twapWindow`, a fractional mean
+    /// rounded up when `up` and down otherwise. External only so a pool
+    /// that can't answer is caught.
+    function twapTick(IUniswapV3Pool pool, bool up) external view returns (int24) {
+        return UniswapPrice.meanTick(pool, twapWindow, up);
     }
 
     /// The calls that set the station's Safe up, if it isn't yet: the Safe
@@ -622,14 +677,15 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     }
 
     /// What `amount` of `token` is worth in dollars at `pool`'s
-    /// time-weighted price. External only so a pool that can't answer is
-    /// caught.
+    /// time-weighted price, a fractional time-weighted tick rounded towards
+    /// the lower worth (down when the token is the pool's token0, up when it
+    /// is token1). External only so a pool that can't answer is caught.
     function marketQuote(
         IUniswapV3Pool pool,
         address token,
         uint256 amount
     ) external view returns (uint256) {
-        int24 tick = UniswapPrice.meanTick(pool, twapWindow);
+        int24 tick = UniswapPrice.meanTick(pool, twapWindow, token > address(dollar));
         return UniswapPrice.quoteAtTick(tick, amount, token, address(dollar));
     }
 

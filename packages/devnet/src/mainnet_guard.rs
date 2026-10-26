@@ -480,6 +480,26 @@ fn is_the_committed_dir(dir: &Path) -> bool {
     }
 }
 
+/// This repository's fork-rehearsal directory, `.shonin/mainnet-fork`.
+pub fn fork_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(".shonin")
+        .join("mainnet-fork")
+}
+
+/// Whether `dir` is `place` or inside it, however either is spelled
+/// (symlinks, `..`, letter case on a disk that ignores it). A `dir` that
+/// can't be resolved is not under anything.
+pub fn is_under(dir: &Path, place: &Path) -> bool {
+    let Ok(given) = resolved(dir) else {
+        return false;
+    };
+    let place = resolved(place).unwrap_or_else(|_| place.to_path_buf());
+    given.ancestors().any(|ancestor| same_dir(ancestor, &place))
+}
+
 /// Refuse an admin-steps directory that doesn't suit the mode, before
 /// anything is sent or written: a fork's steps never go where the hardware
 /// key's are kept (`.shonin/mainnet/admin-steps`) or under the committed
@@ -526,6 +546,85 @@ pub fn deployments_dir(mode: Mode, given: &Path) -> Result<PathBuf> {
         ),
         _ => resolved(given),
     }
+}
+
+/// Refuse a file that is a symlink, isn't a regular file, or has another
+/// name on disk (a hard link): what is read or written at its path could
+/// be another file, anywhere. A file not there yet is fine.
+pub fn refuse_linked_file(file: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(file) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink: a mainnet command reads and writes its own files alone, never \
+             another through a link. Nothing was written.",
+            file.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "{} is not a regular file. Nothing was written.",
+            file.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            bail!(
+                "{} has another name on disk (a hard link): writing it would write that file \
+                 too. Nothing was written.",
+                file.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Write `contents` as `file`, never through it: a file there now that is a
+/// symlink or a hard link is refused ([`refuse_linked_file`]), and the new
+/// contents go to a file made here, beside it, then renamed over the path,
+/// which replaces the name itself and never follows what it points to.
+pub fn write_file(file: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    use std::io::Write;
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow!("making {}: {}", parent.display(), error.kind()))?;
+    refuse_linked_file(file)?;
+    let name = file
+        .file_name()
+        .ok_or_else(|| anyhow!("{} names no file", file.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.new",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temporary);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::symlink_metadata(file)
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .unwrap_or(0o644);
+        options.mode(mode);
+    }
+    let written = (|| {
+        let mut out = options.open(&temporary)?;
+        out.write_all(contents.as_ref())?;
+        out.sync_all()?;
+        std::fs::rename(&temporary, file)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        bail!("writing {}: {error}", file.display());
+    }
+    Ok(())
 }
 
 /// The deployer's key, from the file the owner named: one line, a `0x` hex
@@ -855,6 +954,42 @@ mod tests {
             !error.contains(&alloy::hex::encode(key.to_bytes())),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mainnet_write_never_goes_through_a_symlink_or_a_hard_link_to_another_file() {
+        let dir = scratch("write-file");
+        let other = dir.join("committed.json");
+        std::fs::write(&other, "the committed file").unwrap();
+        let file = dir.join("fork.json");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&other, &file).unwrap();
+            let error = write_file(&file, "a fork's").unwrap_err().to_string();
+            assert!(error.contains("symlink"), "{error}");
+            std::fs::remove_file(&file).unwrap();
+            std::fs::hard_link(&other, &file).unwrap();
+            let error = write_file(&file, "a fork's").unwrap_err().to_string();
+            assert!(error.contains("hard link"), "{error}");
+            std::fs::remove_file(&file).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "the committed file"
+        );
+        // A file of its own is written, made or replaced, and nothing is
+        // left beside it.
+        write_file(&file, "first").unwrap();
+        write_file(&file, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+        write_file(&dir.join("new/deeper.json"), "made").unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["committed.json", "fork.json", "new"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

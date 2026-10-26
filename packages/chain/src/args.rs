@@ -675,9 +675,13 @@ mod tests {
 
     /// Chain args over a network of two EVM vault chains and a Solana one.
     fn args_naming(vault_chain: Option<Chain>) -> (ChainArgs, PathBuf) {
+        // Each call has a directory of its own: tests run side by side, and
+        // the clock alone can give two of them the same name.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "shonin-chain-args-{}-{}",
+            "shonin-chain-args-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -5997,7 +5997,18 @@ async fn send_outcome_with<C: alloy::sol_types::SolCall>(
     match sending.context(what.to_string()) {
         Err(error) => {
             tracing::debug!(%to, error = format!("{error:#}"), "not yet");
-            if error.chain().any(|cause| cause.is::<chain::Reverted>()) {
+            if error.chain().any(|cause| cause.is::<OverTxGasCap>()) {
+                // Nothing went out: refused as a node refuses a call that
+                // can't land, and backed off as that is.
+                tracing::warn!(
+                    chain_id = client.chain_id,
+                    %to,
+                    what,
+                    error = format!("{error:#}"),
+                    "the keeper's call needs more gas than one transaction may carry; not sent"
+                );
+                Outcome::Refused
+            } else if error.chain().any(|cause| cause.is::<chain::Reverted>()) {
                 went_out();
                 Outcome::Reverted
             } else if execution_reverted(&error) {
@@ -6576,15 +6587,14 @@ const ROOMY_GAS_MARGIN: u64 = 250_000;
 /// besides, held under the block's gas limit when it is known, and never
 /// below the estimate. An unwind that needs more than a block's limit
 /// can't be sent at all: its estimate is refused and nothing moves.
-/// [`send_roomy`] holds it under the chain's per-transaction cap too
-/// ([`capped_roomy_gas`]).
+/// [`send_roomy`] holds it under the chain's per-transaction cap too, and
+/// sends nothing whose estimate is above that cap ([`capped_roomy_gas`]).
 ///
 /// This assumes the latest block's gas limit is the limit the send will be
 /// held to, and that one block's limit holds for every block. HyperEVM's
-/// small and big blocks break that: its small blocks hold about 2M gas, so
-/// an unwind or Closer call estimated above about 1.17M gas is lifted past
-/// the small-block limit here, and whether it then lands at all depends on the
-/// chain's rules for big blocks.
+/// small and big blocks break that (the latest block may be a big one), so
+/// there the chain's cap in [`tx_gas_cap`] is the small block's limit: the
+/// keeper's address sends into small blocks.
 fn roomy_gas(estimate: u64, block_limit: Option<u64>) -> u64 {
     let roomy = estimate
         .saturating_add(estimate / 2)
@@ -6599,25 +6609,58 @@ fn roomy_gas(estimate: u64, block_limit: Option<u64>) -> u64 {
 /// Azul upgrade) let one transaction carry, whatever their blocks hold.
 const EIP_7825_TX_GAS_CAP: u64 = 16_777_216;
 
+/// HyperEVM's small block: the most gas a transaction from an address that
+/// hasn't asked for big blocks can carry and still be included (3,000,000
+/// on mainnet and testnet, read in October 2026). The keeper's address
+/// never asks for big blocks.
+const HYPEREVM_SMALL_BLOCK_GAS: u64 = 3_000_000;
+
 /// The most gas one transaction may carry on `chain_id`. Robinhood Chain
 /// (Arbitrum Nitro) holds each to 32,000,000 (ArbGasInfo's
-/// `getMaxTxGasLimit`); every other chain is held to EIP-7825's cap, which
+/// `getMaxTxGasLimit`); HyperEVM to its small block's limit, whatever a
+/// big block holds; every other chain is held to EIP-7825's cap, which
 /// is never more than a chain without a cap takes.
 fn tx_gas_cap(chain_id: u64) -> u64 {
     match chain_id {
         4663 | 46630 => 32_000_000,
+        999 | 998 => HYPEREVM_SMALL_BLOCK_GAS,
         _ => EIP_7825_TX_GAS_CAP,
     }
 }
 
 /// [`roomy_gas`], never above the chain's per-transaction cap either: a
-/// limit above it is refused by the node however much the call needs.
-fn capped_roomy_gas(estimate: u64, block_limit: Option<u64>, tx_cap: u64) -> u64 {
-    roomy_gas(estimate, block_limit).min(tx_cap)
+/// limit above it is refused by the node (or, on HyperEVM, can't be
+/// included) however much the call needs. Nothing when the estimate itself
+/// is above the cap: the call can't land with the gas it needs, and sent
+/// with less it would only revert out of gas and be paid for.
+fn capped_roomy_gas(estimate: u64, block_limit: Option<u64>, tx_cap: u64) -> Option<u64> {
+    (estimate <= tx_cap).then(|| roomy_gas(estimate, block_limit).min(tx_cap))
 }
 
+/// A call whose gas estimate is above the chain's per-transaction cap: not
+/// sent (see [`capped_roomy_gas`]).
+#[derive(Debug)]
+struct OverTxGasCap {
+    estimate: u64,
+    cap: u64,
+}
+
+impl std::fmt::Display for OverTxGasCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the call is estimated at {} gas, above the {} one transaction may carry; not sent",
+            self.estimate, self.cap
+        )
+    }
+}
+
+impl std::error::Error for OverTxGasCap {}
+
 /// Send a call as the keeper with the gas limit [`capped_roomy_gas`] gives
-/// from the node's estimate, and wait for it to land.
+/// from the node's estimate, and wait for it to land; refused with
+/// [`OverTxGasCap`], before anything is sent, when the estimate is above the
+/// chain's per-transaction cap.
 async fn send_roomy<C: alloy::sol_types::SolCall>(
     client: &Observed,
     keeper: Address,
@@ -6642,14 +6685,11 @@ async fn send_roomy<C: alloy::sol_types::SolCall>(
         .ok()
         .flatten()
         .map(|block| block.header.gas_limit);
-    client
-        .send_with_gas_limit(
-            keeper,
-            to,
-            call,
-            capped_roomy_gas(estimate, block_limit, tx_gas_cap(client.chain_id)),
-        )
-        .await
+    let cap = tx_gas_cap(client.chain_id);
+    let Some(limit) = capped_roomy_gas(estimate, block_limit, cap) else {
+        return Err(OverTxGasCap { estimate, cap }.into());
+    };
+    client.send_with_gas_limit(keeper, to, call, limit).await
 }
 
 /// Send one call as the keeper, and say whether it went through.
@@ -8805,25 +8845,81 @@ mod tests {
         assert_eq!(base, 16_777_216);
         assert_eq!(tx_gas_cap(4663), 32_000_000);
         for estimate in [21_000, 1_000_000, 11_018_144, 11_018_145, 15_000_000, base] {
-            let limit = capped_roomy_gas(estimate, Some(400_000_000), base);
+            let limit = capped_roomy_gas(estimate, Some(400_000_000), base).unwrap();
             assert!(limit <= base, "{estimate} was sent with {limit}");
             assert!(
                 limit >= estimate,
                 "{estimate} was sent with less than it needs"
             );
-            assert!(limit <= capped_roomy_gas(estimate, Some(400_000_000), u64::MAX));
+            assert!(limit <= capped_roomy_gas(estimate, Some(400_000_000), u64::MAX).unwrap());
         }
-        assert_eq!(capped_roomy_gas(15_000_000, Some(400_000_000), base), base);
+        assert_eq!(
+            capped_roomy_gas(15_000_000, Some(400_000_000), base),
+            Some(base)
+        );
         assert_eq!(
             capped_roomy_gas(1_000_000, Some(400_000_000), base),
-            1_750_000
+            Some(1_750_000)
         );
         // The block's limit still holds where it is the lower one.
         assert_eq!(
             capped_roomy_gas(1_000_000, Some(1_200_000), base),
-            1_200_000
+            Some(1_200_000)
         );
-        assert!(capped_roomy_gas(20_000_000, Some(30_000_000), base) <= base);
+    }
+
+    /// A call estimated above the chain's per-transaction cap is never sent:
+    /// sent with the cap, less than it needs, it would only revert out of gas
+    /// and be paid for, every round. On every chain, whatever its blocks hold.
+    #[test]
+    fn a_call_estimated_above_the_per_transaction_cap_is_never_sent() {
+        for chain in [8453, 4663, 46630, 999, 998, 1] {
+            let cap = tx_gas_cap(chain);
+            for block_limit in [None, Some(cap / 2), Some(cap), Some(400_000_000)] {
+                for over in [cap + 1, cap + cap / 10, 2 * cap] {
+                    assert_eq!(
+                        capped_roomy_gas(over, block_limit, cap),
+                        None,
+                        "on {chain} an estimate of {over} was sent"
+                    );
+                }
+                // At the cap or under it, it is sent with at least its estimate.
+                for estimate in [cap / 3, cap] {
+                    let limit = capped_roomy_gas(estimate, block_limit, cap).unwrap_or_else(|| {
+                        panic!("on {chain} an estimate of {estimate} was not sent")
+                    });
+                    assert!(
+                        estimate <= limit && limit <= cap,
+                        "{estimate} was sent with {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// On HyperEVM the latest block may be a big one (30M), but the
+    /// keeper's address sends into small blocks: an unwind is never sent
+    /// with a limit more than a small block holds, and one that fits a
+    /// small block is sent with at least its estimate.
+    #[test]
+    fn on_hyperevm_an_unwind_is_never_sent_with_more_than_a_small_block_holds() {
+        for chain in [999, 998] {
+            let cap = tx_gas_cap(chain);
+            assert_eq!(cap, 3_000_000);
+            for estimate in [21_000, 595_057, 1_170_000, 2_000_000, 3_000_000] {
+                let limit = capped_roomy_gas(estimate, Some(30_000_000), cap).unwrap();
+                assert!(limit <= cap, "{estimate} was sent with {limit}");
+                assert!(
+                    limit >= estimate,
+                    "{estimate} was sent with less than it needs"
+                );
+            }
+            // Under the margin's reach, the margin is kept in full.
+            assert_eq!(
+                capped_roomy_gas(595_057, Some(30_000_000), cap),
+                Some(1_142_585)
+            );
+        }
     }
 
     /// A venue that reports value it never closes, its mark wobbling a

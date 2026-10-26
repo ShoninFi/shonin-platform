@@ -105,8 +105,8 @@ contract AFullBandSaleOnBaseFitsItsAllowanceTest is Test {
         _;
     }
 
-    /// A Safe holding more than the maximum: the close sells exactly the
-    /// maximum, says it isn't done, and every call, the sale included, goes
+    /// A Safe holding more than the maximum: the close sells no more than
+    /// the maximum, says it isn't done, and every call, the sale included, goes
     /// through with the allowance and spends well under it.
     function test_one_bounded_sale_through_the_safe_fits_its_allowance_with_room_to_spare() public onFork {
         address safe = driver.safeOf(address(station));
@@ -128,15 +128,17 @@ contract AFullBandSaleOnBaseFitsItsAllowanceTest is Test {
             console2.log("call / gas", i, spent);
             if (spent > worst) worst = spent;
         }
-        assertEq(IERC20(WETH).balanceOf(safe), 2 * MAX_SALE, "other than the maximum was sold");
+        // At most the maximum: the price limit may stop the sale sooner.
+        assertGe(IERC20(WETH).balanceOf(safe), 2 * MAX_SALE, "more than the maximum was sold");
+        assertLt(IERC20(WETH).balanceOf(safe), 3 * MAX_SALE, "nothing was sold");
         assertGt(
             IERC20(USDC).balanceOf(address(station)), 1000e6, "the sale's dollars did not reach the station"
         );
         assertLt(worst, StationCloses.ATTEMPT_GAS / 2, "the bounded sale is not well under its allowance");
         // The driver's reads at its most listings stay under what the
-        // worst full unwind is measured with (600,000) and what the part's
+        // worst full unwind is measured with (700,000) and what the part's
         // floor keeps for them.
-        assertLt(reads * driver.MAX_LISTINGS(), 600_000, "the driver's reads outgrow the worst full unwind's");
+        assertLt(reads * driver.MAX_LISTINGS(), 700_000, "the driver's reads outgrow the worst full unwind's");
         assertLt(
             reads * driver.MAX_LISTINGS(),
             StationCloses.PART_FLOOR - StationCloses.ATTEMPT_FLOOR,
@@ -265,6 +267,9 @@ contract AFullBandSaleOnBaseFitsItsAllowanceTest is Test {
 
         int24 reach = int24(int256(thin.SALE_SPACINGS())) * spacing;
         for (uint256 retry = 0; retry < 3; retry++) {
+            // A quiet half hour since the pool last moved: its time-weighted
+            // price, which bounds the sale too, is where the last sale left it.
+            vm.warp(vm.getBlockTimestamp() + 30 minutes + 1);
             (, int24 tickBefore,,,,,) = IUniswapV3Pool(pool).slot0();
             uint256 heldBefore = stock.balanceOf(safe);
             uint256 homeBefore = IERC20(USDC).balanceOf(address(holder));

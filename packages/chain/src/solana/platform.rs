@@ -2537,7 +2537,9 @@ pub fn read_station(
 }
 
 /// Rewrites a station the first programs wrote in the current layout, paid
-/// for by `payer`; a station already current is left as it is.
+/// for by `payer`; a station already current is left as it is. Not in a
+/// mainnet build, whose station has no `migrate_station`.
+#[cfg(not(feature = "mainnet"))]
 pub fn ix_migrate_station(payer: &Pubkey, station: &Pubkey) -> Instruction {
     Instruction {
         program_id: shonin_station::ID,

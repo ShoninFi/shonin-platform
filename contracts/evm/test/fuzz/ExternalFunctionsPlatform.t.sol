@@ -654,8 +654,8 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         nothingLeft(b);
     }
 
-    /// A stopped station's unwind by name: anyone, once stopped; it never
-    /// takes cash from the vault.
+    /// A stopped station's unwind by name: anyone, once stopped, each driver
+    /// named once; it never takes cash from the vault.
     function testFuzz_unwindStopped(uint8 stage, uint8 pick, address random, uint8 which) public {
         stage = arrange(stage);
         address caller = pickCaller(pick, random);
@@ -668,6 +668,8 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         bytes4 want;
         if (stage != STOPPED) want = Station.NotHalted.selector;
         else if (which % 5 == 0 && names.length != 0) want = Station.NotDeclared.selector;
+        // A driver named twice is refused.
+        else if (names.length > 1) want = Station.NotAllowed.selector;
         (bool ok, bytes4 err) =
             callAs(caller, address(station), abi.encodeCall(Station.unwindStopped, (names)));
         expectOutcome(ok, err, want, "unwindStopped");
