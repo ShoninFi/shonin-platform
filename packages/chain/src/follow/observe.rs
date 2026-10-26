@@ -205,7 +205,11 @@ impl Gathered {
 /// The endpoints to observe a plan on, in order: `routed` when the plan
 /// reads HyperCore and the client has an order for it, else every one of
 /// `count`, from `preferred` on.
-fn observation_order(routed: Option<&[usize]>, preferred: usize, count: usize) -> Vec<usize> {
+pub(super) fn observation_order(
+    routed: Option<&[usize]>,
+    preferred: usize,
+    count: usize,
+) -> Vec<usize> {
     match routed {
         Some(routed) => routed.to_vec(),
         None => (0..count).map(|step| (preferred + step) % count).collect(),

@@ -303,6 +303,20 @@ impl Follower {
         capabilities::header(provider, at).await
     }
 
+    /// A header, checked to be the block asked for, from the preferred
+    /// endpoint, then the others in turn, as an observation is: an endpoint
+    /// that fails (a rate limit, a connection or forwarding failure, an HTTP
+    /// error, no answer within `read_budget_ms`, or no such block yet) is
+    /// passed over for the next, and the one that answers becomes the
+    /// preferred. Read before an observation pinned to it, the header and
+    /// the observation are then asked of the same endpoint first.
+    pub async fn header_any(&mut self, at: BlockNumberOrTag) -> Result<Header> {
+        let (endpoint, header) =
+            header_in_order(&self.endpoints, self.preferred, at, self.budget()).await?;
+        self.preferred = endpoint;
+        Ok(header)
+    }
+
     /// Compare `observed` with the anchors, moving them to its branch unless
     /// it is `Lagging` or `Unknown`, and note its head in the clock. Anchors
     /// it did not carry are read as headers on the endpoint that answered it,
@@ -420,6 +434,29 @@ impl Headers for EndpointHeaders {
             Err(error) => Err(error),
         }
     }
+}
+
+/// A header from the first of `endpoints` to give it, asked from
+/// `preferred` on, each within `budget`; with the endpoint that gave it.
+async fn header_in_order(
+    endpoints: &[DynProvider],
+    preferred: usize,
+    at: BlockNumberOrTag,
+    budget: std::time::Duration,
+) -> Result<(usize, Header)> {
+    let mut failures = Vec::new();
+    for endpoint in observe::observation_order(None, preferred, endpoints.len()) {
+        match tokio::time::timeout(budget, capabilities::header(&endpoints[endpoint], at)).await {
+            Ok(Ok(header)) => return Ok((endpoint, header)),
+            Ok(Err(error)) => failures.push(format!("endpoint {}: {error:#}", endpoint + 1)),
+            Err(_) => failures.push(format!(
+                "endpoint {}: the header took longer than read_budget_ms={}",
+                endpoint + 1,
+                budget.as_millis()
+            )),
+        }
+    }
+    bail!("no endpoint gave the header ({})", failures.join("; "))
 }
 
 /// The wall clock, in ms since the Unix epoch.

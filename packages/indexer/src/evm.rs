@@ -232,10 +232,9 @@ impl EvmRecord {
         store: &Store,
         health: &HashMap<Address, Health>,
     ) -> Result<Refreshed> {
-        let endpoint = self.follower.preferred();
         let head = self
             .follower
-            .header(endpoint, BlockNumberOrTag::Latest)
+            .header_any(BlockNumberOrTag::Latest)
             .await
             .map_err(|error| anyhow!("the head: {error:#}"))?;
         if let Some(last) = self.head
@@ -671,9 +670,8 @@ fn answers_of(plan: &Plan, observed: &chain::follow::Observed) -> HashMap<Key, I
 /// of the block the payment was logged in, so the read is of the branch the
 /// log was checked on.
 async fn supply_before(past: &mut Follower, vault: Address, paid: read::Paid) -> Result<U256> {
-    let endpoint = past.preferred();
     let at = past
-        .header(endpoint, BlockNumberOrTag::Number(paid.block))
+        .header_any(BlockNumberOrTag::Number(paid.block))
         .await?;
     if at.hash != paid.block_hash {
         bail!(
@@ -682,10 +680,7 @@ async fn supply_before(past: &mut Follower, vault: Address, paid: read::Paid) ->
         );
     }
     let before = past
-        .header(
-            endpoint,
-            BlockNumberOrTag::Number(paid.block.saturating_sub(1)),
-        )
+        .header_any(BlockNumberOrTag::Number(paid.block.saturating_sub(1)))
         .await?;
     if before.hash != at.parent_hash {
         bail!("block {}'s header is not its child's parent", before.number);
@@ -703,9 +698,8 @@ struct Sampler<'a> {
 
 impl read::Past for Sampler<'_> {
     async fn header(&mut self, number: u64) -> Result<Header> {
-        let endpoint = self.follower.preferred();
         self.follower
-            .header(endpoint, BlockNumberOrTag::Number(number))
+            .header_any(BlockNumberOrTag::Number(number))
             .await
     }
 
