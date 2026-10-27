@@ -2,7 +2,9 @@
 pragma solidity ^0.8.30;
 
 import {Call, Custody, ExitPath, IDriver, ValuationKind} from "../../interfaces/IDriver.sol";
+
 import {IStation, StationSpec} from "../../interfaces/IStation.sol";
+import {CloseBand} from "../CloseBand.sol";
 import {
     ConditionFlat,
     IAggregatorV3,
@@ -78,8 +80,10 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// many of the pool's tick spacings past the nearer of the pool's price
     /// and its time-weighted price, in the sale's direction (about 2.5% at
     /// the 0.05% fee's spacing of ten ticks). Anyone may send that unwind and
-    /// its sale has no minimum out, so the time-weighted bound is what keeps
-    /// its price: no caller can move it within the transaction that sells.
+    /// its sale has no minimum out, so the time-weighted bound (and the
+    /// feed's latest answer less the stopped discount, see
+    /// `FULL_BAND_FEED_BPS`) is what keeps its price: no caller can move it
+    /// within the transaction that sells.
     /// The bound from the pool's price keeps the walk within this many
     /// spacings however the pool was moved, and so within this many
     /// initialised ticks crossed and one more: a sale's gas grows with each,
@@ -89,6 +93,21 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// of it to spare, whatever the pool's spacing. What the limit leaves
     /// unsold is sold by a later unwind.
     uint256 public constant SALE_SPACINGS = 25;
+    /// A stopped station's sale also stops at its feed's latest positive
+    /// answer, however old and whether or not the token's oracle is paused,
+    /// less the stopped discount: the station's band as it stands, at most
+    /// this many basis points (10%) until the band is full; from the full
+    /// band this, doubling each time the band would have doubled (20%, 40%,
+    /// 80%), and then no feed bound at all. The time-weighted bound follows
+    /// a pool someone holds off its price window after window, the feed's
+    /// answer does not, and a feed gone stale keeps its last answer. The
+    /// nearer of the two bounds to the pool's price is the limit, so the
+    /// walk, and its gas, is never longer than the time-weighted rule's
+    /// alone. A market that has really fallen further than the discount
+    /// below the feed is held until the feed follows it or the discount
+    /// widens past it; before the full band, a stock whose feed gives no
+    /// answer at all is not sold.
+    uint256 public constant FULL_BAND_FEED_BPS = 1000;
     /// The pool's bounds on a swap's price limit (exclusive).
     uint160 private constant MIN_SQRT_RATIO = 4_295_128_739;
     uint160 private constant MAX_SQRT_RATIO =
@@ -350,19 +369,23 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     /// leaver, never on the dollars the Safe keeps for everyone. Blocked
     /// when any holding worth more than dust has a feed that can't be
     /// trusted or a market further from its feed than the band, on either
-    /// side. At the full band, everything is sold whatever the feed says, at
-    /// most `maxSale` of a token per close and no further than
-    /// `SALE_SPACINGS` past the nearer of the pool's price and its
-    /// time-weighted price, so each sale fits the gas the station gives it
-    /// and none is made below the time-weighted price less those spacings;
-    /// a close that sells anything is reported blocked beside its calls
-    /// (what the sale leaves at its price limit is only known once it is
-    /// made), and the next unwind sells on, done once nothing is left to
-    /// sell. Each call stands
-    /// alone (its own Safe transaction): the station makes each on its own
-    /// then, so a token whose sale fails (its transfers paused, its pool
-    /// unable to take it, its gas burned) stays in the Safe, still valued,
-    /// and the other holdings and the idle dollars come home.
+    /// side.
+    ///
+    /// A stopped station's full unwind (`CloseBand.isStopped`), at any band,
+    /// sells instead at most `maxSale` of a token per close, with no
+    /// minimum out and a price limit: `SALE_SPACINGS` past the nearer of
+    /// the pool's price and its time-weighted price, or the feed's latest
+    /// answer less the stopped discount (`FULL_BAND_FEED_BPS`), whichever
+    /// is nearer the pool's price. So each sale fits the gas the station
+    /// gives it, and none is made below either bound whoever sends the
+    /// unwind. A close that sells anything is reported blocked beside its
+    /// calls (what the sale leaves at its price limit is only known once it
+    /// is made), and the next unwind sells on, done once nothing is left to
+    /// sell. Each call stands alone (its own Safe transaction): the station
+    /// makes each on its own then, so a token whose sale fails (its
+    /// transfers paused, its pool unable to take it, its gas burned) stays
+    /// in the Safe, still valued, and the other holdings and the idle
+    /// dollars come home.
     function close(
         address station,
         uint256 fraction,
@@ -459,10 +482,10 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
     // Internals -------------------------------------------------------------
 
     /// One stock's part of a close: approve the router and sell the
-    /// fraction, paid to the station; at the full band no more than
-    /// `maxSale` and no further than `_priceLimit`, and `more`, since either
-    /// may leave some to sell (with no sale at all when the limit allows
-    /// none now).
+    /// fraction, paid to the station; for a stopped station's unwind no
+    /// more than `maxSale` and no further than `_priceLimit`, and `more`,
+    /// since either may leave some to sell (with no sale at all when the
+    /// limit allows none now).
     function _sale(
         address station,
         address safe,
@@ -473,17 +496,24 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         uint256 balance = IERC20(stock.token).balanceOf(safe);
         if (balance == 0) return (sale, false, false, false);
         (bool trusted, uint256 price) = _feedPrice(stock);
-        bool dust = trusted ? balance.mulDiv(price, stock.scale) < DUST_USD : balance < DUST_UNITS;
-        bool banded = bandBps < BPS && !dust;
-        if (banded && (!trusted || _outsideBand(stock, price, bandBps))) return (sale, false, true, false);
+        bool stopped = CloseBand.isStopped(bandBps);
+        bool banded;
+        if (!stopped) {
+            bool dust = trusted ? balance.mulDiv(price, stock.scale) < DUST_USD : balance < DUST_UNITS;
+            banded = !dust;
+            if (banded && (!trusted || _outsideBand(stock, price, bandBps))) {
+                return (sale, false, true, false);
+            }
+        }
         uint256 amountIn = balance.mulDiv(fraction, WAD, Math.Rounding.Ceil);
         if (amountIn > balance) amountIn = balance;
         if (amountIn == 0) return (sale, false, false, false);
         uint160 priceLimit;
-        if (bandBps >= BPS) {
+        if (stopped) {
             if (amountIn > maxSale[stock.token]) amountIn = maxSale[stock.token];
-            priceLimit = _priceLimit(stock);
             more = true;
+            (bool sellable, uint256 floor) = _stoppedFloor(price, bandBps);
+            if (sellable) priceLimit = _priceLimit(stock, floor);
             if (priceLimit == 0) return (sale, false, false, true);
         }
         uint256 minOut = banded ? amountIn.mulDiv(price, stock.scale).mulDiv(BPS - bandBps, BPS) : 0;
@@ -509,22 +539,55 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
         sells = true;
     }
 
-    /// The price a full-band sale of `stock` stops at, or nothing when no
-    /// sale should be made now: `SALE_SPACINGS` of its pool's tick spacings
-    /// past the pool's current tick or past its time-weighted tick over
-    /// `twapWindow`, whichever is nearer, in the sale's direction (down when
-    /// the stock is the pool's token0), within the bounds the pool takes.
+    /// The least a stopped station's sale of a stock may take at the feed
+    /// (dollar units per token unit, times `scale`), or nothing when no
+    /// feed bound applies; `sellable` false when no sale may be made now.
+    /// The feed's latest positive answer (`price`, whatever its age or the
+    /// oracle's pause) less the stopped discount: the band, at most
+    /// `FULL_BAND_FEED_BPS`, until the band is full; from then on
+    /// `FULL_BAND_FEED_BPS`, doubling for each `WIDEN_AFTER` since, and no
+    /// bound once that reaches the whole price. Before the full band a
+    /// stock whose feed gives no answer is not sold; from it, the
+    /// time-weighted bound alone applies to it.
+    function _stoppedFloor(
+        uint256 price,
+        uint16 bandBps
+    ) private pure returns (bool sellable, uint256 floor) {
+        uint256 band = CloseBand.band(bandBps);
+        uint256 discount;
+        if (band < BPS) {
+            if (price == 0) return (false, 0);
+            discount = band < FULL_BAND_FEED_BPS ? band : FULL_BAND_FEED_BPS;
+        } else {
+            discount = FULL_BAND_FEED_BPS;
+            for (uint256 past = CloseBand.pastFull(bandBps); past > 0 && discount < BPS; past--) {
+                discount *= 2;
+            }
+            if (discount >= BPS || price == 0) return (true, 0);
+        }
+        // Rounded up: the higher, stricter floor.
+        return (true, price.mulDiv(BPS - discount, BPS, Math.Rounding.Ceil));
+    }
+
+    /// The price a stopped station's sale of `stock` stops at, or nothing
+    /// when no sale should be made now: `SALE_SPACINGS` of its pool's tick
+    /// spacings past the pool's current tick or past its time-weighted tick
+    /// over `twapWindow`, whichever is nearer, in the sale's direction (down
+    /// when the stock is the pool's token0), within the bounds the pool
+    /// takes; and, given a `floor` (`_stoppedFloor`), no further than that.
     /// The time-weighted bound is one no caller can move within the
-    /// transaction that sells, so the sale never takes less than that price
-    /// whoever sends the unwind and however the pool was moved first; the
-    /// bound from the current tick keeps the walk, and so its gas, within
-    /// `SALE_SPACINGS` whichever way the pool was moved. A pool already at
-    /// or past the time-weighted bound, or whose time-weighted price can't
-    /// be read, gets no sale: the next unwind tries again. A fractional
-    /// time-weighted tick is rounded towards the Safe (up for a sale walking
-    /// down, down for one walking up), so the bound is never past the
-    /// time-weighted price less `SALE_SPACINGS`, not even by a tick.
-    function _priceLimit(Stock memory stock) private view returns (uint160) {
+    /// transaction that sells, and the feed's one no caller can move at
+    /// all, so the sale never takes less than the higher of the two whoever
+    /// sends the unwind and however long the pool was held off its price
+    /// first; the bound from the current tick keeps the walk, and so its
+    /// gas, within `SALE_SPACINGS` whichever way the pool was moved (the
+    /// feed's bound only ever shortens it). A pool already at or past the
+    /// limit, or whose time-weighted price can't be read, gets no sale: the
+    /// next unwind tries again. The time-weighted tick and the feed's bound
+    /// are both rounded towards the Safe (up for a sale walking down, down
+    /// for one walking up), so the limit is never past either bound, not
+    /// even by a tick.
+    function _priceLimit(Stock memory stock, uint256 floor) private view returns (uint160) {
         (uint160 sqrtPrice, int24 tick,,,,,) = stock.pool.slot0();
         bool down = stock.token < address(dollar);
         int24 mean;
@@ -539,12 +602,40 @@ contract RobinhoodDriver is IDriver, ICustomCondition {
             uint160 limit = target <= UniswapPrice.MIN_TICK
                 ? MIN_SQRT_RATIO + 1
                 : UniswapPrice.sqrtRatioAtTick(int24(target));
+            if (floor != 0) {
+                // The pool's price is dollars per stock.
+                uint160 atFeed = _sqrtRatio(floor, stock.scale, true);
+                if (atFeed > limit) limit = atFeed;
+            }
             return limit < sqrtPrice ? limit : 0;
         }
         int256 above = (tick < mean ? int256(tick) : int256(mean)) + distance;
         uint160 upper =
             above >= UniswapPrice.MAX_TICK ? MAX_SQRT_RATIO - 1 : UniswapPrice.sqrtRatioAtTick(int24(above));
+        if (floor != 0) {
+            // The pool's price is stock per dollar.
+            uint160 atFeed = _sqrtRatio(stock.scale, floor, false);
+            if (atFeed < upper) upper = atFeed;
+        }
         return upper > sqrtPrice ? upper : 0;
+    }
+
+    /// The square root of `num / den` as a Q64.96, as a pool's price is
+    /// kept: rounded up when `up` and down otherwise, and held within the
+    /// bounds a swap's price limit may take.
+    function _sqrtRatio(uint256 num, uint256 den, bool up) private pure returns (uint160) {
+        Math.Rounding rounding = up ? Math.Rounding.Ceil : Math.Rounding.Floor;
+        uint256 root;
+        if (num / den < 1 << 64) {
+            root = Math.sqrt(num.mulDiv(1 << 192, den, rounding), rounding);
+        } else if (num / den < 1 << 128) {
+            root = Math.sqrt(num.mulDiv(1 << 128, den, rounding), rounding) << 32;
+        } else {
+            return MAX_SQRT_RATIO - 1;
+        }
+        if (root <= MIN_SQRT_RATIO) return MIN_SQRT_RATIO + 1;
+        if (root >= MAX_SQRT_RATIO) return MAX_SQRT_RATIO - 1;
+        return uint160(root);
     }
 
     /// `pool`'s time-weighted tick over `twapWindow`, a fractional mean

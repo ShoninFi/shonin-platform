@@ -1,5 +1,5 @@
 //! Mainnet's Solana deploy: the eight programs that ship, set up and made
-//! final, and the admin's steps prepared for the hardware key.
+//! final, and the admin's steps prepared for the admin's key.
 //!
 //! What ships is fixed here ([`SHIPPING`]): the registry, publishing, the
 //! price list, profiles, the station, the vault, the Confidential Space
@@ -14,7 +14,7 @@
 //! and admin step) and sends nothing; with `--on-fork` a rehearsal on a local
 //! Surfpool fork of mainnet-beta; with `--deployer-keyfile` and
 //! `--confirm-mainnet mainnet-beta` a real send. Every mode needs the admin's
-//! address (`--admin`, the hardware key), which is the registry's, the price
+//! address (`--admin`, the admin's key), which is the registry's, the price
 //! list's and the vault factory's admin and the platform's fee address from
 //! the first instruction.
 //!
@@ -185,7 +185,7 @@ pub struct Decided {
 /// beside a confirmation, and a send missing either of its flags or
 /// confirming anything but `mainnet-beta`. The generation is not asked: no
 /// Solana address depends on it.
-pub fn decide(flags: &Flags) -> Result<Decided> {
+fn parse_admin(flags: &Flags) -> Result<Pubkey> {
     let admin = flags
         .admin
         .as_deref()
@@ -193,7 +193,7 @@ pub fn decide(flags: &Flags) -> Result<Decided> {
         .filter(|admin| !admin.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "ADMIN=<address> is required on mainnet: the hardware key's Solana address, admin \
+                "ADMIN=<address> is required on mainnet: the admin key's Solana address, admin \
                  of every program from the first instruction. Nothing was sent."
             )
         })?;
@@ -206,10 +206,15 @@ pub fn decide(flags: &Flags) -> Result<Decided> {
     if !admin.is_on_curve() {
         bail!(
             "ADMIN ({admin}) is not on the ed25519 curve: no key can ever sign for it (an account \
-             or program-derived address, or a mistyped one). The admin is the hardware key's own \
+             or program-derived address, or a mistyped one). The admin is a key's own \
              address. Nothing was sent."
         );
     }
+    Ok(admin)
+}
+
+pub fn decide(flags: &Flags) -> Result<Decided> {
+    let admin = parse_admin(flags)?;
     let confirm = flags
         .confirm_mainnet
         .as_deref()
@@ -251,6 +256,7 @@ pub fn decide(flags: &Flags) -> Result<Decided> {
             (Some(_), Some(_)) => Mode::Send,
         }
     };
+    crate::mainnet_admin_key::refuse_public_solana_admin(mode, &admin)?;
     Ok(Decided { mode, admin })
 }
 
@@ -1144,7 +1150,7 @@ fn print_plan(planned: &[Planned], admin: &Pubkey, admin_steps: &[AdminStep], st
         "  - make {} final, and read every program's upgrade authority back as none",
         finalised().map(|p| p.name).collect::<Vec<_>>().join(", ")
     );
-    println!("Then the admin's steps, signed by ADMIN ({admin}) with the hardware key:");
+    println!("Then the admin's steps, signed by ADMIN ({admin}) with the admin's key file:");
     for step in admin_steps {
         println!("  - {}", step.purpose);
     }
@@ -2116,8 +2122,8 @@ fn same_place(a: &Path, b: &Path) -> bool {
 /// Refuse directories that don't suit the mode, before anything is sent or
 /// written: every mode reads each `mainnet-id` from this repository's own
 /// programs alone, where a real send writes it; the admin's steps of a fork never go where the
-/// hardware key's are kept (`.shonin/mainnet/admin-steps`) or under the
-/// committed addresses, and the hardware key's never come from the fork's.
+/// mainnet's are kept (`.shonin/mainnet/admin-steps`) or under the
+/// committed addresses, and mainnet's never come from the fork's.
 pub fn check_dirs(mode: Mode, sources: &Path, admin_steps_dir: &Path) -> Result<()> {
     check_sources(sources)?;
     mainnet_guard::check_admin_steps_dir(mode, admin_steps_dir)
@@ -2128,6 +2134,29 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
     let decided = decide(&inputs.flags)?;
     let mode = decided.mode;
     let admin = decided.admin;
+    // The admin's keypair file, first: on a real send the key of the
+    // address made admin of everything for good must exist where the rules
+    // allow.
+    let deployers = match &inputs.flags.deployer_keyfile {
+        Some(path) => vec![
+            keys::read_keypair(path)
+                .map_err(|_| {
+                    anyhow!(
+                        "{} is not a Solana keypair file. Nothing was sent.",
+                        path.display()
+                    )
+                })?
+                .pubkey(),
+        ],
+        None => Vec::new(),
+    };
+    crate::mainnet_admin_key::check_deploy_solana_admin(
+        mode,
+        inputs.flags.admin_keyfile.as_deref(),
+        &admin,
+        &deployers,
+        &mainnet_guard::fork_root(),
+    )?;
     let settings = Settings::mainnet(inputs.project.as_deref())?;
     let ids = compiled_ids();
 
@@ -2214,7 +2243,7 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
         if deployer.pubkey() == admin {
             bail!(
                 "the deployer is ADMIN: the hot deployer must hold no power once the deploy ends, \
-                 and the admin is the hardware key. Nothing was sent."
+                 and the admin is its own key. Nothing was sent."
             );
         }
         if ids.values().any(|id| *id == deployer.pubkey()) {
@@ -2268,10 +2297,21 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
     let now = client.now().await?;
     let found_setup = setup_checks(&read_setup(&client).await?, &admin, &settings, now);
     refuse_another_setup(&found_setup)?;
+    let platform_dollars = platform_dollars_checks(&client, &admin).await?;
+    println!(
+        "The platform's USDC account {} (Circle's USDC {CIRCLE_MAINNET_USDC}, owner ADMIN {admin}, \
+         classic Token program): {}",
+        platform(admin).dollars(&admin),
+        if platform_dollars.iter().all(|check| check.ok) {
+            "there already"
+        } else {
+            "created by the deploy, the deployer paying its rent"
+        }
+    );
     let (deployer, deployer_file) = match deployer {
         None => {
             println!(
-                "Dry run: nothing was sent. Rehearse with ON_FORK=1, or send with DEPLOYER_KEYFILE=<path> CONFIRM_MAINNET={CONFIRMATION}."
+                "Dry run: nothing was sent. Rehearse with ON_FORK=1, or send with DEPLOYER_KEYFILE=<path> ADMIN_KEYFILE=<the admin's keypair file> CONFIRM_MAINNET={CONFIRMATION}."
             );
             return Ok(());
         }
@@ -2541,6 +2581,24 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
             .context("setting the vault factory up")?;
     }
 
+    // The platform's USDC account (the admin's associated token account
+    // for Circle's USDC, classic Token), which publishing's submissions pay
+    // into: created if it isn't there, the deployer paying its rent.
+    let platform_dollars = platform.dollars(&admin);
+    if client.account(&platform_dollars).await?.is_none() {
+        let landed = client
+            .send(
+                vec![platform.ix_open_dollars(&deployer.pubkey(), &admin)],
+                &[&deployer],
+            )
+            .await
+            .context("creating the platform's USDC account")?;
+        println!(
+            "The platform's USDC account {platform_dollars} is created (transaction {})",
+            landed.record.signature
+        );
+    }
+
     // 3. Every set-up account read back from the cluster, then, last, the
     // programs made final and every authority read back as none.
     let now = client.now().await?;
@@ -2639,6 +2697,53 @@ pub async fn deploy(inputs: DeployInputs<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The platform's USDC account read back: the admin's associated token
+/// account for Circle's USDC, there, held by the classic Token program (not
+/// Token-2022), of USDC's mint and owned by the admin.
+pub async fn platform_dollars_checks(client: &SolanaClient, admin: &Pubkey) -> Result<Vec<Check>> {
+    use chain::solana::programs::anchor_spl::token;
+    let at = platform(*admin).dollars(admin);
+    let mut checks = Vec::new();
+    let Some(account) = client.account(&at).await? else {
+        check(
+            &mut checks,
+            format!("the platform's USDC account {at} exists"),
+            false,
+            "absent",
+        );
+        return Ok(checks);
+    };
+    check(
+        &mut checks,
+        format!("the platform's USDC account {at} is held by the classic Token program"),
+        account.owner == token::ID,
+        account.owner.to_string(),
+    );
+    match client.load::<token::TokenAccount>(&at).await {
+        Ok(Some(held)) => {
+            check(
+                &mut checks,
+                "the platform's USDC account is of Circle's USDC",
+                held.mint == CIRCLE_MAINNET_USDC,
+                held.mint.to_string(),
+            );
+            check(
+                &mut checks,
+                "the platform's USDC account is owned by the admin",
+                held.owner == *admin,
+                held.owner.to_string(),
+            );
+        }
+        _ => check(
+            &mut checks,
+            "the platform's USDC account is a token account",
+            false,
+            "unreadable",
+        ),
+    }
+    Ok(checks)
+}
+
 /// The roles a mainnet deployment records: the deployer, and the admin as
 /// admin and platform. Every other role is none until its key exists.
 fn roles(deployer: &Pubkey, admin: &Pubkey) -> SolanaRoles {
@@ -2660,71 +2765,120 @@ fn roles(deployer: &Pubkey, admin: &Pubkey) -> SolanaRoles {
 
 // --- The admin's steps, sent or printed ------------------------------------------------
 
-/// `mainnet-solana-admin-steps`: on a fork, the admin's steps still to do
-/// sent from a stand-in admin's keypair (`admin_keyfile`, which must be
-/// ADMIN), and with `warp` the fork's clock moved past the timelock; on
-/// mainnet never sent: each step still to do is printed and written for the
-/// hardware key.
+/// Beside the deploy's steps, what else the admin is asked to sign on
+/// Solana: a real image proposed, an image revoked, a vault killed.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    pub image: Option<([u8; 32], registry::state::ImageKind)>,
+    pub revoke: Option<[u8; 32]>,
+    pub kill: Option<Pubkey>,
+}
+
+/// The mode and admin for a command that signs as the admin: the admin's
+/// key file and `CONFIRM_MAINNET=mainnet-beta` together send; either alone
+/// is refused; a fork flag beside a confirmation is refused.
+pub fn decide_admin(flags: &Flags) -> Result<Decided> {
+    let admin = parse_admin(flags)?;
+    let mode = mainnet_guard::admin_mode(flags, |given| given == CONFIRMATION, CONFIRMATION)?;
+    crate::mainnet_admin_key::refuse_public_solana_admin(mode, &admin)?;
+    Ok(Decided { mode, admin })
+}
+
+/// Whether a kill is done, to send, or refused, from a Solana vault's
+/// state: killed is done; open, winding down or frozen is to kill; closed
+/// (or none) is refused.
+pub fn judge_kill(vault: &Pubkey, state: vault::state::VaultState) -> Result<bool> {
+    use vault::state::VaultState;
+    match state {
+        VaultState::Killed => Ok(true),
+        VaultState::Open | VaultState::WindingDown | VaultState::Frozen => Ok(false),
+        VaultState::Closed => {
+            bail!("the vault {vault} is already closed: nothing to kill. Nothing was sent.")
+        }
+        VaultState::None => bail!("{vault} is not an open vault. Nothing was sent."),
+    }
+}
+
+/// `mainnet-solana-admin-steps`: the admin's steps still to do (Orca's
+/// driver and the project proposed, and as asked an image proposed or
+/// revoked, a vault killed), read from the cluster. A dry run prints each
+/// one and writes the steps file; with `ADMIN_KEYFILE` and
+/// `CONFIRM_MAINNET=mainnet-beta` each is signed with the admin's keypair
+/// in this process and sent, read again just before its send; on a fork the
+/// same sends are signed by the fork's throwaway admin, and with `warp` the
+/// fork's clock is then moved past the timelock.
 #[allow(clippy::too_many_arguments)]
 pub async fn admin(
     key: &ChainKey,
     config: &ChainConfig,
     flags: &Flags,
-    admin_keyfile: Option<&Path>,
+    deployments_dir: &Path,
     admin_steps_dir: &Path,
     project: Option<&str>,
-    image: Option<([u8; 32], registry::state::ImageKind)>,
+    extra: Extra,
     warp: bool,
 ) -> Result<()> {
-    let decided = decide(flags)?;
+    let decided = decide_admin(flags)?;
+    deploy_steps_wanted(&extra)?;
     let project_id = Settings::mainnet(project)?.project;
-    match decided.mode {
-        Mode::Send => bail!(
-            "the admin's steps are never sent by this tool on mainnet: the hardware key signs them. \
-             Run without DEPLOYER_KEYFILE and CONFIRM_MAINNET to print them. Nothing was sent."
-        ),
-        Mode::DryRun if admin_keyfile.is_some() => bail!(
-            "ADMIN_KEYFILE is a fork's stand-in admin: on mainnet the admin is the hardware key. \
-             Nothing was sent."
-        ),
-        _ => {}
+    if warp && decided.mode != Mode::Fork {
+        bail!("only a fork's clock can be moved (ON_FORK=1). Nothing was sent.");
     }
     check_dirs(decided.mode, &committed_sources(), admin_steps_dir)?;
-    let client = connect(decided.mode, key, config).await?;
-    let mut steps = admin_instructions(&client, decided.admin, project_id, project).await?;
-    if let Some((digest, kind)) = image {
-        // A real image digest, given: proposed once, as one kind, and a
-        // revoked one never again.
-        let held: Option<registry::state::ImageRecord> =
-            client.load(&registry::read::image_address(&digest)).await?;
-        let shown = hex(&digest);
-        match held.filter(|image| image.proposed) {
-            Some(image) if image.kind != kind => bail!(
-                "the image {shown} is already proposed as another kind ({:?}); an image is \
-                 proposed once. Nothing was sent.",
-                image.kind
-            ),
-            Some(image) if image.revoked => bail!(
-                "the image {shown} was revoked; a revoked image can't be proposed again. Nothing \
-                 was sent."
-            ),
-            Some(_) => println!("The image {shown} is proposed already."),
-            None => {
-                let ix = platform(decided.admin).ix_propose_image(digest, kind);
-                steps.push((
-                    AdminStep::of(
-                        "propose-image",
-                        format!(
-                            "registry.propose_image: the {kind:?} image {shown}; it can be blessed \
-                             once the timelock has passed"
-                        ),
-                        &ix,
-                    ),
-                    ix,
-                ));
+    if decided.mode == Mode::Fork && mainnet_guard::is_committed_dir(deployments_dir) {
+        bail!(
+            "a fork rehearsal reads the fork's deployment file, never config/deployments/mainnet. \
+             Nothing was sent."
+        );
+    }
+    // The admin's key is checked before anything is read from the cluster:
+    // never the deployer's (DEPLOYER_KEYFILE's, or the one the deployment
+    // file records).
+    let mut deployers = Vec::new();
+    let file = deployments_dir.join(format!("{}.json", key.file_stem()));
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        let recorded = SolanaDeployments::from_json(&text)?;
+        if let Some(roles) = &recorded.roles {
+            if roles.admin != decided.admin.to_string() {
+                bail!(
+                    "{} records the admin {}, not ADMIN={}. Nothing was sent.",
+                    file.display(),
+                    roles.admin,
+                    decided.admin
+                );
+            }
+            if let Ok(deployer) = roles.deployer.parse::<Pubkey>() {
+                deployers.push(deployer);
             }
         }
+    } else if decided.mode == Mode::Send {
+        bail!(
+            "reading {}: deploy first. Nothing was sent.",
+            file.display()
+        );
     }
+    if let Some(path) = &flags.deployer_keyfile {
+        deployers.push(
+            keys::read_keypair(path)
+                .map_err(|_| {
+                    anyhow!(
+                        "{} is not a Solana keypair file. Nothing was sent.",
+                        path.display()
+                    )
+                })?
+                .pubkey(),
+        );
+    }
+    let signer = crate::mainnet_admin_key::solana_admin_key(
+        decided.mode,
+        flags.admin_keyfile.as_deref(),
+        &decided.admin,
+        &deployers,
+        &mainnet_guard::fork_root(),
+    )?;
+
+    let client = connect(decided.mode, key, config).await?;
+    let steps = steps_to_do(&client, decided.admin, project_id, project, &extra).await?;
     let file = write_admin_steps(
         admin_steps_dir,
         &decided.admin,
@@ -2733,7 +2887,7 @@ pub async fn admin(
             .map(|(step, _)| step.clone())
             .collect::<Vec<_>>(),
     )?;
-    if decided.mode == Mode::DryRun {
+    let Some(signer) = signer else {
         if steps.is_empty() {
             println!("Nothing is left for the admin to sign on Solana.");
         }
@@ -2751,34 +2905,48 @@ pub async fn admin(
             println!("  data {}", step.data);
         }
         println!(
-            "Written to {}. Sign each with the hardware key (ADMIN {}) as its fee payer and only \
-             signer. Nothing was sent.",
+            "Written to {}. Nothing was sent: a send takes ADMIN_KEYFILE=<the admin's keypair> \
+             CONFIRM_MAINNET={CONFIRMATION} (ADMIN {} signs and pays for each).",
             file.display(),
             decided.admin
         );
         return Ok(());
+    };
+    let secret = signer.to_bytes();
+    if decided.mode == Mode::Fork
+        && client.lamports(&signer.pubkey()).await? < LAMPORTS_PER_SOL / 10
+    {
+        client.airdrop(&signer.pubkey(), LAMPORTS_PER_SOL).await?;
     }
-    // A fork: the stand-in admin signs.
-    let admin_keyfile = admin_keyfile.ok_or_else(|| {
-        anyhow!("ADMIN_KEYFILE=<the stand-in admin's keypair> is required to send the admin's steps on a fork")
-    })?;
-    let stand_in = keys::read_keypair(admin_keyfile)?;
-    if stand_in.pubkey() != decided.admin {
-        bail!(
-            "ADMIN_KEYFILE is {}, not ADMIN ({}). Nothing was sent.",
-            stand_in.pubkey(),
-            decided.admin
-        );
-    }
-    if client.lamports(&stand_in.pubkey()).await? < LAMPORTS_PER_SOL / 10 {
-        client.airdrop(&stand_in.pubkey(), LAMPORTS_PER_SOL).await?;
-    }
+    let sending = sending_record(admin_steps_dir);
     for (step, ix) in steps {
-        client
-            .send(vec![ix], &[&stand_in])
+        // An earlier run's send whose transaction may still land (it stopped
+        // before it saw it land or expire) holds every step back.
+        let height = client.rpc.block_height().await?;
+        let recorded = sending_recorded(&sending)?;
+        judge_earlier_send(&recorded, height)?;
+        if recorded.is_some() {
+            // Its blockhash has expired: it can't land any more.
+            std::fs::remove_file(&sending).ok();
+        }
+        // Read again just before the send: one done meanwhile is not sent.
+        let still = steps_to_do(&client, decided.admin, project_id, project, &extra).await?;
+        if !still.iter().any(|(other, _)| other.name == step.name) {
+            println!("done already: {}", step.purpose);
+            continue;
+        }
+        mainnet_guard::write_file(&sending, format!("{} {height}\n", step.name))?;
+        let landed = client
+            .send(vec![ix], &[&signer])
             .await
-            .with_context(|| format!("sending {}", step.name))?;
-        println!("sent {}: {}", step.name, step.purpose);
+            .with_context(|| format!("sending {}", step.name))
+            .map_err(|error| crate::mainnet_admin_key::redacted(error, &secret))?;
+        // Landed: it can't land a second time.
+        std::fs::remove_file(&sending).ok();
+        println!(
+            "sent {}: {} (transaction {}, fee {} lamports)",
+            step.name, step.purpose, landed.record.signature, landed.record.fee
+        );
     }
     if warp {
         let config: registry::state::Config = client
@@ -2796,6 +2964,179 @@ pub async fn admin(
         );
     }
     Ok(())
+}
+
+/// How many blocks after the height read just before a send its
+/// transaction may still land: a blockhash is valid for 150 blocks, and the
+/// send's own blockhash is read a little after (at a lower commitment's
+/// height, perhaps), so twice that is waited.
+pub const SEND_MAY_LAND_FOR: u64 = 300;
+
+/// Where an admin send's name and the block height before it are kept
+/// until the send is seen to land.
+fn sending_record(admin_steps_dir: &Path) -> PathBuf {
+    admin_steps_dir.join("solana-admin-sending")
+}
+
+/// The record of a send not yet seen to land, if one is kept: its step and
+/// the block height read just before it.
+fn sending_recorded(file: &Path) -> Result<Option<(String, u64)>> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Ok(None);
+    };
+    let mut parts = text.split_whitespace();
+    match (
+        parts.next(),
+        parts.next().and_then(|at| at.parse::<u64>().ok()),
+    ) {
+        (Some(step), Some(height)) => Ok(Some((step.to_string(), height))),
+        _ => bail!(
+            "{} is not a send's record: remove it once no admin transaction can still land. \
+             Nothing was sent.",
+            file.display()
+        ),
+    }
+}
+
+/// Refuse to send while an earlier send, recorded as its step and the
+/// block height read just before it, may still land at block height `now`;
+/// past that (or with no record) a send may go.
+pub fn judge_earlier_send(recorded: &Option<(String, u64)>, now: u64) -> Result<()> {
+    match recorded {
+        Some((step, height)) if now <= height + SEND_MAY_LAND_FOR => bail!(
+            "an earlier send of {step} (at block height {height}) was not seen to land and may \
+             still land until block height {}: no step is sent before then (now {now}). Run \
+             again after it: what landed is read as done. Nothing was sent.",
+            height + SEND_MAY_LAND_FOR
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the deploy's own steps (Orca's driver and the project) are
+/// asked for beside `extra`: never beside an emergency step (a revocation
+/// or a kill), which is sent alone, so it can't re-propose a driver the
+/// admin has since replaced or retired. An emergency step beside an
+/// image's proposal is refused.
+pub fn deploy_steps_wanted(extra: &Extra) -> Result<bool> {
+    let emergency = extra.revoke.is_some() || extra.kill.is_some();
+    if emergency && extra.image.is_some() {
+        bail!(
+            "a revocation or a kill is sent alone, never beside an image's proposal: run them \
+             apart. Nothing was sent."
+        );
+    }
+    Ok(!emergency)
+}
+
+/// Every admin step still to do, as the cluster stands: the deploy's own
+/// steps and an image's proposal, or the emergency step asked for alone
+/// ([`deploy_steps_wanted`]).
+async fn steps_to_do(
+    client: &SolanaClient,
+    admin: Pubkey,
+    project_id: Option<[u8; 32]>,
+    project: Option<&str>,
+    extra: &Extra,
+) -> Result<Vec<(AdminStep, Instruction)>> {
+    let mut steps = if deploy_steps_wanted(extra)? {
+        admin_instructions(client, admin, project_id, project).await?
+    } else {
+        Vec::new()
+    };
+    let platform = platform(admin);
+    if let Some((digest, kind)) = extra.image {
+        // A real image digest, given: proposed once, as one kind, and a
+        // revoked one never again.
+        let held: Option<registry::state::ImageRecord> =
+            client.load(&registry::read::image_address(&digest)).await?;
+        let shown = hex(&digest);
+        match held.filter(|image| image.proposed) {
+            Some(image) if image.kind != kind => bail!(
+                "the image {shown} is already proposed as another kind ({:?}); an image is \
+                 proposed once. Nothing was sent.",
+                image.kind
+            ),
+            Some(image) if image.revoked => bail!(
+                "the image {shown} was revoked; a revoked image can't be proposed again. Nothing \
+                 was sent."
+            ),
+            Some(_) => println!("The image {shown} is proposed already."),
+            None => {
+                let ix = platform.ix_propose_image(digest, kind);
+                steps.push((
+                    AdminStep::of(
+                        "propose-image",
+                        format!(
+                            "registry.propose_image: the {kind:?} image {shown}; it can be blessed \
+                             once the timelock has passed"
+                        ),
+                        &ix,
+                    ),
+                    ix,
+                ));
+            }
+        }
+    }
+    if let Some(digest) = extra.revoke {
+        let held: Option<registry::state::ImageRecord> =
+            client.load(&registry::read::image_address(&digest)).await?;
+        let shown = hex(&digest);
+        match held {
+            Some(image) if image.revoked => println!("The image {shown} is revoked already."),
+            Some(image) if image.proposed => {
+                let ix = platform.ix_revoke_image(digest);
+                steps.push((
+                    AdminStep::of(
+                        "revoke-image",
+                        format!(
+                            "registry.revoke_image: the image {shown}, at once and for good: \
+                             keys blessed from it stop counting"
+                        ),
+                        &ix,
+                    ),
+                    ix,
+                ));
+            }
+            _ => println!("The image {shown} was never proposed on Solana: nothing to revoke."),
+        }
+    }
+    if let Some(at) = extra.kill {
+        let account = client
+            .account(&at)
+            .await?
+            .ok_or_else(|| anyhow!("no account at {at}: not a vault. Nothing was sent."))?;
+        if account.owner != vault::ID {
+            bail!(
+                "{at} is not a vault of this deployment's vault program ({}). Nothing was sent.",
+                vault::ID
+            );
+        }
+        let held: vault::state::Vault = client
+            .load(&at)
+            .await?
+            .ok_or_else(|| anyhow!("{at} is not a vault. Nothing was sent."))?;
+        if held.admin != admin {
+            bail!(
+                "the vault {at} names the admin {}, not ADMIN={admin}. Nothing was sent.",
+                held.admin
+            );
+        }
+        if judge_kill(&at, held.state)? {
+            println!("The vault {at} is killed already.");
+        } else {
+            let ix = platform.ix_kill(&admin, &at);
+            steps.push((
+                AdminStep::of(
+                    "kill-vault",
+                    format!("vault.kill: the vault {at} stops at once, and its station unwinds"),
+                    &ix,
+                ),
+                ix,
+            ));
+        }
+    }
+    Ok(steps)
 }
 
 // --- The read-back -----------------------------------------------------------------------
@@ -2892,6 +3233,27 @@ pub async fn verify(
             format!("{} bytes", so.len()),
         );
     }
+
+    // The custody: the admin is one key (on the ed25519 curve), not the
+    // deployer, and the platform (the admin) holds Circle's USDC account.
+    check(
+        &mut checks,
+        "the admin is a key's own address (on the ed25519 curve)",
+        admin.is_on_curve(),
+        admin.to_string(),
+    );
+    let recorded_deployer = deployments
+        .roles
+        .as_ref()
+        .map(|roles| roles.deployer.clone())
+        .unwrap_or_default();
+    check(
+        &mut checks,
+        "the admin is not the deployer",
+        !recorded_deployer.is_empty() && recorded_deployer != admin.to_string(),
+        recorded_deployer,
+    );
+    checks.extend(platform_dollars_checks(&client, &admin).await?);
 
     // Every setting the set-up fixed, read from the cluster.
     checks.extend(setup_checks(
@@ -3034,6 +3396,153 @@ pub async fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_solana_admin_signs_with_its_key_file_and_mainnet_beta_s_confirmation_together_alone() {
+        let mut given = flags();
+        assert_eq!(decide_admin(&given).unwrap().mode, Mode::DryRun);
+        given.admin_keyfile = Some(PathBuf::from("admin.json"));
+        assert!(
+            decide_admin(&given).is_err(),
+            "a key file without the confirmation"
+        );
+        given.confirm_mainnet = Some("mainnet".to_string());
+        assert!(
+            decide_admin(&given).is_err(),
+            "a confirmation of another cluster"
+        );
+        given.confirm_mainnet = Some(CONFIRMATION.to_string());
+        assert_eq!(decide_admin(&given).unwrap().mode, Mode::Send);
+        given.admin_keyfile = None;
+        assert!(
+            decide_admin(&given).is_err(),
+            "a confirmation without the key file"
+        );
+        given.on_fork = true;
+        assert!(
+            decide_admin(&given).is_err(),
+            "a fork beside a confirmation"
+        );
+        given.confirm_mainnet = None;
+        assert_eq!(decide_admin(&given).unwrap().mode, Mode::Fork);
+    }
+
+    #[test]
+    fn a_revocation_or_a_kill_is_sent_alone_never_beside_the_deploy_s_steps() {
+        let digest = [7u8; 32];
+        let revoke = Extra {
+            revoke: Some(digest),
+            ..Extra::default()
+        };
+        let kill = Extra {
+            kill: Some(Pubkey::new_unique()),
+            ..Extra::default()
+        };
+        assert!(!deploy_steps_wanted(&revoke).unwrap());
+        assert!(!deploy_steps_wanted(&kill).unwrap());
+        let both = Extra {
+            revoke: Some(digest),
+            kill: Some(Pubkey::new_unique()),
+            ..Extra::default()
+        };
+        assert!(!deploy_steps_wanted(&both).unwrap());
+        // The deploy's own steps, and an image's proposal beside them.
+        assert!(deploy_steps_wanted(&Extra::default()).unwrap());
+        let image = Extra {
+            image: Some((digest, registry::state::ImageKind::Executor)),
+            ..Extra::default()
+        };
+        assert!(deploy_steps_wanted(&image).unwrap());
+        let mixed = Extra {
+            image: Some((digest, registry::state::ImageKind::Executor)),
+            kill: Some(Pubkey::new_unique()),
+            ..Extra::default()
+        };
+        assert!(
+            deploy_steps_wanted(&mixed)
+                .unwrap_err()
+                .to_string()
+                .contains("Nothing was sent")
+        );
+    }
+
+    #[test]
+    fn a_send_that_may_still_land_holds_every_step_back_until_its_blockhash_expires() {
+        assert!(judge_earlier_send(&None, 1_000).is_ok());
+        let recorded = Some(("revoke-image".to_string(), 1_000));
+        for now in [1_000, 1_001, 1_000 + SEND_MAY_LAND_FOR] {
+            assert!(
+                judge_earlier_send(&recorded, now)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("may still land")
+            );
+        }
+        assert!(judge_earlier_send(&recorded, 1_001 + SEND_MAY_LAND_FOR).is_ok());
+        const { assert!(SEND_MAY_LAND_FOR >= 150) };
+        let dir = scratch("sending-record");
+        let file = sending_record(&dir);
+        assert_eq!(sending_recorded(&file).unwrap(), None);
+        std::fs::write(&file, "kill-vault 42\n").unwrap();
+        assert_eq!(
+            sending_recorded(&file).unwrap(),
+            Some(("kill-vault".to_string(), 42))
+        );
+        std::fs::write(&file, "garbled").unwrap();
+        assert!(sending_recorded(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fork_s_throwaway_admin_is_refused_on_solana_mainnet_in_every_mode_but_the_fork() {
+        use chain::solana::Signer;
+        let throwaway =
+            crate::mainnet_admin_key::solana_throwaway(&mainnet_guard::fork_root()).unwrap();
+        let mut given = flags();
+        given.admin = Some(throwaway.pubkey().to_string());
+        assert!(
+            decide(&given)
+                .unwrap_err()
+                .to_string()
+                .contains("throwaway")
+        );
+        assert!(decide_admin(&given).is_err());
+        given.deployer_keyfile = Some(PathBuf::from("deployer.json"));
+        given.confirm_mainnet = Some(CONFIRMATION.to_string());
+        assert!(
+            decide(&given)
+                .unwrap_err()
+                .to_string()
+                .contains("throwaway")
+        );
+        let mut fork = flags();
+        fork.admin = Some(throwaway.pubkey().to_string());
+        fork.on_fork = true;
+        assert_eq!(decide(&fork).unwrap().mode, Mode::Fork);
+        assert_eq!(decide_admin(&fork).unwrap().mode, Mode::Fork);
+    }
+
+    #[test]
+    fn a_solana_vault_killed_already_is_done_and_a_closed_one_is_refused() {
+        use vault::state::VaultState;
+        let at = Pubkey::new_unique();
+        assert!(judge_kill(&at, VaultState::Killed).unwrap());
+        for open in [
+            VaultState::Open,
+            VaultState::WindingDown,
+            VaultState::Frozen,
+        ] {
+            assert!(!judge_kill(&at, open).unwrap());
+        }
+        for refused in [VaultState::Closed, VaultState::None] {
+            assert!(
+                judge_kill(&at, refused)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Nothing was sent")
+            );
+        }
+    }
 
     fn flags() -> Flags {
         Flags {
@@ -3953,8 +4462,8 @@ mod tests {
         let dir_ = dir.clone();
         let dir = committed_sources();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // A fork's admin steps never where the hardware key's are kept, by
-        // any spelling, and the hardware key's never from the fork's.
+        // A fork's admin steps never where mainnet's are kept, by
+        // any spelling, and mainnet's never from the fork's.
         let real = root.join(".shonin/mainnet/admin-steps");
         assert!(check_dirs(Mode::Fork, &dir, &real).is_err());
         assert!(

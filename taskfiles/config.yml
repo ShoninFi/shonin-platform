@@ -56,8 +56,11 @@ vars:
   # contracts are not on the fork.
   OVERWRITE_FORK_RECORD: ""
   # Solana's: the owner's program keypairs (<library name>-keypair.json
-  # each), and on a fork the stand-in admin's keypair.
+  # each).
   MAINNET_PROGRAM_KEYPAIRS: ""
+  # The admin's key file (EVM: one 0x line; Solana: a keypair JSON), outside
+  # this repository and readable by its owner alone: the admin's steps sign
+  # with it, and a real deploy reads it for ADMIN's address.
   ADMIN_KEYFILE: ""
 
   # Paths
@@ -118,13 +121,14 @@ vars:
   # A mainnet rehearsal on local forks (ON_FORK=1) writes under
   # .shonin/mainnet-fork instead, and never beside the committed addresses.
   PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "deployments"}}{{else}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{end}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
-  # Where the mainnet deploy writes the admin's prepared steps (and their
-  # commands for the hardware wallet): never committed.
+  # Where the mainnet deploy writes the admin's prepared steps: never
+  # committed.
   PATH_MAINNET_ADMIN_STEPS: '{{if .ON_FORK}}{{joinPath .PATH_ROOT ".shonin" "mainnet-fork" "admin-steps"}}{{else}}{{joinPath .PATH_ROOT ".shonin" "mainnet" "admin-steps"}}{{end}}'
   # What every mainnet command takes, from the task's own arguments alone:
-  # ADMIN=<the hardware key's address>, GENERATION=1, and to send either
+  # ADMIN=<the admin key's address>, GENERATION=1, and to send either
   # ON_FORK=1 (local forks only) or DEPLOYER_KEYFILE=<path> with
-  # CONFIRM_MAINNET=<the chain ids, comma-separated>.
+  # CONFIRM_MAINNET=<the chain ids, comma-separated> (ADMIN_KEYFILE is
+  # passed by the tasks that read it).
   MAINNET_ARGS: >-
     {{if .ADMIN}}--admin {{shellQuote .ADMIN}}{{end}}
     {{if .DEPLOYER_KEYFILE}}--deployer-keyfile {{shellQuote .DEPLOYER_KEYFILE}}{{end}}

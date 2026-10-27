@@ -24,6 +24,7 @@ mod economics;
 mod fund;
 mod fund_wallet;
 mod hyperliquid_vaults;
+mod mainnet_admin_key;
 mod mainnet_evm;
 mod mainnet_guard;
 mod mainnet_keeper;
@@ -116,10 +117,18 @@ struct Args {
 /// each is given on the command line, by the owner, for this run.
 #[derive(clap::Args, Clone, Debug, Default)]
 struct MainnetArgs {
-    /// The hardware key's address: admin of every contract from the first
+    /// The admin key's address: admin of every contract from the first
     /// transaction, and where the platform's fees go. Required.
     #[arg(long)]
     admin: Option<String>,
+    /// A file holding the admin's key (EVM: one 0x hex line; Solana: a
+    /// keypair JSON), held by the owner outside this repository, readable by
+    /// its owner alone. With --confirm-mainnet the admin's steps are signed
+    /// with it, in this process, and sent; a real deploy takes it too, read
+    /// for its address alone (it must be ADMIN's). On a fork, the tool's
+    /// throwaway admin is taken without it.
+    #[arg(long)]
+    admin_keyfile: Option<PathBuf>,
     /// A file holding the deployer's private key (one 0x hex line), held by
     /// the owner. With --confirm-mainnet, a real send.
     #[arg(long)]
@@ -145,6 +154,7 @@ impl MainnetArgs {
             confirm_mainnet: self.confirm_mainnet.clone(),
             on_fork: self.on_fork,
             generation: self.mainnet_generation,
+            admin_keyfile: self.admin_keyfile.clone(),
         }
     }
 }
@@ -160,8 +170,9 @@ enum Command {
     /// Mainnet's EVM deploy, of exactly what ships on each chain: without
     /// the sending flags a dry run printing every contract, its arguments,
     /// its address and the admin's steps; with --on-fork a rehearsal on
-    /// local forks; with --deployer-keyfile and --confirm-mainnet a real
-    /// send. The admin's steps are written for the hardware key.
+    /// local forks; with --deployer-keyfile, --admin-keyfile and
+    /// --confirm-mainnet a real send. The admin's steps are written for the admin's key
+    /// (`mainnet-admin-steps` signs and sends them).
     MainnetDeploy {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -172,7 +183,8 @@ enum Command {
         #[arg(long)]
         admin_steps_dir: PathBuf,
         /// The operator's Google Cloud project, proposed among the admin's
-        /// steps once it exists.
+        /// steps once it exists; its hash is recorded in the deployment
+        /// file, and the admin's steps propose no other.
         #[arg(long)]
         project: Option<String>,
         /// On a fork rehearsal alone: replace a recorded deployment file
@@ -182,10 +194,12 @@ enum Command {
         #[arg(long)]
         overwrite_fork_record: bool,
     },
-    /// Mainnet: the admin's prepared steps. On a fork, sent as the admin
-    /// (impersonated), and with --warp the fork's clock moved past the
-    /// timelock; on mainnet never sent, but each step's command for the
-    /// hardware wallet printed and written beside the steps.
+    /// Mainnet: the admin's prepared steps. Alone a dry run listing each
+    /// step still to do (chain, target, calldata, what it does), sending
+    /// nothing; with --admin-keyfile and --confirm-mainnet each step still
+    /// to do signed with the admin's key in this process and sent; with
+    /// --on-fork signed by the fork's throwaway admin and sent to the forks,
+    /// --warp then moving their clocks past the timelock.
     MainnetAdminSteps {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -193,6 +207,11 @@ enum Command {
         admin_steps_dir: PathBuf,
         #[arg(long)]
         warp: bool,
+        /// The operator's Google Cloud project to propose: the only project
+        /// the steps propose (never one the steps file names), and the one
+        /// the deploy recorded when it recorded one.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// A local Surfpool fork of mainnet-beta for ON_FORK=1 rehearsals, its
     /// datasource a read-only forwarder on this machine that passes on reads
@@ -238,8 +257,8 @@ enum Command {
     /// Mainnet's Solana deploy, from a build with the mainnet ids: without
     /// the sending flags a dry run printing the plan; with --on-fork a
     /// rehearsal on a local Surfpool fork of mainnet-beta; with
-    /// --deployer-keyfile and --confirm-mainnet mainnet-beta a real send.
-    /// Every program is set up, made final and read back final.
+    /// --deployer-keyfile, --admin-keyfile and --confirm-mainnet mainnet-beta
+    /// a real send. Every program is set up, made final and read back final.
     MainnetSolanaDeploy {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -258,15 +277,15 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Mainnet's Solana admin steps: on a fork sent from the stand-in
-    /// admin's keypair (--admin-keyfile, which must be --admin), with --warp
-    /// past the timelock; on mainnet never sent, but printed and written for
-    /// the hardware key.
+    /// Mainnet's Solana admin steps (and as asked an image proposed or
+    /// revoked, a vault killed): alone a dry run printing and writing each
+    /// step still to do; with --admin-keyfile and --confirm-mainnet
+    /// mainnet-beta signed with the admin's keypair in this process and
+    /// sent; with --on-fork signed by the fork's throwaway admin, --warp
+    /// then moving the fork's clock past the timelock.
     MainnetSolanaAdminSteps {
         #[command(flatten)]
         mainnet: MainnetArgs,
-        #[arg(long)]
-        admin_keyfile: Option<PathBuf>,
         #[arg(long)]
         admin_steps_dir: PathBuf,
         #[arg(long)]
@@ -278,6 +297,13 @@ enum Command {
         /// executor, builder, reviewer or unwinder.
         #[arg(long, requires = "image_digest")]
         image_kind: Option<String>,
+        /// An image digest (`sha256:<64 hex>`) to revoke, at once and for
+        /// good, as a step too.
+        #[arg(long)]
+        revoke_digest: Option<String>,
+        /// A vault of this deployment to kill, as a step too.
+        #[arg(long)]
+        kill_vault: Option<String>,
         #[arg(long)]
         warp: bool,
     },
@@ -329,10 +355,10 @@ enum Command {
     },
     /// Mainnet: propose a real image digest on each EVM chain's registry
     /// (or --vault-chain's) as the admin's step, from the deployment files:
-    /// with --on-fork sent as the admin, impersonated (--warp then moves the
-    /// forks' clocks past the timelock); otherwise never sent, each step
-    /// still to do printed for the hardware wallet and written beside the
-    /// deploy's admin steps.
+    /// alone a dry run listing each proposal still to do; with
+    /// --admin-keyfile and --confirm-mainnet signed with the admin's key and
+    /// sent; with --on-fork signed by the fork's throwaway admin (--warp then
+    /// moves the forks' clocks past the timelock).
     MainnetImage {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -347,6 +373,48 @@ enum Command {
         #[arg(long)]
         warp: bool,
     },
+    /// Mainnet: revoke an image digest on each EVM chain's registry (or
+    /// --vault-chain's), at once and for good, as the admin. Alone a dry run
+    /// printing each revocation still to do; with --admin-keyfile and
+    /// --confirm-mainnet signed with the admin's key and sent; with
+    /// --on-fork sent by the fork's throwaway admin. Already revoked is
+    /// done; one never proposed on a chain is left alone there.
+    MainnetRevokeImage {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// `sha256:<64 hex>`.
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+    },
+    /// Mainnet: kill a vault of this deployment's factory on the chain
+    /// --vault-chain names, as the admin, in the same three modes. Killed
+    /// already is done; a vault this deployment's factory didn't make is
+    /// refused.
+    MainnetKillVault {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        /// The vault's address.
+        #[arg(long)]
+        vault: String,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+    },
+    /// Mainnet: clear the root key's record on the canonical chain (`root`
+    /// in the chain config), as the admin, in the same three modes. No root
+    /// recorded is done.
+    MainnetClearRootKey {
+        #[command(flatten)]
+        mainnet: MainnetArgs,
+        #[arg(long)]
+        admin_steps_dir: PathBuf,
+    },
+    /// Mainnet: a fork rehearsal's throwaway admin, made the first time
+    /// (readable by its owner alone) and recorded, so a real send refuses
+    /// it: its EVM address, or with --vault-chain solana its Solana public
+    /// key. Prints nothing else and sends nothing.
+    MainnetForkAdmin,
     MainnetVerify {
         #[command(flatten)]
         mainnet: MainnetArgs,
@@ -730,6 +798,10 @@ async fn main() -> Result<()> {
                 | Command::MainnetVerify { .. }
                 | Command::MainnetRecordKeeper { .. }
                 | Command::MainnetImage { .. }
+                | Command::MainnetRevokeImage { .. }
+                | Command::MainnetKillVault { .. }
+                | Command::MainnetClearRootKey { .. }
+                | Command::MainnetForkAdmin
                 | Command::MainnetVerifySource { .. }
                 | Command::MainnetSolanaIds { .. }
                 | Command::MainnetSolanaDeploy { .. }
@@ -808,11 +880,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::MainnetSolanaAdminSteps {
             mainnet,
-            admin_keyfile,
             admin_steps_dir,
             project,
             image_digest,
             image_kind,
+            revoke_digest,
+            kill_vault,
             warp,
         }) => {
             let (key, config) = solana_mainnet()?;
@@ -826,14 +899,31 @@ async fn main() -> Result<()> {
                 }
                 _ => None,
             };
+            let revoke = revoke_digest
+                .as_deref()
+                .map(admin::image_digest)
+                .transpose()?
+                .map(|digest| digest.0);
+            let kill = kill_vault
+                .as_deref()
+                .map(|vault| {
+                    vault.trim().parse::<chain::solana::Pubkey>().map_err(|_| {
+                        anyhow!("VAULT is not a Solana address ({vault}). Nothing was sent.")
+                    })
+                })
+                .transpose()?;
             mainnet_solana::admin(
                 &key,
                 &config,
                 &mainnet.flags(),
-                admin_keyfile.as_deref(),
+                &target.deployments_dir,
                 &admin_steps_dir,
                 project.as_deref(),
-                image,
+                mainnet_solana::Extra {
+                    image,
+                    revoke,
+                    kill,
+                },
                 warp,
             )
             .await
@@ -924,11 +1014,14 @@ async fn main() -> Result<()> {
             mainnet,
             admin_steps_dir,
             warp,
+            project,
         }) => {
-            mainnet_evm::admin(
+            mainnet_evm::act(
                 only(&target, one, evm_chains(&target)),
+                &target.deployments_dir,
                 &admin_steps_dir,
                 &mainnet.flags(),
+                mainnet_evm::AdminAction::DeploySteps { project },
                 warp,
             )
             .await
@@ -940,14 +1033,100 @@ async fn main() -> Result<()> {
             admin_steps_dir,
             warp,
         }) => {
-            mainnet_evm::image(
+            crate::admin::kind_named(&kind)?;
+            mainnet_evm::act(
                 only(&target, one, evm_chains(&target)),
                 &target.deployments_dir,
                 &admin_steps_dir,
                 &mainnet.flags(),
-                admin::image_digest(&digest)?,
-                &kind,
+                mainnet_evm::AdminAction::ProposeImage {
+                    digest: admin::image_digest(&digest)?,
+                    kind_name: kind,
+                },
                 warp,
+            )
+            .await
+        }
+        Some(Command::MainnetForkAdmin) => {
+            let fork_root = mainnet_guard::fork_root();
+            if one && target.key.kind == ChainKind::Solana {
+                use chain::solana::Signer;
+                println!(
+                    "{}",
+                    mainnet_admin_key::solana_throwaway(&fork_root)?.pubkey()
+                );
+            } else {
+                println!(
+                    "{:?}",
+                    mainnet_admin_key::evm_throwaway(&fork_root)?.address()
+                );
+            }
+            Ok(())
+        }
+        Some(Command::MainnetRevokeImage {
+            mainnet,
+            digest,
+            admin_steps_dir,
+        }) => {
+            mainnet_evm::act(
+                only(&target, one, evm_chains(&target)),
+                &target.deployments_dir,
+                &admin_steps_dir,
+                &mainnet.flags(),
+                mainnet_evm::AdminAction::RevokeImage {
+                    digest: admin::image_digest(&digest)?,
+                },
+                false,
+            )
+            .await
+        }
+        Some(Command::MainnetKillVault {
+            mainnet,
+            vault,
+            admin_steps_dir,
+        }) => {
+            if !one {
+                bail!(
+                    "a vault is killed on the chain it is on: name it with --vault-chain. Nothing was sent."
+                );
+            }
+            let vault: alloy::primitives::Address = vault
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("VAULT is not an address ({vault}). Nothing was sent."))?;
+            mainnet_evm::act(
+                only(&target, one, evm_chains(&target)),
+                &target.deployments_dir,
+                &admin_steps_dir,
+                &mainnet.flags(),
+                mainnet_evm::AdminAction::KillVault { vault },
+                false,
+            )
+            .await
+        }
+        Some(Command::MainnetClearRootKey {
+            mainnet,
+            admin_steps_dir,
+        }) => {
+            let root = target
+                .configs
+                .network(target.network)
+                .and_then(|network| network.root())
+                .map(|(_, key)| key.clone())
+                .ok_or_else(|| {
+                    anyhow!("the mainnet network names no canonical chain for the root key (`root` in the chain config). Nothing was sent.")
+                })?;
+            let chains: Vec<(ChainKey, ChainConfig)> = evm_chains(&target)
+                .into_iter()
+                .filter(|(key, _)| *key == root)
+                .collect();
+            mainnet_evm::act(
+                chains,
+                &target.deployments_dir,
+                &admin_steps_dir,
+                &mainnet.flags(),
+                mainnet_evm::AdminAction::ClearRootKey,
+                false,
             )
             .await
         }
@@ -1906,7 +2085,7 @@ pub const MAINNET_MISSING: &str = "The devnet's development commands don't touch
 they deploy is the stand-in stack (a dollar anyone may mint, a stand-in venue, and an attestation \
 verifier that trusts one development key) and they sign as roles derived from a mnemonic. Mainnet \
 has its own: `task chains:deploy NETWORK=mainnet` (mainnet-deploy) deploys only what ships, \
-`task chains:admin-steps NETWORK=mainnet` prepares the hardware key's steps, and \
+`task chains:admin-steps NETWORK=mainnet` lists, or signs and sends, the admin's steps, and \
 `task chains:verify-deploy NETWORK=mainnet` reads it all back.";
 
 /// Each role's account on every EVM chain of the network, with its gas, and

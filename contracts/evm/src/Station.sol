@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {CloseBand} from "./drivers/CloseBand.sol";
 import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
 import {Call, ExitPath, IDelayedDriver, IDriver} from "./interfaces/IDriver.sol";
 import {IStation, IStationFactory, IStationVault, Send, Stage, StationSpec} from "./interfaces/IStation.sol";
@@ -42,10 +43,9 @@ contract Station is IStation, ReentrancyGuardTransient {
     using StationStorage for StationLayout;
 
     uint256 private constant WAD = 1e18;
-    uint256 private constant BPS = 10_000;
     /// A stopped station's full unwind keeps the exit band this long after
     /// the stop, then the band doubles each time this passes again.
-    uint64 public constant WIDEN_AFTER = 7 days;
+    uint64 public constant WIDEN_AFTER = StationStorage.WIDEN_AFTER;
     /// What a best-effort revoke may spend in all: far more than a venue's
     /// revoke costs, far less than a block.
     uint256 private constant BEST_EFFORT_GAS = 2_000_000;
@@ -454,14 +454,8 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// until any price is accepted. No key sets it; only time does.
     function stoppedBand() public view returns (uint16) {
         StationLayout storage s = StationStorage.layout();
-        uint256 band = s.spec.exitBandBps;
-        if (!s.stopped || block.timestamp < uint256(s.stoppedAt) + WIDEN_AFTER) return uint16(band);
-        uint256 doublings = (block.timestamp - s.stoppedAt) / WIDEN_AFTER;
-        if (band == 0) band = 1;
-        // 2^14 bps is past any price, so stop doubling there.
-        if (doublings >= 14) return uint16(BPS);
-        band <<= doublings;
-        return uint16(band > BPS ? BPS : band);
+        if (!s.stopped) return s.spec.exitBandBps;
+        return CloseBand.band(s.unwindBand());
     }
 
     function approvedKey(bytes32 driver) external view returns (address) {

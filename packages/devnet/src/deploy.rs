@@ -1123,6 +1123,10 @@ const BATCH_BYTES: usize = 96_000;
 /// The gas a big block holds on HyperEVM.
 const HYPEREVM_BIG_BLOCK_GAS: u64 = 30_000_000;
 
+/// The gas a small block holds on HyperEVM: where an account's
+/// transactions go unless it asked HyperCore for big blocks.
+pub const HYPEREVM_SMALL_BLOCK_GAS: u64 = 2_000_000;
+
 /// The most gas one transaction may carry on this chain: a big block's on
 /// HyperEVM (the deployer's transactions go into them), and elsewhere the
 /// per-transaction cap the newest chains enforce.

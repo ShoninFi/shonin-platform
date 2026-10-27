@@ -40,7 +40,7 @@ pub const MAINNET_GENERATION: u64 = 1;
 /// The flags a mainnet command takes, as given.
 #[derive(Clone, Debug, Default)]
 pub struct Flags {
-    /// The hardware key's address: admin of everything from the first
+    /// The admin key's address: admin of everything from the first
     /// transaction.
     pub admin: Option<String>,
     /// A file holding the deployer's private key (one `0x` hex line), named
@@ -52,6 +52,9 @@ pub struct Flags {
     pub on_fork: bool,
     /// The deployment generation, given explicitly.
     pub generation: Option<u64>,
+    /// A file holding the admin's key, named by the owner: with
+    /// `confirm_mainnet`, the admin's steps are signed with it and sent.
+    pub admin_keyfile: Option<PathBuf>,
 }
 
 /// How a mainnet command runs.
@@ -141,6 +144,69 @@ pub fn decide_without_generation(flags: &Flags, chain_ids: &[u64]) -> Result<(Mo
     mode_and_admin(flags, chain_ids)
 }
 
+/// The mode the flags ask for, with the admin, for a command that signs as
+/// the admin (its steps, an image, a revocation, a kill, the root key's
+/// clearing): the admin's key file and the confirmation together send, and
+/// either alone is refused; neither is a dry run; a fork flag beside a
+/// confirmation is refused. The deployer's key file, if given, only names a
+/// key the admin's must not be.
+pub fn decide_admin(flags: &Flags, chain_ids: &[u64]) -> Result<(Mode, Address)> {
+    if let Some(generation) = flags.generation
+        && generation != MAINNET_GENERATION
+    {
+        bail!(
+            "GENERATION={generation} is refused: the mainnet deployment is generation \
+             {MAINNET_GENERATION}, and no other. Nothing was sent."
+        );
+    }
+    let admin = parse_admin(flags)?;
+    if chain_ids.is_empty() {
+        bail!("no mainnet chain to send to");
+    }
+    let mode = admin_mode(
+        flags,
+        |given| confirms(given, chain_ids),
+        &confirmation_for(chain_ids),
+    )?;
+    crate::mainnet_admin_key::refuse_public_evm_admin(mode, admin)?;
+    Ok((mode, admin))
+}
+
+/// The admin-signing mode from the flags, with `confirmed` judging the
+/// confirmation and `wanted` the one to name: shared by every chain.
+pub fn admin_mode(flags: &Flags, confirmed: impl Fn(&str) -> bool, wanted: &str) -> Result<Mode> {
+    let confirm = flags
+        .confirm_mainnet
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if flags.on_fork {
+        if confirm.is_some() {
+            bail!(
+                "ON_FORK and CONFIRM_MAINNET together: a rehearsal on forks never confirms a \
+                 mainnet send. Pass one or the other. Nothing was sent."
+            );
+        }
+        return Ok(Mode::Fork);
+    }
+    match (&flags.admin_keyfile, confirm) {
+        (None, None) => Ok(Mode::DryRun),
+        (None, Some(_)) => bail!(
+            "sending is refused: CONFIRM_MAINNET is given but no ADMIN_KEYFILE=<path> (the \
+             admin's key, from a file the owner holds). Nothing was sent."
+        ),
+        (Some(_), None) => bail!(
+            "sending is refused: ADMIN_KEYFILE is given but no CONFIRM_MAINNET={wanted} (what is \
+             being sent to). Nothing was sent."
+        ),
+        (Some(_), Some(given)) if !confirmed(given) => bail!(
+            "sending is refused: CONFIRM_MAINNET={given} does not name exactly what is being \
+             sent to ({wanted}). Nothing was sent."
+        ),
+        (Some(_), Some(_)) => Ok(Mode::Send),
+    }
+}
+
 /// The admin's address, required: never missing, never zero.
 fn parse_admin(flags: &Flags) -> Result<Address> {
     let admin = flags
@@ -150,7 +216,7 @@ fn parse_admin(flags: &Flags) -> Result<Address> {
         .filter(|admin| !admin.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "ADMIN=<address> is required on mainnet: the hardware key's address, admin of every \
+                "ADMIN=<address> is required on mainnet: the admin key's address, admin of every \
                  contract from the first transaction. Nothing was sent."
             )
         })?;
@@ -163,7 +229,15 @@ fn parse_admin(flags: &Flags) -> Result<Address> {
     Ok(admin)
 }
 
+/// The mode and the admin, with an admin anyone (or a fork rehearsal)
+/// holds the key of refused on mainnet in every mode.
 fn mode_and_admin(flags: &Flags, chain_ids: &[u64]) -> Result<(Mode, Address)> {
+    let (mode, admin) = mode_and_any_admin(flags, chain_ids)?;
+    crate::mainnet_admin_key::refuse_public_evm_admin(mode, admin)?;
+    Ok((mode, admin))
+}
+
+fn mode_and_any_admin(flags: &Flags, chain_ids: &[u64]) -> Result<(Mode, Address)> {
     let admin = parse_admin(flags)?;
     if chain_ids.is_empty() {
         bail!("no mainnet chain to deploy to");
@@ -501,9 +575,9 @@ pub fn is_under(dir: &Path, place: &Path) -> bool {
 }
 
 /// Refuse an admin-steps directory that doesn't suit the mode, before
-/// anything is sent or written: a fork's steps never go where the hardware
-/// key's are kept (`.shonin/mainnet/admin-steps`) or under the committed
-/// addresses, and the hardware key's never come from, or go to, the fork's
+/// anything is sent or written: a fork's steps never go where mainnet's are
+/// kept (`.shonin/mainnet/admin-steps`) or under the committed
+/// addresses, and mainnet's never come from, or go to, the fork's
 /// (`.shonin/mainnet-fork`). Each is matched however it is spelled.
 pub fn check_admin_steps_dir(mode: Mode, dir: &Path) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
@@ -517,7 +591,7 @@ pub fn check_admin_steps_dir(mode: Mode, dir: &Path) -> Result<()> {
     match mode {
         Mode::Fork if under(&real_steps) || is_committed_dir(dir) => bail!(
             "a fork rehearsal writes its admin steps under .shonin/mainnet-fork, never where \
-             the hardware key's are kept ({}). Nothing was sent.",
+             mainnet's are kept ({}). Nothing was sent.",
             dir.display()
         ),
         Mode::Send | Mode::DryRun if under(&fork_root) => bail!(
@@ -649,8 +723,73 @@ pub fn read_key_file(path: &Path) -> Result<PrivateKeySigner> {
 /// Anvil's well-known development mnemonic: its accounts' keys are public.
 const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
-/// How many of the mnemonic's accounts anvil funds by default.
+/// How many of the mnemonic's accounts anvil funds by default: the keys a
+/// fork rehearsal may sign with.
 const ANVIL_ACCOUNTS: usize = 10;
+
+/// How many of the public development mnemonic's accounts mainnet refuses
+/// along each common path. Every one of them is public (`anvil --accounts <n>` and Hardhat's node
+/// print their keys); the first thousand cover any count a development
+/// tool is asked to list, and are derived once per run, when first needed.
+pub const PUBLIC_DEVELOPMENT_ACCOUNTS: u32 = 1000;
+
+/// The addresses of anvil's public development keys (the ten a fork may
+/// sign with).
+pub fn anvil_addresses() -> Result<Vec<Address>> {
+    Ok(chain::keys_from_mnemonic(ANVIL_MNEMONIC, ANVIL_ACCOUNTS)?
+        .iter()
+        .map(|key| key.address())
+        .collect())
+}
+
+/// The EVM addresses of the public development mnemonic's first `count`
+/// indices along `m/44'/60'/0'/0/<i>` (anvil's, Hardhat's and MetaMask's)
+/// and along `m/44'/60'/<i>'/0/0` (Ledger Live's): the seed and the parent
+/// keys are derived once, then each index from its parent.
+fn public_development_addresses(count: u32) -> Result<Vec<Address>> {
+    use alloy::signers::k256::ecdsa::SigningKey;
+    use alloy::signers::local::coins_bip39::{English, Mnemonic};
+    let mnemonic = Mnemonic::<English>::new_from_phrase(ANVIL_MNEMONIC)
+        .map_err(|_| anyhow!("the public development mnemonic is not a BIP-39 phrase"))?;
+    let coin = mnemonic
+        .master_key(None)
+        .map_err(|error| anyhow!("deriving the public development mnemonic's seed: {error}"))?
+        .derive_path("m/44'/60'")
+        .map_err(|error| anyhow!("deriving the public development mnemonic's accounts: {error}"))?;
+    let standard = coin
+        .derive_path("m/0'/0")
+        .map_err(|error| anyhow!("deriving the public development mnemonic's accounts: {error}"))?;
+    let address = |key: &SigningKey| PrivateKeySigner::from_signing_key(key.clone()).address();
+    let mut addresses = Vec::with_capacity(2 * count as usize);
+    for index in 0..count {
+        let child = standard.derive_path(index).map_err(|error| {
+            anyhow!("deriving the public development mnemonic's account {index}: {error}")
+        })?;
+        addresses.push(address(child.as_ref()));
+        let ledger = coin
+            .derive_path(format!("m/{index}'/0/0").as_str())
+            .map_err(|error| {
+                anyhow!("deriving the public development mnemonic's account {index}': {error}")
+            })?;
+        addresses.push(address(ledger.as_ref()));
+    }
+    Ok(addresses)
+}
+
+/// Whether `address` is one of the public development mnemonic's accounts
+/// (the first [`PUBLIC_DEVELOPMENT_ACCOUNTS`] indices along anvil's path or
+/// Ledger Live's): anyone holds its key.
+pub fn is_public_development_address(address: Address) -> Result<bool> {
+    static PUBLIC: std::sync::OnceLock<std::collections::HashSet<Address>> =
+        std::sync::OnceLock::new();
+    if let Some(public) = PUBLIC.get() {
+        return Ok(public.contains(&address));
+    }
+    let derived = public_development_addresses(PUBLIC_DEVELOPMENT_ACCOUNTS)?;
+    Ok(PUBLIC
+        .get_or_init(|| derived.into_iter().collect())
+        .contains(&address))
+}
 
 /// A fork rehearsal's deployer from a key file: only one of anvil's own
 /// public development keys. A rehearsal signs for the mainnets' chain ids,
@@ -731,6 +870,28 @@ mod tests {
             given.confirm_mainnet = Some(right.to_string());
             assert_eq!(decide(&given, &CHAINS).unwrap().mode, Mode::Send, "{right}");
         }
+    }
+
+    #[test]
+    fn the_admin_signs_only_with_its_key_file_and_a_confirmation_of_exactly_its_chains() {
+        let mut given = flags();
+        assert_eq!(decide_admin(&given, &CHAINS).unwrap().0, Mode::DryRun);
+        given.admin_keyfile = Some(PathBuf::from("admin"));
+        assert!(decide_admin(&given, &CHAINS).is_err(), "no confirmation");
+        given.confirm_mainnet = Some("8453".to_string());
+        assert!(decide_admin(&given, &CHAINS).is_err(), "not every chain");
+        given.confirm_mainnet = Some(confirmation_for(&CHAINS));
+        assert_eq!(decide_admin(&given, &CHAINS).unwrap().0, Mode::Send);
+        // The deployer's key file never makes a send of the admin's steps.
+        let mut deployer_only = flags();
+        deployer_only.deployer_keyfile = Some(PathBuf::from("deployer"));
+        deployer_only.confirm_mainnet = Some(confirmation_for(&CHAINS));
+        assert!(decide_admin(&deployer_only, &CHAINS).is_err());
+        given.on_fork = true;
+        assert!(
+            decide_admin(&given, &CHAINS).is_err(),
+            "a fork beside a confirmation"
+        );
     }
 
     #[test]

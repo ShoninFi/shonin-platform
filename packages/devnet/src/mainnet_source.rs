@@ -862,6 +862,7 @@ mod tests {
                 drivers: Map::from([(plan.driver.name.clone(), plan.driver.address)]),
                 deployer: Address::new([0x22; 20]),
                 build: build(artifacts).unwrap(),
+                project: None,
             })
             .unwrap(),
         );

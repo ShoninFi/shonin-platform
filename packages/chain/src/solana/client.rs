@@ -825,9 +825,10 @@ impl SolanaClient {
     }
 
     /// Make a new table for `payer` holding `first`, derived from a slot
-    /// read at [`tables::DERIVED_FROM`] of the node it is sent to, and say
-    /// where it is. A creation the program refuses for its slot is made
-    /// again from a slot read again, up to [`tables::CREATION_TRIES`] times.
+    /// chosen of the node it is sent to (see [`Self::derivation_slot`]),
+    /// and say where it is. A creation the program refuses for its slot is
+    /// made again, once the cluster has moved on, from a slot chosen again,
+    /// up to [`tables::CREATION_TRIES`] times.
     async fn create_table(
         &self,
         payer: &Pubkey,
@@ -835,9 +836,10 @@ impl SolanaClient {
         builder: &Keypair,
     ) -> Result<(Pubkey, TransactionRecord)> {
         let mut tries = 0;
+        let mut refused = None;
         loop {
             tries += 1;
-            let recent = self.rpc.slot_at(tables::DERIVED_FROM).await?;
+            let recent = self.derivation_slot(refused).await?;
             let (create, address) = tables::create_lookup_table(*payer, *payer, recent);
             let extend = tables::extend_lookup_table(address, *payer, Some(*payer), first.clone());
             match self.set_up(vec![create, extend], builder).await {
@@ -848,10 +850,52 @@ impl SolanaClient {
                             .downcast_ref::<TransactionFailed>()
                             .is_some_and(|failed| tables::slot_refused(&failed.logs)) =>
                 {
-                    tracing::warn!(%payer, slot = recent, "a lookup table's slot was refused as not recent: read again");
-                    tokio::time::sleep(POLL).await;
+                    tracing::warn!(%payer, slot = recent, "a lookup table's slot was refused as not recent: chosen again once the cluster moves on");
+                    refused = Some(recent);
+                    self.slots_pass(tables::REFUSED_WAIT_SLOTS).await?;
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// The slot a new table is derived from: the newest slot the node holds
+    /// a confirmed block for, at least [`tables::SLOT_MARGIN`] behind its
+    /// confirmed slot and newer than `after` (see [`tables`]' notes). While
+    /// there is none, the cluster is waited on.
+    async fn derivation_slot(&self, after: Option<u64>) -> Result<u64> {
+        let started = Instant::now();
+        loop {
+            let confirmed = self.rpc.slot().await?;
+            if let Some(range) = tables::derivation_range(confirmed, after) {
+                let blocks = self.rpc.blocks(range.0, range.1).await?;
+                if let Some(slot) = tables::derivation_slot(&blocks, range) {
+                    return Ok(slot);
+                }
+            }
+            if started.elapsed() > WARM_UP_TIMEOUT {
+                bail!(
+                    "no block to derive a lookup table from: the cluster stayed at slot {confirmed}"
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Once the node's confirmed slot is `slots` past where it is now.
+    async fn slots_pass(&self, slots: u64) -> Result<()> {
+        let from = self.rpc.slot().await?;
+        let started = Instant::now();
+        loop {
+            tokio::time::sleep(POLL).await;
+            let now = self.rpc.slot().await?;
+            if now >= from + slots {
+                return Ok(());
+            }
+            if started.elapsed() > WARM_UP_TIMEOUT {
+                bail!(
+                    "the cluster stayed at slot {now}: a lookup table's creation is not made again"
+                );
             }
         }
     }

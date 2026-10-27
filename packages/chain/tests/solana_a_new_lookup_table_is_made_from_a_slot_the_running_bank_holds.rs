@@ -1,20 +1,24 @@
 //! A new lookup table is derived from a slot the bank that runs its
-//! creation holds among its recent slots, and a creation refused for its
-//! slot is made again from a slot read again.
+//! creation holds among its recent slots, whatever the cluster's finality
+//! lag, never from a slot its leader skipped; and a creation refused for
+//! its slot is made again, once the cluster has moved on, from a newer one.
 //!
 //! The lookup-table program takes only a slot in the running bank's
-//! `SlotHashes`: one of the 512 before it, never its own. The node's
-//! preflight runs the creation at the confirmed commitment, so the newest
-//! confirmed slot is that bank's own and is refused ("not a recent slot");
-//! a finalized one is behind it and taken.
+//! `SlotHashes`: one of the 512 before it that holds a block, never its own
+//! slot. The node's preflight runs the creation at the confirmed commitment,
+//! so the newest confirmed slot is that bank's own and is refused ("not a
+//! recent slot"), and on a cluster whose finalized slot trails the
+//! confirmed one by no slots at all, so may the newest finalized one be.
 //!
-//! The scripted node keeps a confirmed tip, a finalized slot some thirty
-//! behind it (one further on at each read), and runs a table's creation as
-//! its preflight would: refused unless its slot is among the tip bank's
-//! recent ones, and refused as many times as a test says whatever its slot,
-//! as a backend behind the one read would. A table created is then served,
-//! holding what its set-up added. No cluster is needed: the node is a few
-//! scripted answers over TCP.
+//! The scripted node keeps a confirmed tip that moves on a slot at every
+//! read of the slot, a finalized slot behind it by lags a test gives (0 to
+//! 2, cycled), and slots a test says were skipped, which hold no block and
+//! are in no bank's recent slots. It runs a table's creation as its
+//! preflight would, at the tip: refused unless its slot is among the tip
+//! bank's recent ones, and refused as many times as a test says whatever
+//! its slot, as a backend behind the one read would. A table created is
+//! then served, holding what its set-up added. No cluster is needed: the
+//! node is a few scripted answers over TCP.
 
 #![cfg(feature = "solana")]
 
@@ -32,21 +36,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A genesis that is no public cluster's, so a `localnet` key accepts it.
 const GENESIS: &str = "AbfHL7AeBtDMe7HtEA3cXJgzY8cdpa4MTW7ZXk9byEJf";
-/// The node's newest confirmed slot: the bank its preflight runs at.
+/// The node's confirmed slot when a test starts.
 const TIP: u64 = 1_000;
-/// How far behind the tip the newest finalized slot is.
-const FINALITY_LAG: u64 = 32;
 /// How many slots before a bank its `SlotHashes` holds.
 const SLOT_HASHES: u64 = 512;
 
 /// What the scripted node has seen and holds.
 struct Node {
-    /// The newest finalized slot, one further on at each read of it.
-    finalized: u64,
-    /// The commitments `getSlot` was asked at.
-    slot_reads: Vec<String>,
-    /// The slot of every creation sent, in order, and whether it was taken.
-    creations: Vec<(u64, bool)>,
+    /// The newest confirmed slot, the bank the preflight runs at: one
+    /// further on at each read of the slot.
+    tip: u64,
+    /// How far the finalized slot trails the tip, at one read of it after
+    /// another.
+    finality_lags: Vec<u64>,
+    /// How many times the finalized slot has been read.
+    finalized_reads: usize,
+    /// Slots whose leader made no block.
+    skipped: std::ops::RangeInclusive<u64>,
+    /// Every creation sent, in order: its slot, whether it was taken, and
+    /// the tip it was run at.
+    creations: Vec<(u64, bool, u64)>,
     /// How many creations to refuse whatever their slot.
     refuse_creations: usize,
     /// The one table made, and what it holds.
@@ -86,9 +95,12 @@ impl Node {
     }
 }
 
-/// Whether the bank at `bank` holds `slot` in its `SlotHashes`.
-fn recent_at(bank: u64, slot: u64) -> bool {
-    slot < bank && slot + SLOT_HASHES >= bank
+impl Node {
+    /// Whether the bank at the tip holds `slot` in its `SlotHashes`: a
+    /// block before it, of the 512 before it.
+    fn recent(&self, slot: u64) -> bool {
+        slot < self.tip && slot + SLOT_HASHES >= self.tip && !self.skipped.contains(&slot)
+    }
 }
 
 fn refused(request: &Value, slot: u64) -> Value {
@@ -124,9 +136,10 @@ fn run(node: &mut Node, tx: &VersionedTransaction, request: &Value) -> Result<()
             // CreateLookupTable { recent_slot, bump_seed }
             0 => {
                 let slot = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
-                let take = node.refuse_creations == 0 && recent_at(TIP, slot);
+                let take = node.refuse_creations == 0 && node.recent(slot);
                 node.refuse_creations = node.refuse_creations.saturating_sub(1);
-                node.creations.push((slot, take));
+                let tip = node.tip;
+                node.creations.push((slot, take, tip));
                 if !take {
                     return Err(refused(request, slot));
                 }
@@ -172,16 +185,24 @@ fn answer(node: &Mutex<Node>, method: &str, request: &Value) -> Value {
                 .as_str()
                 .unwrap_or("finalized")
                 .to_string();
-            node.slot_reads.push(commitment.clone());
+            node.tip += 1;
             match commitment.as_str() {
-                "processed" => json!(TIP + 1),
-                "confirmed" => json!(TIP),
+                "processed" => json!(node.tip + 2),
+                "confirmed" => json!(node.tip),
                 _ => {
-                    let slot = node.finalized;
-                    node.finalized += 1;
-                    json!(slot)
+                    let lag = node.finality_lags[node.finalized_reads % node.finality_lags.len()];
+                    node.finalized_reads += 1;
+                    json!(node.tip - lag)
                 }
             }
+        }
+        "getBlocks" => {
+            let start = params[0].as_u64().unwrap();
+            let end = params[1].as_u64().unwrap().min(node.tip);
+            let blocks: Vec<u64> = (start..=end)
+                .filter(|slot| !node.skipped.contains(slot))
+                .collect();
+            json!(blocks)
         }
         "getBlockHeight" => json!(TIP),
         "getProgramAccounts" => json!([]),
@@ -326,9 +347,13 @@ async fn serve(node: Arc<Mutex<Node>>) -> String {
 }
 
 /// The keeper's send of a call naming more accounts than the wire carries
-/// by address, the keeper holding no table yet, to a node that refuses its
-/// first `refuse_creations` creations whatever their slot.
+/// by address, the keeper holding no table yet, to a node whose finalized
+/// slot trails its tip by `finality_lags` (cycled), whose `skipped` slots
+/// hold no block, and which refuses its first `refuse_creations` creations
+/// whatever their slot.
 async fn send_needing_a_new_table(
+    finality_lags: &[u64],
+    skipped: std::ops::RangeInclusive<u64>,
     refuse_creations: usize,
 ) -> (anyhow::Result<chain::solana::Landed>, Arc<Mutex<Node>>) {
     let keys = Arc::new(RoleKeys::from_mnemonic(DEVELOPMENT_MNEMONIC).unwrap());
@@ -357,8 +382,10 @@ async fn send_needing_a_new_table(
     );
 
     let node = Arc::new(Mutex::new(Node {
-        finalized: TIP - FINALITY_LAG,
-        slot_reads: Vec::new(),
+        tip: TIP,
+        finality_lags: finality_lags.to_vec(),
+        finalized_reads: 0,
+        skipped,
         creations: Vec::new(),
         refuse_creations,
         table: None,
@@ -387,27 +414,19 @@ async fn send_needing_a_new_table(
     (sent, node)
 }
 
-#[tokio::test]
-async fn a_new_table_is_derived_from_a_finalized_slot_the_running_bank_holds() {
-    let (sent, node) = send_needing_a_new_table(0).await;
-    let seen = node.lock().unwrap();
-    let [(slot, taken)] = seen.creations.as_slice() else {
+/// No slot skipped.
+#[allow(clippy::reversed_empty_ranges)]
+const NONE_SKIPPED: std::ops::RangeInclusive<u64> = 1..=0;
+
+/// The send went through one creation, taken, into a table holding every
+/// account the call names.
+fn made_once(sent: anyhow::Result<chain::solana::Landed>, seen: &Node) -> u64 {
+    let [(slot, taken, tip)] = seen.creations.as_slice() else {
         panic!("one creation, not {:?}", seen.creations);
     };
     assert!(
         *taken,
-        "the creation's slot {slot} is not among the recent slots of the bank at {TIP}, which runs it"
-    );
-    assert!(
-        *slot <= TIP - FINALITY_LAG,
-        "slot {slot} is not a finalized one"
-    );
-    assert!(
-        seen.slot_reads
-            .iter()
-            .any(|commitment| commitment == "finalized"),
-        "the slot was read at {:?}",
-        seen.slot_reads
+        "the creation's slot {slot} is not among the recent slots of the bank at {tip}, which runs it"
     );
     let landed = match sent {
         Ok(landed) => landed,
@@ -426,16 +445,47 @@ async fn a_new_table_is_derived_from_a_finalized_slot_the_running_bank_holds() {
         44,
         "the table holds every account the call names"
     );
+    *slot
 }
 
 #[tokio::test]
-async fn a_creation_refused_for_its_slot_is_made_again_from_a_slot_read_again() {
-    let (sent, node) = send_needing_a_new_table(1).await;
+async fn a_new_table_is_derived_from_a_slot_the_running_bank_holds_when_finality_trails_not_at_all()
+{
+    let (sent, node) = send_needing_a_new_table(&[0], NONE_SKIPPED, 0).await;
+    made_once(sent, &node.lock().unwrap());
+}
+
+#[tokio::test]
+async fn a_new_table_is_derived_from_a_slot_the_running_bank_holds_when_finality_trails_a_slot_or_two()
+ {
+    let (sent, node) = send_needing_a_new_table(&[0, 2, 1], NONE_SKIPPED, 0).await;
+    made_once(sent, &node.lock().unwrap());
+}
+
+#[tokio::test]
+async fn a_new_table_is_never_derived_from_a_slot_its_leader_skipped() {
+    // Every slot a few dozen behind the tip skipped, so a slot chosen a
+    // fixed distance behind it without asking which hold blocks is one.
+    let skipped = TIP - 45..=TIP - 15;
+    let (sent, node) = send_needing_a_new_table(&[0, 2, 1], skipped.clone(), 0).await;
     let seen = node.lock().unwrap();
-    let [(first, false), (second, true)] = seen.creations.as_slice() else {
+    let slot = made_once(sent, &seen);
+    assert!(!skipped.contains(&slot), "slot {slot} was skipped");
+}
+
+#[tokio::test]
+async fn a_creation_refused_for_its_slot_is_made_again_from_a_newer_slot_once_the_cluster_moves_on()
+{
+    let (sent, node) = send_needing_a_new_table(&[0, 2, 1], NONE_SKIPPED, 1).await;
+    let seen = node.lock().unwrap();
+    let [(first, false, refused_at), (second, true, taken_at)] = seen.creations.as_slice() else {
         panic!("one refused creation, then one taken: {:?}", seen.creations);
     };
     assert!(second > first, "the second creation reused slot {first}");
+    assert!(
+        *taken_at >= refused_at + 4,
+        "made again at slot {taken_at}, not a few slots on from the refusal at {refused_at}"
+    );
     if let Err(error) = sent {
         panic!("the send did not go through the table made again: {error:#}");
     }
@@ -443,7 +493,7 @@ async fn a_creation_refused_for_its_slot_is_made_again_from_a_slot_read_again() 
 
 #[tokio::test]
 async fn a_creation_refused_every_time_fails_the_send_after_its_tries() {
-    let (sent, node) = send_needing_a_new_table(usize::MAX).await;
+    let (sent, node) = send_needing_a_new_table(&[0, 2, 1], NONE_SKIPPED, usize::MAX).await;
     let seen = node.lock().unwrap();
     assert!(sent.is_err(), "the send went through without a table");
     assert_eq!(seen.creations.len(), tables::CREATION_TRIES);

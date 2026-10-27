@@ -1,8 +1,8 @@
 //! A mainnet command refuses, before it sends anything or writes beside the
 //! committed addresses, whatever its rules forbid: a generation other than
 //! the mainnet one, a fork rehearsal writing to the committed directory by
-//! another spelling of its path, a fork's admin steps kept where the
-//! hardware key's are (or the hardware key's where the fork's are), the
+//! another spelling of its path, a fork's admin steps kept where
+//! mainnet's are (or mainnet's where the fork's are), the
 //! admin's steps or the read-back judged
 //! against a local anvil node without the fork flag, a recorded
 //! deployment file another deployment would overwrite, a listing pool that
@@ -211,10 +211,34 @@ fn without_the_fork_flag_the_admin_steps_and_the_read_back_refuse_a_local_anvil_
         ),
     )
     .unwrap();
+    // The deployment the steps are rebuilt from: its registry the steps'.
+    let deployments = dir.join("deployments");
+    std::fs::create_dir_all(&deployments).unwrap();
+    let zero = "0x0000000000000000000000000000000000000000";
+    let registry = "0x00000000000000000000000000000000000000a1";
+    let roles = serde_json::json!({
+        "admin": ADMIN, "platform": ADMIN, "attestor": zero, "builder": zero,
+        "reviewer": zero, "executor": zero, "keeper": zero, "operator": zero,
+        "author": zero, "viewer": zero,
+    });
+    std::fs::write(
+        deployments.join("evm-8453.json"),
+        serde_json::json!({
+            "chain_key": "evm:8453", "chain_id": 8453, "rpc_url": "", "deployed_block": 0,
+            "usd": zero, "venue": zero, "attestation_verifier": zero, "attestation": registry,
+            "publishing": zero, "prices": zero, "strategies": zero, "reviews": zero,
+            "profiles": zero, "factory": zero, "station_factory": zero, "driver": zero,
+            "bridge": zero, "closer": zero, "roles": roles, "station_implementation": zero,
+            "mainnet": {"risc_zero": zero, "vault_implementation": zero, "drivers": {},
+                        "deployer": zero, "build": format!("0x{}", "00".repeat(32))},
+        })
+        .to_string(),
+    )
+    .unwrap();
     let output = devnet(
         &dir,
         18647,
-        &dir.join("deployments"),
+        &deployments,
         &[
             "mainnet-admin-steps",
             "--admin",
@@ -231,7 +255,7 @@ fn without_the_fork_flag_the_admin_steps_and_the_read_back_refuse_a_local_anvil_
     );
     assert!(
         !steps.join("admin-steps-evm-8453.sh").exists(),
-        "the hardware key's script was written from a local node's answers"
+        "a mainnet listing was written from a local node's answers"
     );
     let output = devnet(
         &dir,
@@ -327,13 +351,13 @@ fn a_recorded_deployment_whose_factory_has_no_code_is_refused_not_overwritten() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The hardware key's admin steps (`.shonin/mainnet/admin-steps`) are built
+/// Mainnet's admin steps (`.shonin/mainnet/admin-steps`) are built
 /// from the steps file's `from_block`; a fork's, with the fork's later block,
-/// would hide a proposal the hardware key already made. So a fork rehearsal
+/// would hide a proposal the admin already made. So a fork rehearsal
 /// never writes there, and the mainnet commands never write or read the
 /// fork's steps (`.shonin/mainnet-fork`).
 #[test]
-fn a_fork_s_admin_steps_and_the_hardware_key_s_are_never_kept_in_each_other_s_place() {
+fn a_fork_s_admin_steps_and_mainnet_s_are_never_kept_in_each_other_s_place() {
     let port = 18650;
     let _node = anvil(port);
     let dir = scratch("steps-place");
