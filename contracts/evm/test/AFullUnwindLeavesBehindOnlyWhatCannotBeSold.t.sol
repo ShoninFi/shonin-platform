@@ -2,7 +2,8 @@
 pragma solidity ^0.8.30;
 
 import {Closer} from "../src/Closer.sol";
-import {Call, Custody, ExitPath, ValuationKind} from "../src/interfaces/IDriver.sol";
+import {CloseBand} from "../src/drivers/CloseBand.sol";
+import {Call, Custody, ExitPath, IDriver, ValuationKind} from "../src/interfaces/IDriver.sol";
 import {StationCloses} from "../src/station/StationCloses.sol";
 import {ClaimBase} from "./ClaimBase.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -11,9 +12,9 @@ import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 /// do) holding several stocks and idle dollars. The driver can't tell that
 /// a sale will fail when it is made, so it orders one call per holding and
 /// one for the idle dollars, every time. With `maxSale` set it sells at
-/// most that much of a holding per close at the full band, and reports the
-/// close blocked beside its calls while more is left, as the Robinhood
-/// driver does.
+/// most that much of a holding per close of a stopped station's unwind, at
+/// any band, and reports the close blocked beside its calls while more is
+/// left, as the Robinhood driver does.
 contract HoldingsVenueDriver {
     uint256 private constant WAD = 1e18;
 
@@ -28,7 +29,7 @@ contract HoldingsVenueDriver {
     /// less, it runs out of gas mid-way, as a real swap does.
     uint8 internal constant HUNGRY = 3;
     uint256 public hunger = 1_500_000;
-    /// The most of a holding one close sells at the full band; none if 0.
+    /// The most of a holding one close of a stopped unwind sells; none if 0.
     uint256 public maxSale;
     /// What the driver's own reads in a close spend.
     uint256 public readCost;
@@ -109,7 +110,7 @@ contract HoldingsVenueDriver {
     }
 
     /// One sale per holding, then the idle dollars; blocked only beside its
-    /// calls, at the full band, while a holding has more than `maxSale`
+    /// calls, in a stopped unwind, while a holding has more than `maxSale`
     /// left to sell.
     function close(
         address,
@@ -120,7 +121,7 @@ contract HoldingsVenueDriver {
         calls = new Call[](worth.length + 1);
         for (uint256 i = 0; i < worth.length; i++) {
             uint256 amount = worth[i] * fraction / WAD;
-            if (band >= 10_000 && maxSale != 0 && amount > maxSale) {
+            if (CloseBand.isStopped(band) && maxSale != 0 && amount > maxSale) {
                 amount = maxSale;
                 more = true;
             }
@@ -353,11 +354,25 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
         _stoppedHolding(HUNGRY, 100e6);
         holdings.setHunger(2_500_000);
         _toTheFullBand();
+        _neverSkippedForWantOfGas();
+    }
+
+    /// The same in the first week, through a driver selling part of a
+    /// holding per close (each call then made with its allowance).
+    function test_in_the_first_week_a_caller_cannot_have_a_sale_skipped_by_sending_little_gas() public {
+        _stoppedHolding(HUNGRY, 100e6);
+        holdings.setHunger(2_500_000);
+        holdings.setMaxSale(100e6);
+        assertLt(station.stoppedBand(), 10_000);
+        _neverSkippedForWantOfGas();
+    }
+
+    function _neverSkippedForWantOfGas() internal {
         bool sold;
         for (uint256 gas = 300_000; gas <= 14_000_000; gas += 200_000) {
             uint256 snapshot = vm.snapshotState();
             try station.unwind{gas: gas}(1e18) {} catch {}
-            bool others = holdings.worth(1) == 0 || holdings.idle() == 0;
+            bool others = holdings.worth(1) < 600e6 || holdings.idle() == 0;
             bool hungry = holdings.worth(0) == 0;
             assertTrue(!others || hungry, "a sale was left for want of gas while the others went");
             if (hungry) sold = true;
@@ -377,6 +392,47 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
         assertEq(holdings.worth(0), 100e6);
         assertEq(holdings.worth(1), 600e6, "a stock was sold inside the band beside a part short of gas");
         assertEq(holdings.idle(), 300e6, "dollars left the venue inside the band beside a part short of gas");
+    }
+
+    /// The band a stopped unwind gives its driver, week by week: the exit
+    /// band marked as a stopped unwind's for the first week, doubling each
+    /// week until full, then the full band counting on by one each week,
+    /// while the station's own `stoppedBand` stays at the full band.
+    function test_a_stopped_unwind_gives_its_driver_its_band_marked_and_counting_on_past_the_full_band()
+        public
+    {
+        _stoppedHolding(PAUSED, 100e6);
+        uint256 start = station.stoppedAt();
+        assertEq(vault.exitBandBps(), 100, "this schedule is the 1% band's");
+        uint16[8] memory widening = [uint16(100), 200, 400, 800, 1600, 3200, 6400, 10_000];
+        for (uint256 week = 0; week < 20; week++) {
+            vm.warp(start + week * 7 days + 1 hours);
+            uint256 expected = week < 8 ? widening[week] : 10_000 + (week - 7);
+            assertEq(station.stoppedBand(), expected > 10_000 ? 10_000 : expected, "the station's own band");
+            vm.expectCall(
+                address(driver),
+                abi.encodeCall(IDriver.close, (address(station), 1e18, uint16(CloseBand.STOPPED | expected)))
+            );
+            station.unwind(1e18);
+        }
+    }
+
+    /// In the first week, a driver that sells part of a holding per close
+    /// of a stopped unwind has its calls made each on its own, as at the
+    /// full band: a holding larger than one sale is sold a slice per
+    /// unwind, the idle dollars come home with the first, and a holding
+    /// whose sale fails leaves only itself behind.
+    function test_in_the_first_week_a_driver_selling_part_per_close_has_each_call_made_on_its_own() public {
+        _stoppedHolding(PAUSED, 100e6);
+        holdings.setMaxSale(250e6);
+        assertLt(station.stoppedBand(), 10_000);
+        uint256 cashBefore = vault.cash() + usd.balanceOf(address(station));
+        (, bool blocked) = station.unwind(1e18);
+        assertTrue(blocked);
+        assertEq(holdings.worth(0), 100e6, "the paused stock moved");
+        assertEq(holdings.worth(1), 350e6, "other than one sale's maximum was sold");
+        assertEq(holdings.idle(), 0, "the idle dollars stayed at the venue");
+        assertEq(vault.cash(), cashBefore + 250e6 + 300e6, "what was sold did not come home");
     }
 
     /// A holding larger than one sale's maximum is sold over several
@@ -411,6 +467,17 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
     /// and the idle dollars) spending all its allowance, after the driver's
     /// reads, fits EIP-7825's per-transaction cap with room to spare.
     function test_the_worst_full_unwind_fits_the_per_transaction_gas_cap() public {
+        _worstUnwind(false);
+    }
+
+    /// The same in the first week, through a driver selling part of each
+    /// holding per close (each call then made with its allowance there
+    /// too): it fits the cap the same.
+    function test_the_worst_first_week_unwind_fits_the_per_transaction_gas_cap() public {
+        _worstUnwind(true);
+    }
+
+    function _worstUnwind(bool firstWeek) internal {
         depositAs(vault, alice, 1000e6);
         pinnedDriverActsAs(address(new HoldingsVenueDriver(IERC20(address(usd)))));
         holdings = HoldingsVenueDriver(address(driver));
@@ -424,7 +491,12 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
         vm.prank(executor);
         station.pull(300e6);
         _stop();
-        _toTheFullBand();
+        if (firstWeek) {
+            holdings.setMaxSale(1);
+            assertLt(station.stoppedBand(), 10_000);
+        } else {
+            _toTheFullBand();
+        }
         // The least gas the unwind goes through with.
         uint256 low = 10_000_000;
         uint256 high = TX_GAS_CAP + 4_000_000;
@@ -438,7 +510,12 @@ contract AFullUnwindLeavesBehindOnlyWhatCannotBeSoldTest is ClaimBase {
             }
             vm.revertToState(snapshot);
         }
-        emit log_named_uint("the least gas the worst full unwind goes through with", high);
+        emit log_named_uint(
+            firstWeek
+                ? "the least gas the worst first-week unwind goes through with"
+                : "the least gas the worst full unwind goes through with",
+            high
+        );
         assertLe(high, TX_GAS_CAP - MARGIN, "the worst full unwind does not fit the cap with room to spare");
         (, bool blocked) = station.unwind{gas: TX_GAS_CAP - MARGIN}(1e18);
         assertTrue(blocked);

@@ -85,7 +85,7 @@ tasks:
         done
 
   solana:deploy:
-    desc: "Deploy the Solana programs: to the local cluster, set up as the devnet sets it up, or with NETWORK=testnet every program to devnet. With NETWORK=mainnet the eight programs that ship, built --features mainnet with the ids of MAINNET_PROGRAM_KEYPAIRS=<dir> (<library name>-keypair.json each), set up with ADMIN=<the hardware key's Solana address> as admin and made final: alone a dry run printing the plan (stand-in ids without the keypairs); ON_FORK=1 rehearses on the local Surfpool fork contracts:solana:mainnet-fork runs (or SHONIN_RPC_SOLANA_MAINNET_BETA=http://127.0.0.1:<port>), writing under .shonin/mainnet-fork; DEPLOYER_KEYFILE=<keypair> CONFIRM_MAINNET=mainnet-beta sends for real, writes each program's mainnet-id and config/deployments/mainnet. A run stopped part way resumes: each program has its own buffer (kept in .shonin/mainnet/solana/buffers), any other buffer the deployer holds is closed, and a set-up already on the cluster is refused unless it holds this ADMIN and the mainnet settings; nothing is made final until every set-up account reads back as this deploy's. PROJECT=<id> adds the operator's project to the admin's steps"
+    desc: "Deploy the Solana programs: to the local cluster, set up as the devnet sets it up, or with NETWORK=testnet every program to devnet. With NETWORK=mainnet the eight programs that ship, built --features mainnet with the ids of MAINNET_PROGRAM_KEYPAIRS=<dir> (<library name>-keypair.json each), set up with ADMIN=<the admin key's Solana address> as admin (and the platform's USDC account, ADMIN's associated account for Circle's USDC under the classic Token program, created, the deployer paying its rent) and made final: alone a dry run printing the plan (stand-in ids without the keypairs); ON_FORK=1 rehearses on the local Surfpool fork contracts:solana:mainnet-fork runs (or SHONIN_RPC_SOLANA_MAINNET_BETA=http://127.0.0.1:<port>), writing under .shonin/mainnet-fork; DEPLOYER_KEYFILE=<keypair> ADMIN_KEYFILE=<the admin's keypair file: ADMIN's, outside this repository, chmod 600; read for its key alone> CONFIRM_MAINNET=mainnet-beta sends for real (every mode but ON_FORK refuses as ADMIN a key of the public development mnemonic or a fork rehearsal's throwaway), writes each program's mainnet-id and config/deployments/mainnet. A run stopped part way resumes: each program has its own buffer (kept in .shonin/mainnet/solana/buffers), any other buffer the deployer holds is closed, and a set-up already on the cluster is refused unless it holds this ADMIN and the mainnet settings; nothing is made final until every set-up account reads back as this deploy's. PROJECT=<id> adds the operator's project to the admin's steps"
     vars:
       DEPLOYER_KEYPAIR: '{{joinPath .PATH_ROOT ".shonin" .NETWORK "solana-deployer.json"}}'
       DEVNET_PROGRAMS: '{{joinPath .PATH_ROOT ".shonin" "testnet" "solana-programs"}}'
@@ -220,6 +220,7 @@ tasks:
           {{if .KEYPAIRS}}--program-keypairs {{shellQuote .KEYPAIRS}}{{end}} \
           --programs-dir "{{.STATE}}/programs" --program-sources "{{.PATH_CONTRACTS_SOLANA}}/programs" \
           --admin-steps-dir "{{.PATH_MAINNET_ADMIN_STEPS}}" --state-dir "{{.STATE}}" \
+          {{if .ADMIN_KEYFILE}}--admin-keyfile {{shellQuote .ADMIN_KEYFILE}}{{end}} \
           {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
 
   solana:verifiable-build:
@@ -446,7 +447,7 @@ tasks:
         echo "every program deployed is its verifiable build"
 
   solana:admin-steps:
-    desc: "Mainnet's Solana admin steps (proposing Orca's driver, PROJECT's project, and with DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder a real image): with ON_FORK=1 sent from the stand-in admin ADMIN_KEYFILE=<keypair> (which must be ADMIN) on the local fork, WARP=1 then moving its clock past the timelock; otherwise nothing is sent: each step still to do is printed (program, accounts, data) and written to .shonin/mainnet/admin-steps/admin-steps-solana-mainnet-beta.json for the hardware key (NETWORK=mainnet ADMIN=<address>)"
+    desc: "Mainnet's Solana admin steps, each still to do read from the cluster: proposing Orca's driver and PROJECT's project, with DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder a real image, with REVOKE=sha256:<hex> an image revoked at once and for good, with VAULT=<address> a vault of this deployment killed. Alone a dry run: each step is printed (program, accounts, data) and written to .shonin/mainnet/admin-steps/admin-steps-solana-mainnet-beta.json, nothing sent. ADMIN_KEYFILE=<the admin's keypair file: outside this repository, chmod 600, ADMIN's, not the deployer's> CONFIRM_MAINNET=mainnet-beta signs each step with it in the tool's own process and sends it, read again just before. ON_FORK=1 signs with the fork's throwaway admin (.shonin/mainnet-fork/solana/throwaway-admin.json, made the first time; task contracts:solana:fork-admin prints it) on the local fork, WARP=1 then moving its clock past the timelock (NETWORK=mainnet ADMIN=<address>)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
         msg: "the admin's prepared steps are mainnet's (NETWORK={{.NETWORK}})."
@@ -462,7 +463,17 @@ tasks:
         {{if .ADMIN_KEYFILE}}--admin-keyfile {{shellQuote .ADMIN_KEYFILE}}{{end}}
         {{if .PROJECT}}--project {{shellQuote .PROJECT}}{{end}}
         {{if .DIGEST}}--image-digest {{shellQuote .DIGEST}} --image-kind {{shellQuote .KIND}}{{end}}
+        {{if .REVOKE}}--revoke-digest {{shellQuote .REVOKE}}{{end}}
+        {{if .VAULT}}--kill-vault {{shellQuote .VAULT}}{{end}}
         {{if .WARP}}--warp{{end}}
+
+  solana:fork-admin:
+    desc: "A Solana fork rehearsal's throwaway admin: its public key (made the first time as .shonin/mainnet-fork/solana/throwaway-admin.json, readable by its owner alone, and recorded so a real send refuses it), to give as ADMIN=<address> to the ON_FORK=1 deploy and admin steps. Sends nothing (NETWORK=mainnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "the fork's throwaway admin is a mainnet rehearsal's (NETWORK={{.NETWORK}})."
+    cmds:
+      - "{{.DEVNET}} --vault-chain solana mainnet-fork-admin"
 
   solana:record-keeper:
     desc: "Mainnet: record the keeper's hot Solana key (KEEPER=<public key>) as the keeper in Solana's deployment file, held to ADMIN, changing nothing else and sending nothing: alone it prints what it would write, WRITE=1 writes config/deployments/mainnet (commit it), ON_FORK=1 the rehearsal's file; another keeper already recorded is replaced only with REPLACE=1. contracts:solana:verify-deploy checks it"
@@ -479,7 +490,7 @@ tasks:
         {{if .WRITE}}--write{{end}}
 
   solana:verify-deploy:
-    desc: "Mainnet's Solana read-back, read-only: each of the eight programs final at its recorded id and running this build, the registry's admin ADMIN, its timelock and floor two days, the Confidential Space checker its only checker with its pins, no development checker, USDC everywhere, fees and the vault factory ADMIN's, thirty days' notice on prices, Orca's driver's pool and price account and whether it is proposed (IN_FORCE=1: in force, and PROJECT's project proposed). ON_FORK=1 reads the rehearsal's (NETWORK=mainnet ADMIN=<address>)"
+    desc: "Mainnet's Solana read-back, read-only: each of the eight programs final at its recorded id and running this build, the registry's admin ADMIN (a key on the ed25519 curve, not the deployer), the platform's USDC account (ADMIN's associated account for Circle's USDC, classic Token), its timelock and floor two days, the Confidential Space checker its only checker with its pins, no development checker, USDC everywhere, fees and the vault factory ADMIN's, thirty days' notice on prices, Orca's driver's pool and price account and whether it is proposed (IN_FORCE=1: in force, and PROJECT's project proposed). ON_FORK=1 reads the rehearsal's (NETWORK=mainnet ADMIN=<address>)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "mainnet" ]'
         msg: "the read-back is mainnet's (NETWORK={{.NETWORK}})."

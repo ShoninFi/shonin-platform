@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {CloseBand} from "../../src/drivers/CloseBand.sol";
 import {
     IAggregatorV3,
     IModuleProxyFactory,
@@ -113,6 +114,11 @@ contract AFullBandSaleOnRobinhoodChainFitsItsAllowanceTest is Test {
         _;
     }
 
+    /// The band the measured closes are given: the full band unless a test
+    /// says otherwise; and the thin pools' feed (about the pools' price).
+    uint16 internal saleBand = 10_000;
+    int256 internal thinFeed = 1e8;
+
     function _venue() internal pure returns (RobinhoodDriver.Venue memory) {
         return RobinhoodDriver.Venue({
             dollar: IERC20(USDG),
@@ -177,7 +183,7 @@ contract AFullBandSaleOnRobinhoodChainFitsItsAllowanceTest is Test {
         RobinhoodDriver through,
         StationDouble holder
     ) internal returns (bool allOk, uint256 worst, uint256 calls) {
-        (Call[] memory list, bool blocked) = through.close(address(holder), 1e18, 10_000);
+        (Call[] memory list, bool blocked) = through.close(address(holder), 1e18, saleBand);
         assertTrue(blocked, "a full-band close that sells reports not done");
         allOk = true;
         calls = list.length;
@@ -196,7 +202,7 @@ contract AFullBandSaleOnRobinhoodChainFitsItsAllowanceTest is Test {
     ) internal returns (RobinhoodDriver thin, StationDouble holder) {
         RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](1);
         listings[0] = RobinhoodDriver.Listing(
-            stock, IAggregatorV3(address(new MockFeed(1e8))), IUniswapV3Pool(pool), type(uint128).max
+            stock, IAggregatorV3(address(new MockFeed(thinFeed))), IUniswapV3Pool(pool), type(uint128).max
         );
         thin = new RobinhoodDriver(_venue(), listings);
         holder = new StationDouble(USDG, 100);
@@ -285,6 +291,25 @@ contract AFullBandSaleOnRobinhoodChainFitsItsAllowanceTest is Test {
     {
         uint256 worst = _dearestWalk(false);
         assertLt(worst, MOST, "the dearest walk down spends more than two thirds of its allowance");
+    }
+
+    /// A stopped station's sale in its first week (the 1% band) takes the
+    /// same form, and walks the whole distance where the feed less the band
+    /// is further than the time-weighted bound (here a feed 5% under the
+    /// pool): uphill and downhill, the same dearest walk fits its allowance
+    /// with a third to spare.
+    function test_in_the_first_week_a_sale_through_ticks_never_crossed_fits_its_allowance_with_a_third_to_spare(
+    ) public onFork {
+        saleBand = uint16(CloseBand.STOPPED | 100);
+        thinFeed = 0.95e8;
+        uint256 snapshot = vm.snapshotState();
+        uint256 up = _dearestWalk(true);
+        vm.revertToState(snapshot);
+        uint256 down = _dearestWalk(false);
+        assertLt(up, MOST, "the first week's dearest walk up spends more than two thirds of its allowance");
+        assertLt(
+            down, MOST, "the first week's dearest walk down spends more than two thirds of its allowance"
+        );
     }
 
     /// The real NVDA token (and the real USDG) on the real 1% NVDA/USDG

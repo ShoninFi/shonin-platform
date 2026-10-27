@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {CloseBand} from "../drivers/CloseBand.sol";
 import {IAttestationRegistry} from "../interfaces/IAttestationRegistry.sol";
 import {Call, IBridge} from "../interfaces/IDriver.sol";
 import {
@@ -59,6 +60,10 @@ library StationStorage {
     /// keccak256(abi.encode(uint256(keccak256("shonin.station")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant SLOT = 0x6f766f5e802164a02b9d82ae8f2d3c1bb236fe4447b61828eddd5683735f2d00;
     bytes4 private constant APPROVE = IERC20.approve.selector;
+    /// A stopped station's full unwind keeps the exit band this long after
+    /// the stop, then the band doubles each time this passes again, and
+    /// once full counts on (`CloseBand`).
+    uint64 internal constant WIDEN_AFTER = 7 days;
 
     error NotDeclared();
     error BadCall();
@@ -71,6 +76,12 @@ library StationStorage {
         assembly ("memory-safe") {
             s.slot := slot
         }
+    }
+
+    /// The band a stopped station's full unwind gives its drivers now,
+    /// marked as one (`CloseBand.stopped`). Only time moves it.
+    function unwindBand(StationLayout storage s) internal view returns (uint16) {
+        return CloseBand.stopped(s.spec.exitBandBps, block.timestamp - s.stoppedAt, WIDEN_AFTER);
     }
 
     function isHome(StationLayout storage s) internal view returns (bool) {

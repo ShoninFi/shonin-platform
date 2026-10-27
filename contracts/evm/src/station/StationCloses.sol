@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {CloseBand} from "../drivers/CloseBand.sol";
 import {Call, ExitPath, IDelayedDriver, IDriver} from "../interfaces/IDriver.sol";
 import {IStation, IStationVault, Stage} from "../interfaces/IStation.sol";
 import {Flow, StationLayout, StationStorage} from "./StationStorage.sol";
@@ -78,7 +79,9 @@ library StationCloses {
     /// What must be left before the part, at the full band, of a driver
     /// whose calls are each given the allowance: its own reads before the
     /// first call, and the floor of that call. A delayed driver's part
-    /// takes no allowance and has no floor.
+    /// takes no allowance and has no floor. Inside the band a part starved
+    /// in its reads fails whole, moving nothing, and a call short of its
+    /// floor undoes the whole unwind, as at the full band.
     uint256 internal constant PART_FLOOR = 1_000_000 + ATTEMPT_FLOOR;
     /// The most a driver's `exitPath` read may spend.
     uint256 private constant EXIT_PATH_READ_GAS = 50_000;
@@ -223,18 +226,20 @@ library StationCloses {
     // A stopped station's unwind --------------------------------------------
 
     /// A stopped station's full unwind, which every holder shares: each
-    /// driver closes on its own, inside the band as it has widened since the
-    /// stop, so a venue that refuses or a market still outside the band
-    /// leaves only its own money behind; at the full band each of a
-    /// driver's calls is made on its own with a fixed allowance of gas, so
-    /// a holding that can't be sold leaves only itself behind. An unwind
-    /// sent with too little gas to give a call its allowance, or such a
-    /// driver's part its floor, is undone whole (`ShortOfGas`), never left
-    /// behind like that, and is sent again with more. A delayed driver's
-    /// part takes no allowance, so it is held to no floor: one sent too
-    /// little gas fails whole, moving nothing, and is retried. Everything idle then goes home.
-    /// It takes the place of a staged close: whatever that sold or brought
-    /// home is everyone's again.
+    /// driver closes on its own, given the band as it has widened since the
+    /// stop and marked as a stopped unwind's (`CloseBand`), so a venue that
+    /// refuses or a market still outside the band leaves only its own money
+    /// behind. Where a driver sells part of a holding per close (at any
+    /// band) or the band is full, each of its calls is made on its own with
+    /// a fixed allowance of gas, so a holding that can't be sold leaves only
+    /// itself behind. An unwind sent with too little gas to give a call its
+    /// allowance, or, at the full band, a driver's part whose closes settle
+    /// in the transaction its floor, is undone whole (`ShortOfGas`), never
+    /// left behind like that, and is sent again with more. A delayed driver's part takes no
+    /// allowance, so it is held to no floor: one sent too little gas fails
+    /// whole, moving nothing, and is retried. Everything idle then goes
+    /// home. It takes the place of a staged close: whatever that sold or
+    /// brought home is everyone's again.
     function unwindStopped(bytes32[] memory drivers) external returns (uint256 sentHome, bool blocked) {
         StationLayout storage s = StationStorage.layout();
         // Not between a valuation's pricing and its settlement: what this
@@ -244,7 +249,7 @@ library StationCloses {
             revert NotAllowed();
         }
         if (s.stage.stagedAt != 0) _lapse(s);
-        uint16 band = IStation(address(this)).stoppedBand();
+        uint16 band = s.unwindBand();
         for (uint256 i = 0; i < drivers.length; i++) {
             // Each driver's part once a call. Nothing stops a contract
             // calling again within the same transaction, which is no worse
@@ -255,7 +260,9 @@ library StationCloses {
                 if (drivers[j] == drivers[i]) revert NotAllowed();
             }
             address driver = s.pinned(drivers[i]);
-            if (band >= BPS && gasleft() < PART_FLOOR && !_delayed(driver)) revert ShortOfGas();
+            if (CloseBand.band(band) >= BPS && gasleft() < PART_FLOOR && !_delayed(driver)) {
+                revert ShortOfGas();
+            }
             try IStation(address(this)).closeAll(drivers[i], band) returns (bool outside) {
                 // Too little gas for a call's allowance is never taken for
                 // a call that failed: the whole unwind is undone.
@@ -271,11 +278,13 @@ library StationCloses {
         emit IStation.Unwound(WAD, sentHome, blocked);
     }
 
-    /// One driver's part of a stopped station's full unwind.
+    /// One driver's part of a stopped station's full unwind, at `band` as
+    /// marked for one (`CloseBand.stopped`).
     function closeAll(bytes32 name, uint16 band) external returns (bool outside) {
         StationLayout storage s = StationStorage.layout();
         IDriver driver = IDriver(s.pinned(name));
         bool delayed = driver.exitPath() == ExitPath.Delayed;
+        bool full = CloseBand.band(band) >= BPS;
         // Through a venue that acts after the transaction, not yet: no
         // sooner after the last move than the driver spaces the executor's
         // moves, whoever calls, so a priced valuation always fits between
@@ -286,10 +295,10 @@ library StationCloses {
         (uint256 markBefore, uint256 exitBefore) = driver.valueOf(address(this));
         Call[] memory calls;
         (calls, outside) = driver.close(address(this), WAD, band);
-        // At the full band a driver whose closes settle in the transaction
-        // may sell only part of a holding per close: its calls come with
-        // `outside`, they are made, and the unwind isn't done.
-        bool partly = outside && band >= BPS && !delayed && calls.length != 0;
+        // A driver whose closes settle in the transaction may sell only part
+        // of a holding per close, at any band of a stopped unwind: its calls
+        // come with `outside`, they are made, and the unwind isn't done.
+        bool partly = outside && !delayed && calls.length != 0;
         if (outside && !partly) return true;
         address[] memory targets = driver.targets();
         if (delayed) {
@@ -308,18 +317,19 @@ library StationCloses {
             if ((calls.length != 0 || sweep.length != 0) && markBefore > s.oneDollar()) {
                 flow.movedAt = uint64(block.timestamp);
             }
-            if (band >= BPS && flow.fullUnwindAt == 0) flow.fullUnwindAt = uint64(block.timestamp);
+            if (full && flow.fullUnwindAt == 0) flow.fullUnwindAt = uint64(block.timestamp);
             return calls.length != 0;
         }
-        if (band >= BPS) {
-            // At the full band, which every holder shares, each call is made
-            // on its own with `ATTEMPT_GAS`: one that fails (a token whose
-            // transfers are paused, a pool that can't take the sale, a token
-            // that burns its gas) leaves only what it would have moved where
-            // it is, still counted by the driver, and everything else comes
-            // home. The unwind isn't done while one fails or a holding is
-            // left to sell. Inside the band the driver's part is all or
-            // nothing.
+        if (full || partly) {
+            // At the full band, or where the driver sells part of a holding
+            // per close (its own price limit is then what bounds the sale),
+            // each call is made on its own with `ATTEMPT_GAS`: one that
+            // fails (a token whose transfers are paused, a pool that can't
+            // take the sale, a token that burns its gas) leaves only what it
+            // would have moved where it is, still counted by the driver, and
+            // everything else comes home. The unwind isn't done while one
+            // fails or a holding is left to sell. Otherwise, inside the
+            // band, the driver's part is all or nothing.
             if (_runEach(s, calls, targets, false)) outside = true;
             if (_shortOfGas()) return true;
             if (_runEach(s, driver.sweep(address(this), exitBefore), targets, false)) outside = true;
@@ -329,12 +339,13 @@ library StationCloses {
         _runEach(s, calls, targets, true);
         _runEach(s, driver.sweep(address(this), exitBefore), targets, true);
         uint256 swept = s.balance() - held;
-        if (swept < exitBefore.mulDiv(BPS - band, BPS)) revert IStation.ShortSweep();
+        if (swept < exitBefore.mulDiv(BPS - CloseBand.band(band), BPS)) revert IStation.ShortSweep();
     }
 
-    /// Make each call, checked as `run` checks it; whether any failed. At
-    /// the full band each is made with exactly `ATTEMPT_GAS`, and one that
-    /// fails is left; with too little left for a call's floor, no more are
+    /// Make each call, checked as `run` checks it; whether any failed. Not
+    /// `strict` (the full band, or a driver selling part of a holding per
+    /// close), each is made with exactly `ATTEMPT_GAS`, and one that fails
+    /// is left; with too little left for a call's floor, no more are
     /// made and the unwind is marked short of gas, to be undone whole by
     /// `unwindStopped`. `strict` (inside the band), each is made with all
     /// the gas there is, and one that fails undoes the part. What a failed

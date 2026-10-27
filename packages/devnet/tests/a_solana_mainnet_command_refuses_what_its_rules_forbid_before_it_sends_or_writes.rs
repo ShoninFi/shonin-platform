@@ -224,10 +224,10 @@ fn fake_surfpool(port: u16) {
     });
 }
 
-/// Without ON_FORK=1 the hardware key's admin steps are read from mainnet
+/// Without ON_FORK=1 mainnet's admin steps are read from mainnet
 /// alone: a local Surfpool fork is refused and nothing is written.
 #[test]
-fn the_hardware_key_s_admin_steps_are_never_read_from_a_fork() {
+fn mainnet_s_admin_steps_are_never_read_from_a_fork() {
     let port = 18740;
     fake_surfpool(port);
     let dir = scratch("adminsteps");
@@ -256,7 +256,7 @@ fn the_hardware_key_s_admin_steps_are_never_read_from_a_fork() {
     let written = steps.join("admin-steps-solana-mainnet-beta.json");
     assert!(
         !out.status.success() && !written.exists(),
-        "the hardware key's admin steps were read from a local Surfpool fork and written to {}:\n{}",
+        "mainnet's admin steps were read from a local Surfpool fork and written to {}:\n{}",
         written.display(),
         text(&out)
     );
@@ -567,4 +567,87 @@ fn the_verifiable_build_s_comparison_reads_only_the_cluster_its_mode_names() {
     // A fork's check never takes a public endpoint.
     let out = cluster(&["--on-fork", "--rpc", "https://api.mainnet-beta.solana.com"]);
     assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// The Solana admin's keypair file, held to the same rules as the EVM
+/// admin's before any cluster is read: with its confirmation alone, its
+/// owner's alone to read, ADMIN's, outside this repository and `.shonin`,
+/// never a fork's throwaway on mainnet, and on a fork the throwaway alone.
+/// Each refusal says "Nothing was sent" and writes no steps file.
+#[test]
+fn the_solana_admin_s_keypair_file_is_refused_unless_its_rules_allow_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("admin-key");
+    let steps = dir.join("steps");
+    let pair = Keypair::new();
+    let file = dir.join("keys/admin.json");
+    keys::write_keypair(&pair, &file).unwrap();
+    let admin = pair.pubkey().to_string();
+    // A deployment that records programs alone: no roles to compare.
+    std::fs::create_dir_all(dir.join("deployments")).unwrap();
+    std::fs::write(
+        dir.join("deployments/solana-mainnet-beta.json"),
+        r#"{"programs": {}}"#,
+    )
+    .unwrap();
+    let run = |admin: &str, file: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "--network",
+            "mainnet",
+            "--deployments-dir",
+            dir.join("deployments").to_str().unwrap().to_string().leak() as &str,
+            "--vault-chain",
+            "solana",
+            "mainnet-solana-admin-steps",
+            "--admin",
+            admin,
+            "--admin-keyfile",
+            file.to_str().unwrap().to_string().leak() as &str,
+            "--admin-steps-dir",
+            steps.to_str().unwrap().to_string().leak() as &str,
+        ];
+        args.extend_from_slice(extra);
+        devnet(
+            &args,
+            &[("SHONIN_RPC_SOLANA_MAINNET_BETA", "http://127.0.0.1:1")],
+        )
+    };
+    let refused = |out: &Output, why: &str| {
+        let said = text(out);
+        assert_eq!(out.status.code(), Some(1), "{said}");
+        assert!(said.contains("Nothing was sent"), "{said}");
+        assert!(said.contains(why), "expected {why:?}:\n{said}");
+        assert!(!steps.exists(), "a refusal wrote the steps:\n{said}");
+    };
+    let confirm = ["--confirm-mainnet", "mainnet-beta"];
+    refused(&run(&admin, &file, &[]), "CONFIRM_MAINNET");
+    refused(
+        &run(&Keypair::new().pubkey().to_string(), &file, &confirm),
+        "not ADMIN",
+    );
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    refused(&run(&admin, &file, &confirm), "readable by others");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let shonin = dir.join(".shonin/admin.json");
+    keys::write_keypair(&pair, &shonin).unwrap();
+    refused(&run(&admin, &shonin, &confirm), ".shonin");
+    refused(&run(&admin, &file, &["--on-fork"]), "throwaway");
+    // The fork's throwaway, copied out, is refused on mainnet.
+    let throwaway = repo().join(".shonin/mainnet-fork/solana/throwaway-admin.json");
+    let made = devnet(
+        &[
+            "--network",
+            "mainnet",
+            "--vault-chain",
+            "solana",
+            "mainnet-fork-admin",
+        ],
+        &[],
+    );
+    assert!(made.status.success(), "{}", text(&made));
+    let fork_admin = String::from_utf8_lossy(&made.stdout).trim().to_string();
+    let copy = dir.join("keys/copy.json");
+    keys::write_keypair(&keys::read_keypair(&throwaway).unwrap(), &copy).unwrap();
+    refused(&run(&fork_admin, &copy, &confirm), "throwaway");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import {Call, Custody, ExitPath, IDelayedDriver, IDriver, ValuationKind} from "../../interfaces/IDriver.sol";
 import {IStation} from "../../interfaces/IStation.sol";
+import {CloseBand} from "../CloseBand.sol";
 import {DelayedVenue} from "../DelayedVenue.sol";
 import {HyperCore, ICoreDepositWallet, ICoreWriter} from "./HyperCore.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -350,6 +351,9 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint16 bandBps
     ) external view returns (Call[] memory calls, bool blocked) {
+        // A stopped station's unwind is closed as any close at its band:
+        // this driver keeps no schedule of its own past the full band.
+        bandBps = CloseBand.band(bandBps);
         bool full = bandBps >= BPS;
         if (!full && _unlisted(station)) return (new Call[](0), true);
         // No HYPE to send the dollars home with: nothing is sold for a

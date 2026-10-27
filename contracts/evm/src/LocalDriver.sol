@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {CloseBand} from "./drivers/CloseBand.sol";
 import {Call, Custody, ExitPath, IDriver, ValuationKind} from "./interfaces/IDriver.sol";
 import {ILocalVenue, Market, OrderRequest, Position} from "./interfaces/ILocalVenue.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -76,6 +77,9 @@ contract LocalDriver is IDriver {
         uint256 fraction,
         uint16 bandBps
     ) external view returns (Call[] memory calls, bool blocked) {
+        // A stopped station's unwind is closed as any close at its band:
+        // this driver keeps no schedule of its own past the full band.
+        bandBps = CloseBand.band(bandBps);
         bytes32[] memory held = venue.marketsHeldBy(station);
         OrderRequest[] memory orders = new OrderRequest[](held.length);
         uint256 count;

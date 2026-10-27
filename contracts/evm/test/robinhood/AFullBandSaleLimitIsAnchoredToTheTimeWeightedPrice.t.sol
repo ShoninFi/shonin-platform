@@ -74,7 +74,9 @@ contract SkewedPool {
 /// A pool already at or past the time-weighted bound, or whose
 /// time-weighted price can't be read, gets no sale (the close says it
 /// isn't done, and the idle dollars still go), and the next unwind tries
-/// again.
+/// again. The feeds here are at the pools' price, so their own bound (the
+/// feed less its discount) is further off than the time-weighted one,
+/// except where a test says otherwise.
 contract AFullBandSaleLimitIsAnchoredToTheTimeWeightedPriceTest is Test {
     uint256 internal constant WAD = 1e18;
     uint32 internal constant WINDOW = 1800;
@@ -88,6 +90,8 @@ contract AFullBandSaleLimitIsAnchoredToTheTimeWeightedPriceTest is Test {
     MockToken internal high;
     SkewedPool internal lowPool;
     SkewedPool internal highPool;
+    MockFeed internal lowFeed;
+    MockFeed internal highFeed;
     RobinhoodDriver internal driver;
     address internal station = makeAddr("station");
     address internal safe;
@@ -105,12 +109,15 @@ contract AFullBandSaleLimitIsAnchoredToTheTimeWeightedPriceTest is Test {
         high = second;
         lowPool = new SkewedPool(address(low), address(usdg), -224_390);
         highPool = new SkewedPool(address(usdg), address(high), 224_390);
+        // About the pools' price at tick 224,390: $180.03.
+        lowFeed = new MockFeed(180e8);
+        highFeed = new MockFeed(180e8);
         RobinhoodDriver.Listing[] memory listings = new RobinhoodDriver.Listing[](2);
         listings[0] = RobinhoodDriver.Listing(
-            address(low), IAggregatorV3(address(new MockFeed(200e8))), IUniswapV3Pool(address(lowPool)), MAX
+            address(low), IAggregatorV3(address(lowFeed)), IUniswapV3Pool(address(lowPool)), MAX
         );
         listings[1] = RobinhoodDriver.Listing(
-            address(high), IAggregatorV3(address(new MockFeed(200e8))), IUniswapV3Pool(address(highPool)), MAX
+            address(high), IAggregatorV3(address(highFeed)), IUniswapV3Pool(address(highPool)), MAX
         );
         driver = new RobinhoodDriver(
             RobinhoodDriver.Venue({
@@ -204,8 +211,11 @@ contract AFullBandSaleLimitIsAnchoredToTheTimeWeightedPriceTest is Test {
         assertTrue(blocked);
     }
 
-    /// Near the tick limits the bound is the pool's own.
+    /// Near the tick limits the bound is the pool's own (with no feed
+    /// answer to bound it first).
     function test_near_the_tick_limits_the_limit_is_the_pools_own_bound() public {
+        lowFeed.set(0, 0);
+        highFeed.set(0, 0);
         lowPool.set(-887_272 + reach / 2, -887_272 + reach / 2, false);
         highPool.set(887_272 - reach / 2, 887_272 - reach / 2, false);
         (uint160 lowLimit, uint160 highLimit,,) = _limits();

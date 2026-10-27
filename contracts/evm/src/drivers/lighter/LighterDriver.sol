@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import {Call, Custody, ExitPath, IDelayedDriver, IDriver, ValuationKind} from "../../interfaces/IDriver.sol";
 import {IStation} from "../../interfaces/IStation.sol";
+import {CloseBand} from "../CloseBand.sol";
 import {DelayedVenue} from "../DelayedVenue.sol";
 import {LighterBoard, LighterPosition, LighterPrice, LighterReport, LighterShares} from "./LighterBoard.sol";
 import {IZkLighter} from "./ZkLighter.sol";
@@ -376,6 +377,9 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint16 bandBps
     ) external view returns (Call[] memory calls, bool blocked) {
+        // A stopped station's unwind is closed as any close at its band:
+        // this driver keeps no schedule of its own past the full band.
+        bandBps = CloseBand.band(bandBps);
         (uint48 master, bool exists) = masterOf(station);
         if (!exists) return (new Call[](0), false);
         (LighterReport memory report, bool reported) = board.reportOf(station);

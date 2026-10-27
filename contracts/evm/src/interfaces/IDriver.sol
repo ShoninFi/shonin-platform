@@ -75,18 +75,25 @@ interface IDriver {
     function withdraw(address station, uint256 amount) external view returns (Call[] memory);
     /// Close `fraction` (1e18 is all) of every position, each order no worse
     /// than `bandBps` from the venue's own price; at 10,000 or more, at any
-    /// price. A stopped station's full unwind at 10,000, through a driver
-    /// whose closes settle in the transaction, makes each call on its own
-    /// with a fixed allowance of gas (`StationCloses.ATTEMPT_GAS`) and lets
-    /// one that fails be, so no call may count on an earlier one having
-    /// gone through except to fail without it (an approval and the sale it
-    /// is for), and each call must fit that allowance with room to spare.
-    /// `blocked` is true, with no calls, when a market is outside the band:
-    /// nothing is closed then, so a leaver is never sold through a market
-    /// that has run away. At 10,000 such a driver may instead sell only
-    /// part of a holding, to keep each sale within the allowance: it
-    /// returns its calls with `blocked` true, the calls are made, and the
-    /// unwind isn't done until a later close sells the rest.
+    /// price. A stopped station's full unwind marks its band
+    /// (`CloseBand.STOPPED`, the high bit): the low bits are the band as it
+    /// has widened since the stop and, once full, 10,000 plus the number of
+    /// widenings since (`CloseBand`); a driver that keeps no schedule of its
+    /// own reads it through `CloseBand.band`, so the mark changes nothing
+    /// for it. A stopped station's full unwind through a driver whose
+    /// closes settle in the transaction makes each call on its own with a
+    /// fixed allowance of gas (`StationCloses.ATTEMPT_GAS`) at 10,000, or
+    /// at any band where the driver returns its calls with `blocked`, and
+    /// lets one that fails be, so no call may count on an earlier one
+    /// having gone through except to fail without it (an approval and the
+    /// sale it is for), and each call must fit that allowance with room to
+    /// spare. `blocked` is true, with no calls, when a market is outside
+    /// the band: nothing is closed then, so a leaver is never sold through
+    /// a market that has run away. For a stopped station's full unwind such
+    /// a driver may instead sell only part of a holding, within a price
+    /// limit of its own and each sale within the allowance: it returns its
+    /// calls with `blocked` true, the calls are made, and the unwind isn't
+    /// done until a later close sells the rest.
     function close(
         address station,
         uint256 fraction,

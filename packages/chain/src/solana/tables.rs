@@ -38,17 +38,26 @@
 //!   is the paying key, it isn't deactivated, and every address remembered
 //!   from before is still at the same index. One that fails any of these is
 //!   never used again. The message is compiled from what was just read.
-//! - **The slot a table is made from.** The lookup-table program takes
-//!   only a slot in the `SlotHashes` of the bank that runs the creation:
-//!   one of the 512 slots before it, never its own. A slot read at the
-//!   confirmed commitment may be that very bank's (the node's preflight
-//!   runs at it), and one read of a node ahead of another the send reaches
-//!   is in no bank there yet; either is refused as "not a recent slot". So
-//!   the slot is read at the finalized commitment, of the node the creation
-//!   is sent to: behind every bank that may run it, by some thirty slots,
-//!   and far inside the 512 for as long as the transaction's blockhash
-//!   lives. A creation still refused for its slot is made again from a
-//!   slot read again.
+//! - **The slot a table is made from.** The lookup-table program takes only a
+//!   slot in the `SlotHashes` of the bank that runs the creation: one of the
+//!   512 slots before it that holds a block of its own fork, never its own
+//!   slot, and never a slot its leader skipped. The newest slot at any
+//!   commitment may be the very bank the node's preflight runs at (the
+//!   finalized slot may trail the confirmed one by no slots at all), or ahead
+//!   of a node behind the one read. So the slot is chosen behind the node's
+//!   confirmed slot by a margin ([`SLOT_MARGIN`]): the newest slot at or
+//!   before that point the node holds a confirmed block for, looked for among
+//!   the [`SLOT_SEARCH`] slots before it. Being a block of the confirmed fork
+//!   that far back, it is an ancestor of every bank that may run the creation,
+//!   and a node lagging the one read by less than the margin holds it too. It
+//!   stays among the 512 while the transaction can land: the creation's
+//!   blockhash lives 150 blocks, and the margin, the search and those blocks
+//!   with the slots skipped among them come to far less. A table's address is
+//!   derived from that slot, so the table is used at the address of the
+//!   creation that landed. A creation still refused for its slot is made
+//!   again, once the cluster has moved on [`REFUSED_WAIT_SLOTS`] slots, from a
+//!   slot chosen again and newer than the one refused, up to
+//!   [`CREATION_TRIES`] times.
 //! - **Warm-up.** Addresses added to a table can be looked up only from the
 //!   slot after the one they were added in, so after creating or extending
 //!   a table the send waits for the cluster to pass that slot.
@@ -73,12 +82,42 @@ pub use solana_address_lookup_table_interface::instruction::{
 };
 pub use solana_address_lookup_table_interface::program::ID as PROGRAM;
 
-/// The commitment the slot a new table is derived from is read at (see the
-/// module's notes).
-pub const DERIVED_FROM: &str = super::rpc::FINALIZED;
-/// How many times a table's creation is made, each from a slot read again,
-/// while the program refuses its slot as not recent.
+/// How many slots behind the node's confirmed slot a new table's slot is
+/// chosen at the latest (see the module's notes).
+pub const SLOT_MARGIN: u64 = 32;
+/// How many slots before that point a block is looked for in, so a run of
+/// skipped slots there still leaves one to choose.
+pub const SLOT_SEARCH: u64 = 32;
+/// How many slots the cluster is waited on to move after a creation is
+/// refused for its slot, before a slot is chosen again.
+pub const REFUSED_WAIT_SLOTS: u64 = 8;
+/// How many times a table's creation is made, each from a slot chosen
+/// again, while the program refuses its slot as not recent.
 pub const CREATION_TRIES: usize = 3;
+
+/// The slots a new table's slot is chosen among, both included, when the
+/// node's confirmed slot is `confirmed` and the slot must be newer than
+/// `after` (the one last refused, if any): none while the cluster has not
+/// gone far enough.
+pub fn derivation_range(confirmed: u64, after: Option<u64>) -> Option<(u64, u64)> {
+    let end = confirmed.checked_sub(SLOT_MARGIN)?;
+    let start = end.saturating_sub(SLOT_SEARCH);
+    let start = match after {
+        Some(after) => start.max(after.checked_add(1)?),
+        None => start,
+    };
+    (start <= end).then_some((start, end))
+}
+
+/// The slot a new table is derived from: the newest of `blocks` (the slots
+/// the node holds a block for) in `range`, if any.
+pub fn derivation_slot(blocks: &[u64], (start, end): (u64, u64)) -> Option<u64> {
+    blocks
+        .iter()
+        .copied()
+        .filter(|slot| (start..=end).contains(slot))
+        .max()
+}
 
 /// Whether a refusal's logs are the lookup-table program refusing the slot
 /// a table was to be derived from.
@@ -318,6 +357,51 @@ mod tests {
 
     use super::*;
     use crate::solana::client::PACKET_DATA_SIZE;
+
+    #[test]
+    fn a_table_s_slot_is_a_block_at_least_the_margin_behind_the_confirmed_slot() {
+        let confirmed = 1_000;
+        let range = derivation_range(confirmed, None).unwrap();
+        assert_eq!(
+            range,
+            (
+                confirmed - SLOT_MARGIN - SLOT_SEARCH,
+                confirmed - SLOT_MARGIN
+            )
+        );
+        let every: Vec<u64> = (900..=confirmed).collect();
+        assert_eq!(
+            derivation_slot(&every, range),
+            Some(confirmed - SLOT_MARGIN)
+        );
+        // Skipped slots at the margin: the newest block before them.
+        let skipping: Vec<u64> = every
+            .iter()
+            .copied()
+            .filter(|slot| !(confirmed - SLOT_MARGIN - 3..=confirmed - SLOT_MARGIN).contains(slot))
+            .collect();
+        assert_eq!(
+            derivation_slot(&skipping, range),
+            Some(confirmed - SLOT_MARGIN - 4)
+        );
+        assert_eq!(derivation_slot(&[], range), None);
+        // The window, the margin and a blockhash's 150 blocks, skips and
+        // all, stay inside the 512 slots a bank holds.
+        const { assert!(SLOT_MARGIN + SLOT_SEARCH + 2 * 150 < 512) };
+    }
+
+    #[test]
+    fn a_slot_chosen_again_is_newer_than_the_one_refused() {
+        assert_eq!(derivation_range(1_000, Some(967)), Some((968, 968)));
+        assert_eq!(derivation_range(1_000, Some(968)), None);
+        assert_eq!(derivation_range(1_008, Some(968)), Some((969, 976)));
+    }
+
+    #[test]
+    fn no_slot_is_chosen_before_the_cluster_is_past_the_margin() {
+        assert_eq!(derivation_range(SLOT_MARGIN - 1, None), None);
+        assert_eq!(derivation_range(SLOT_MARGIN, None), Some((0, 0)));
+    }
 
     /// A table's account as the lookup-table program writes it.
     fn table_account(

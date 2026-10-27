@@ -421,9 +421,11 @@ impl Rpc {
             .await
     }
 
-    /// The newest slot the node has at `commitment`.
-    pub async fn slot_at(&self, commitment: &str) -> Result<u64> {
-        self.call("getSlot", json!([{"commitment": commitment}]))
+    /// The slots from `start` to `end` (both included) the node holds a
+    /// confirmed block for, in order: a slot skipped by its leader is not
+    /// among them.
+    pub async fn blocks(&self, start: u64, end: u64) -> Result<Vec<u64>> {
+        self.call("getBlocks", json!([start, end, {"commitment": COMMITMENT}]))
             .await
     }
 

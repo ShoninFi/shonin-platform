@@ -12,13 +12,14 @@
 //! image or project can be part of it.
 //!
 //! The deployer (a hot key the owner funds with just enough gas) sends the
-//! creations alone. Every contract names the owner's hardware key (`ADMIN`)
-//! as its admin from its creation, and the platform's fees go there too.
-//! What only the admin may do (initialising the station factory, proposing
-//! the driver, the project when it is known) is written as prepared
-//! transactions to a file ([`AdminSteps`]), for the hardware key to sign;
-//! on a fork rehearsal they are sent as the admin, impersonated. The
-//! deployer holds no power once the deploy ends.
+//! creations alone. Every contract names the owner's admin key (`ADMIN`, one
+//! key held in a key file, the same address on every chain) as its admin
+//! from its creation, and the platform's fees go there too. What only the
+//! admin may do (initialising the station factory, proposing the driver,
+//! the project when it is known) is written as prepared transactions to a
+//! file ([`AdminSteps`]); [`act`] signs them with the admin's key in this
+//! process and sends them (on a fork rehearsal, the fork's throwaway admin
+//! signs). The deployer holds no power once the deploy ends.
 //!
 //! Every address follows from the build, the admin and the generation,
 //! through the deterministic deployer, before anything is sent: a dry run
@@ -547,6 +548,16 @@ alloy::sol! {
     interface IMainnetVaultFactory {
         function admin() external view returns (address);
         function platform() external view returns (address);
+        function vaults() external view returns (address[] memory);
+    }
+    interface IMainnetVault {
+        function kill() external;
+        function state() external view returns (uint8);
+        function admin() external view returns (address);
+    }
+    interface IMainnetRootKey {
+        function clearRootKey() external;
+        function revokeImage(bytes32 imageDigest) external;
     }
     interface IMainnetStationFactory {
         function initializer() external view returns (address);
@@ -597,9 +608,12 @@ pub enum StepKind {
     ProposeDriver,
     ProposeProject,
     ProposeImage,
+    RevokeImage,
+    KillVault,
+    ClearRootKey,
 }
 
-/// One transaction only the admin may send, prepared for the hardware key.
+/// One transaction only the admin may send, prepared for the admin's key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminStep {
     pub chain_id: u64,
@@ -610,7 +624,7 @@ pub struct AdminStep {
     pub kind: StepKind,
 }
 
-/// A chain's admin steps, as written for the hardware key.
+/// A chain's admin steps, as the deploy wrote them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdminSteps {
     pub chain_id: u64,
@@ -640,60 +654,102 @@ pub fn project_hash(project: &str) -> B256 {
 pub fn admin_steps(plan: &ChainPlan, project: Option<&str>) -> Vec<AdminStep> {
     let registry = plan.platform.attestation;
     let mut steps = vec![
-        AdminStep {
-            chain_id: plan.chain_id,
-            to: plan.platform.station_factory,
-            data: IMainnetStationFactory::initializeCall {
-                attestation_: registry,
-                asset_: plan.dollar,
-                vaultFactory_: plan.platform.factory,
-                implementation_: plan.platform.station_implementation,
-            }
-            .abi_encode()
-            .into(),
-            value: U256::ZERO,
-            purpose: format!(
-                "initialise the station factory {} for this deployment (registry {registry}, \
-                 dollar {}, vault factory {}, station {})",
-                plan.platform.station_factory,
-                plan.dollar,
-                plan.platform.factory,
-                plan.platform.station_implementation
-            ),
-            kind: StepKind::InitialiseStationFactory,
-        },
-        AdminStep {
-            chain_id: plan.chain_id,
-            to: registry,
-            data: IMainnetRegistry::proposeDriverCall {
-                name: deploy::market_id(&plan.driver.name),
-                implementation: plan.driver.address,
-            }
-            .abi_encode()
-            .into(),
-            value: U256::ZERO,
-            purpose: format!(
-                "propose the driver {} ({} at {}); it trades once the timelock has passed",
-                plan.driver.name, plan.driver.contract, plan.driver.address
-            ),
-            kind: StepKind::ProposeDriver,
-        },
+        initialise_step(
+            plan.chain_id,
+            plan.platform.station_factory,
+            registry,
+            plan.dollar,
+            plan.platform.factory,
+            plan.platform.station_implementation,
+        ),
+        driver_step(
+            plan.chain_id,
+            registry,
+            &plan.driver.name,
+            &format!("{} at {}", plan.driver.contract, plan.driver.address),
+            plan.driver.address,
+        ),
     ];
-    if let Some(project) = project.map(str::trim).filter(|project| !project.is_empty()) {
-        steps.push(AdminStep {
-            chain_id: plan.chain_id,
-            to: registry,
-            data: IMainnetRegistry::proposeProjectCall {
-                projectId: project_hash(project),
-            }
-            .abi_encode()
-            .into(),
-            value: U256::ZERO,
-            purpose: format!("propose the operator's project {project}"),
-            kind: StepKind::ProposeProject,
-        });
+    if let Some(project) = named_project(project) {
+        steps.push(project_step(plan.chain_id, registry, project));
     }
     steps
+}
+
+/// The project named, if one is: trimmed, never empty.
+pub fn named_project(project: Option<&str>) -> Option<&str> {
+    project.map(str::trim).filter(|project| !project.is_empty())
+}
+
+/// The step proposing the operator's project `project` on a registry.
+pub fn project_step(chain_id: u64, registry: Address, project: &str) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: registry,
+        data: IMainnetRegistry::proposeProjectCall {
+            projectId: project_hash(project),
+        }
+        .abi_encode()
+        .into(),
+        value: U256::ZERO,
+        purpose: format!("propose the operator's project {project}"),
+        kind: StepKind::ProposeProject,
+    }
+}
+
+/// The step initialising a deployment's station factory.
+pub fn initialise_step(
+    chain_id: u64,
+    station_factory: Address,
+    registry: Address,
+    dollar: Address,
+    factory: Address,
+    station: Address,
+) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: station_factory,
+        data: IMainnetStationFactory::initializeCall {
+            attestation_: registry,
+            asset_: dollar,
+            vaultFactory_: factory,
+            implementation_: station,
+        }
+        .abi_encode()
+        .into(),
+        value: U256::ZERO,
+        purpose: format!(
+            "initialise the station factory {station_factory} for this deployment (registry \
+             {registry}, dollar {dollar}, vault factory {factory}, station {station})"
+        ),
+        kind: StepKind::InitialiseStationFactory,
+    }
+}
+
+/// The step proposing the driver `name` (`described`) at `address` on a
+/// registry.
+pub fn driver_step(
+    chain_id: u64,
+    registry: Address,
+    name: &str,
+    described: &str,
+    address: Address,
+) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: registry,
+        data: IMainnetRegistry::proposeDriverCall {
+            name: deploy::market_id(name),
+            implementation: address,
+        }
+        .abi_encode()
+        .into(),
+        value: U256::ZERO,
+        purpose: format!(
+            "propose the driver {name} ({described}); it trades once the timelock has passed"
+        ),
+        kind: StepKind::ProposeDriver,
+    }
 }
 
 /// Whether a listed pool serves the TWAP a full-band sale's price limit is
@@ -770,117 +826,6 @@ pub fn image_step(
     }
 }
 
-/// `mainnet-image`: a real image digest proposed on each EVM chain's
-/// registry as an admin step, built from the chain's deployment file (held
-/// to ADMIN) and the registry as it stands. On a fork sent as the admin,
-/// impersonated (with `warp`, the clock then moved past the timelock); on
-/// mainnet never sent: each step still to do is printed as its command for
-/// the hardware wallet and written to `image-evm-<id>.sh` beside the
-/// deploy's admin steps.
-pub async fn image(
-    chains: Vec<(ChainKey, ChainConfig)>,
-    deployments_dir: &Path,
-    admin_steps_dir: &Path,
-    flags: &mainnet_guard::Flags,
-    digest: B256,
-    kind_name: &str,
-    warp: bool,
-) -> Result<()> {
-    let kind = crate::admin::kind_named(kind_name)?;
-    let ids: Vec<u64> = chains
-        .iter()
-        .filter_map(|(key, _)| key.evm_chain_id())
-        .collect();
-    let (mode, admin) = mainnet_guard::decide_without_generation(flags, &ids)?;
-    if mode == Mode::Send {
-        bail!(
-            "an image is proposed by the hardware key, never sent from here on mainnet. Run this \
-             without DEPLOYER_KEYFILE and CONFIRM_MAINNET to print its commands."
-        );
-    }
-    if warp && mode != Mode::Fork {
-        bail!("only a fork's clock can be moved (ON_FORK=1)");
-    }
-    mainnet_guard::check_admin_steps_dir(mode, admin_steps_dir)?;
-    if mode == Mode::Fork && mainnet_guard::is_committed_dir(deployments_dir) {
-        bail!(
-            "a fork rehearsal reads the fork's deployment files, never config/deployments/mainnet"
-        );
-    }
-    for (key, config) in chains {
-        let id = key.evm_chain_id().unwrap_or_default();
-        let file = Deployments::file_in(deployments_dir, &key);
-        let deployments = Deployments::from_json(
-            &std::fs::read_to_string(&file)
-                .with_context(|| format!("reading {}: deploy first", file.display()))?,
-        )?;
-        if deployments.roles.admin != admin {
-            bail!(
-                "{} records the admin {}, not ADMIN={admin}",
-                file.display(),
-                deployments.roles.admin
-            );
-        }
-        mainnet_guard::check_chain(mode, &config, id).await?;
-        let client =
-            chain::connect_with(&key, &config, NetworkName::Mainnet, Signing::ReadOnly).await?;
-        mainnet_guard::check_chain_id(&config.label, id, client.chain_id)?;
-        let steps = AdminSteps {
-            chain_id: id,
-            admin,
-            registry: deployments.attestation,
-            from_block: deployments.deployed_block,
-            steps: vec![image_step(
-                id,
-                deployments.attestation,
-                digest,
-                kind,
-                kind_name,
-            )],
-        };
-        println!("{} ({key}): the {kind_name} image {digest}", config.label);
-        if mode == Mode::Fork {
-            send_impersonated(&client, &steps).await?;
-            if warp {
-                let timelock = client
-                    .read(steps.registry, IMainnetRegistry::timelockCall {})
-                    .await?;
-                client
-                    .raw_request("evm_increaseTime", serde_json::json!([timelock + 60]))
-                    .await?;
-                client
-                    .raw_request("evm_mine", serde_json::json!([]))
-                    .await?;
-                println!(
-                    "  the fork's clock moved {} s, past the registry's timelock",
-                    timelock + 60
-                );
-            }
-            continue;
-        }
-        let step = &steps.steps[0];
-        let done = step_done(&client, &steps, step).await?;
-        let command = ledger_command(step, admin, &config.public_rpc);
-        println!(
-            "  {}: {}\n    {command}",
-            if done { "done" } else { "to send" },
-            step.purpose
-        );
-        std::fs::create_dir_all(admin_steps_dir)?;
-        let script_file = admin_steps_dir.join(format!("image-evm-{id}.sh"));
-        let mut script = String::from("#!/bin/sh\nset -e\n");
-        if !done {
-            script.push_str(&format!("# {}\n{command}\n", step.purpose));
-        }
-        mainnet_guard::write_file(&script_file, script)?;
-        println!(
-            "  nothing was sent: the hardware key's command is in {}",
-            script_file.display()
-        );
-    }
-    Ok(())
-}
-
 /// Read a listed pool's observations and ask it for the TWAP over
 /// `window`, judged by [`judge_twap`]: its observation count, or why not.
 /// How a pool that would refuse the send is named, in the dry run and in
@@ -930,10 +875,11 @@ async fn pool_twap(client: &Client, pool: Address, window: u32) -> Result<u16, S
     judge_twap(window, cardinality, observed).map(|()| cardinality)
 }
 
-/// The command that sends one admin step from the hardware wallet.
-pub fn ledger_command(step: &AdminStep, admin: Address, public_rpc: &str) -> String {
+/// One admin step, listed plainly: the chain, the contract it calls and
+/// its calldata. What the dry run prints for each step still to do.
+pub fn step_listing(step: &AdminStep) -> String {
     format!(
-        "cast send --ledger --from {admin} --chain {} --rpc-url {public_rpc} {} {}",
+        "chain {}, to {}, calldata {}",
         step.chain_id, step.to, step.data
     )
 }
@@ -1019,6 +965,10 @@ pub struct MainnetRecord {
     pub drivers: BTreeMap<String, Address>,
     pub deployer: Address,
     pub build: B256,
+    /// The operator's project the deploy was given, as the registry holds
+    /// it (its hash): the project the admin's steps may propose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<B256>,
 }
 
 /// Run the mainnet deploy: a dry run, a fork rehearsal or a real send, as
@@ -1030,6 +980,19 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
         .filter_map(|(key, _)| key.evm_chain_id())
         .collect();
     let decided = mainnet_guard::decide(&inputs.flags, &ids)?;
+    // The admin's key file, first: on a real send the key of the address
+    // made admin of everything for good must exist where the rules allow.
+    let deployers = match &inputs.flags.deployer_keyfile {
+        Some(path) => vec![mainnet_guard::read_key_file(path)?.address()],
+        None => Vec::new(),
+    };
+    crate::mainnet_admin_key::check_deploy_evm_admin(
+        decided.mode,
+        inputs.flags.admin_keyfile.as_deref(),
+        decided.admin,
+        &deployers,
+        &mainnet_guard::fork_root(),
+    )?;
     if inputs.overwrite_fork_record && decided.mode != Mode::Fork {
         bail!(
             "OVERWRITE_FORK_RECORD is a fork rehearsal's alone: a mainnet deployment file is never \
@@ -1088,8 +1051,9 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
             }
         }
         println!(
-            "\nA dry run: nothing was sent. A real send takes DEPLOYER_KEYFILE=<path> and \
-             CONFIRM_MAINNET={}; a rehearsal on local forks, ON_FORK=1.",
+            "\nA dry run: nothing was sent. A real send takes DEPLOYER_KEYFILE=<path>, \
+             ADMIN_KEYFILE=<the admin's key file, ADMIN's> and CONFIRM_MAINNET={}; a rehearsal \
+             on local forks, ON_FORK=1.",
             mainnet_guard::confirmation_for(&ids)
         );
         return Ok(());
@@ -1107,10 +1071,11 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
     };
     if deployer.address() == decided.admin {
         bail!(
-            "the deployer's key is the admin's address: the admin is the hardware key, and the \
+            "the deployer's key is the admin's address: the admin is its own key, and the \
              deployer a hot key that holds no power. Nothing was sent."
         );
     }
+
     println!(
         "deployer {} (holds no power once the deploy ends), admin {}, generation {}",
         deployer.address(),
@@ -1180,6 +1145,7 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
                 inputs.artifacts,
                 &file,
                 build,
+                named_project(project).map(project_hash),
                 inputs.overwrite_fork_record,
             )
             .await;
@@ -1229,11 +1195,15 @@ pub async fn run(inputs: DeployInputs<'_>) -> Result<()> {
         );
     }
     println!(
-        "Next: the admin's steps ({}), then, once the timelock has passed, the read-back.",
+        "Next: the admin's steps ({}{}), then, once the timelock has passed, the read-back.",
         match decided.mode {
             Mode::Fork => "task chains:admin-steps NETWORK=mainnet ON_FORK=1 ADMIN=<address>",
             _ =>
-                "task chains:admin-steps NETWORK=mainnet ADMIN=<address> prints the hardware key's commands",
+                "task chains:admin-steps NETWORK=mainnet ADMIN=<address> lists them; with ADMIN_KEYFILE=<path> CONFIRM_MAINNET=<ids> it signs and sends them",
+        },
+        match named_project(project) {
+            Some(_) => "; PROJECT=<the same id> proposes the operator's project",
+            None => "",
         }
     );
     Ok(())
@@ -1253,6 +1223,7 @@ async fn deploy_chain(
     artifacts: &Path,
     file: &Path,
     build: B256,
+    project: Option<B256>,
     overwrite_fork_record: bool,
 ) -> Result<u64> {
     let other = refuse_another_recorded(client, file, plan, overwrite_fork_record).await?;
@@ -1280,6 +1251,7 @@ async fn deploy_chain(
         drivers: BTreeMap::from([(plan.driver.name.clone(), plan.driver.address)]),
         deployer: deployer.address(),
         build,
+        project,
     };
     write_deployment(file, &deployments, plan, &record)?;
     Landed::finished(file);
@@ -1429,7 +1401,7 @@ fn print_plan(
             }
         }
     }
-    println!("  the admin's steps, for the hardware key:");
+    println!("  the admin's steps, signed by the admin's key after the deploy:");
     for step in admin_steps(plan, project) {
         println!("    to {} data {}  ({})", step.to, step.data, step.purpose);
     }
@@ -1674,6 +1646,30 @@ async fn step_done(client: &Client, steps: &AdminSteps, step: &AdminStep) -> Res
                 image.revoked,
             )
         }
+        StepKind::RevokeImage => {
+            use chain::bindings::attestation::IAttestationRegistry;
+            let wanted = IMainnetRootKey::revokeImageCall::abi_decode(&step.data)?;
+            let image = client
+                .read(
+                    step.to,
+                    IAttestationRegistry::imageOfCall {
+                        imageDigest: wanted.imageDigest,
+                    },
+                )
+                .await?;
+            Ok(image.revoked)
+        }
+        StepKind::KillVault => {
+            let state = client.read(step.to, IMainnetVault::stateCall {}).await?;
+            judge_kill(step.to, state)
+        }
+        StepKind::ClearRootKey => {
+            use chain::bindings::attestation::IAttestationRegistry;
+            let record = client
+                .read(step.to, IAttestationRegistry::rootKeyCall {})
+                .await?;
+            Ok(record.signer == Address::ZERO)
+        }
         StepKind::ProposeProject => {
             let asking = TransactionRequest::default()
                 .from(steps.admin)
@@ -1700,74 +1696,677 @@ async fn step_done(client: &Client, steps: &AdminSteps, step: &AdminStep) -> Res
     }
 }
 
-/// Send each chain's admin steps not yet done. On a fork, as the admin,
-/// impersonated, and with `warp` the fork's clock is then moved past the
-/// registry's timelock, so what was proposed is in force. On mainnet
-/// nothing is sent: each step's command for the hardware wallet is printed
-/// and written beside the steps, for the owner to run.
-pub async fn admin(
+/// What the admin is asked to sign on the EVM chains.
+#[derive(Clone, Debug)]
+pub enum AdminAction {
+    /// The steps the deploy prepared (`admin-steps-evm-<id>.json`).
+    DeploySteps {
+        /// The operator's project named on the command line: the only
+        /// project the steps propose, and it must be the one the deploy
+        /// recorded when it recorded one.
+        project: Option<String>,
+    },
+    /// A real image digest proposed on each chain's registry.
+    ProposeImage { digest: B256, kind_name: String },
+    /// An image revoked on each chain's registry, at once and for good.
+    RevokeImage { digest: B256 },
+    /// A vault of this deployment's factory killed, on the chain named.
+    KillVault { vault: Address },
+    /// The root key's record cleared on the canonical chain.
+    ClearRootKey,
+}
+
+/// The vault states as `IVault.VaultState` numbers them.
+pub mod vault_state {
+    pub const ACTIVATING: u8 = 1;
+    pub const OPEN: u8 = 2;
+    pub const WINDING_DOWN: u8 = 3;
+    pub const FROZEN: u8 = 4;
+    pub const KILLED: u8 = 5;
+    pub const CLOSED: u8 = 6;
+    pub const CANCELLED: u8 = 7;
+}
+
+/// Whether a kill is done, to send, or refused, from the vault's state: a
+/// killed vault is done; an open, winding-down or frozen one is to kill; one
+/// still activating (cancelled, never killed), closed or cancelled is
+/// refused, since a kill would revert.
+pub fn judge_kill(vault: Address, state: u8) -> Result<bool> {
+    use vault_state::*;
+    match state {
+        KILLED => Ok(true),
+        OPEN | WINDING_DOWN | FROZEN => Ok(false),
+        ACTIVATING => bail!(
+            "the vault {vault} is still activating: it is cancelled, never killed. Nothing was sent."
+        ),
+        CLOSED | CANCELLED => bail!(
+            "the vault {vault} is already {}: nothing to kill. Nothing was sent.",
+            if state == CLOSED {
+                "closed"
+            } else {
+                "cancelled"
+            }
+        ),
+        other => bail!("the vault {vault} answers state {other}, not a vault's. Nothing was sent."),
+    }
+}
+
+/// The step revoking `digest` on a chain's registry.
+pub fn revoke_step(chain_id: u64, registry: Address, digest: B256) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: registry,
+        data: IMainnetRootKey::revokeImageCall {
+            imageDigest: digest,
+        }
+        .abi_encode()
+        .into(),
+        value: U256::ZERO,
+        purpose: format!(
+            "revoke the image {digest}: at once and for good, keys blessed from it stop counting"
+        ),
+        kind: StepKind::RevokeImage,
+    }
+}
+
+/// The step killing `vault`.
+pub fn kill_step(chain_id: u64, vault: Address) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: vault,
+        data: IMainnetVault::killCall {}.abi_encode().into(),
+        value: U256::ZERO,
+        purpose: format!("kill the vault {vault}: it stops at once, and its stations unwind"),
+        kind: StepKind::KillVault,
+    }
+}
+
+/// The step clearing the root key's record on a chain's registry.
+pub fn clear_root_step(chain_id: u64, registry: Address, signer: Address) -> AdminStep {
+    AdminStep {
+        chain_id,
+        to: registry,
+        data: IMainnetRootKey::clearRootKeyCall {}.abi_encode().into(),
+        value: U256::ZERO,
+        purpose: format!(
+            "clear the root key's record (signer {signer}): that signer is refused for good"
+        ),
+        kind: StepKind::ClearRootKey,
+    }
+}
+
+/// The contracts of one deployment the admin's steps may call: its
+/// registry, its station factory, and the vaults its factory made that a
+/// kill was asked for (each read from the factory before it is named here).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeploymentTargets {
+    pub registry: Address,
+    pub station_factory: Address,
+    pub vaults: Vec<Address>,
+}
+
+impl DeploymentTargets {
+    /// The targets a deployment file records (no vault until one is read).
+    pub fn of(deployments: &Deployments) -> Self {
+        Self {
+            registry: deployments.attestation,
+            station_factory: deployments.station_factory,
+            vaults: Vec::new(),
+        }
+    }
+}
+
+/// Whether `data` is exactly one call of `C`: its selector, arguments that
+/// decode, and nothing after them.
+fn is_exactly<C: SolCall>(data: &[u8]) -> bool {
+    C::abi_decode(data).is_ok_and(|call| call.abi_encode() == data)
+}
+
+/// Refuse a step that is not one of the admin's known calls, aimed at the
+/// contract of this deployment its kind calls: the station factory's
+/// `initialize`; the registry's `proposeDriver`, `proposeProject`,
+/// `proposeImage`, `revokeImage` or `clearRootKey`; a vault's `kill`, on a
+/// vault this deployment's factory made. Nothing else is ever signed with
+/// the admin's key, whatever a file says.
+pub fn check_step(step: &AdminStep, chain_id: u64, targets: &DeploymentTargets) -> Result<()> {
+    use chain::bindings::attestation::IAttestationRegistry;
+    let (aimed, what, call_ok, call) = match step.kind {
+        StepKind::InitialiseStationFactory => (
+            step.to == targets.station_factory,
+            format!(
+                "this deployment's station factory {}",
+                targets.station_factory
+            ),
+            is_exactly::<IMainnetStationFactory::initializeCall>(&step.data),
+            "initialize",
+        ),
+        StepKind::ProposeDriver => (
+            step.to == targets.registry,
+            format!("this deployment's registry {}", targets.registry),
+            is_exactly::<IMainnetRegistry::proposeDriverCall>(&step.data),
+            "proposeDriver",
+        ),
+        StepKind::ProposeProject => (
+            step.to == targets.registry,
+            format!("this deployment's registry {}", targets.registry),
+            is_exactly::<IMainnetRegistry::proposeProjectCall>(&step.data),
+            "proposeProject",
+        ),
+        StepKind::ProposeImage => (
+            step.to == targets.registry,
+            format!("this deployment's registry {}", targets.registry),
+            is_exactly::<IAttestationRegistry::proposeImageCall>(&step.data),
+            "proposeImage",
+        ),
+        StepKind::RevokeImage => (
+            step.to == targets.registry,
+            format!("this deployment's registry {}", targets.registry),
+            is_exactly::<IMainnetRootKey::revokeImageCall>(&step.data),
+            "revokeImage",
+        ),
+        StepKind::ClearRootKey => (
+            step.to == targets.registry,
+            format!("this deployment's registry {}", targets.registry),
+            is_exactly::<IMainnetRootKey::clearRootKeyCall>(&step.data),
+            "clearRootKey",
+        ),
+        StepKind::KillVault => (
+            targets.vaults.contains(&step.to),
+            "a vault this deployment's factory made".to_string(),
+            is_exactly::<IMainnetVault::killCall>(&step.data),
+            "kill",
+        ),
+    };
+    if step.chain_id != chain_id || step.value != U256::ZERO {
+        bail!(
+            "the admin's step \"{}\" is not a step for chain {chain_id} with no value: it is \
+             never signed. Nothing was sent.",
+            step.purpose
+        );
+    }
+    if step.to == Address::ZERO || !aimed {
+        bail!(
+            "the admin's step \"{}\" calls {}, not {what}: it is never signed. Nothing was sent.",
+            step.purpose,
+            step.to
+        );
+    }
+    if !call_ok {
+        bail!(
+            "the admin's step \"{}\" is not one call of {call} (the call its kind makes): it is \
+             never signed. Nothing was sent.",
+            step.purpose
+        );
+    }
+    Ok(())
+}
+
+/// The deploy's admin steps for a chain, rebuilt from its deployment file
+/// rather than taken from the steps file: the station factory initialised
+/// with the registry, dollar, vault factory and station the file records,
+/// and each driver the file's mainnet record holds proposed on its
+/// registry, and the operator's project when `project` names it (it must be
+/// the one the deployment file records, when it records one). A project is
+/// never taken from the steps file. Any step of the file outside these, or
+/// different from its rebuilt one, is refused: nothing is signed then. A
+/// filed project proposal with no project named is left out, and said so in
+/// the notes returned beside the steps.
+pub fn deploy_steps_from(
+    deployments: &Deployments,
+    text: &str,
+    filed: &AdminSteps,
+    project: Option<&str>,
+) -> Result<(AdminSteps, Vec<String>)> {
+    let chain_id = deployments.chain_id;
+    let targets = DeploymentTargets::of(deployments);
+    if filed.chain_id != chain_id || filed.registry != deployments.attestation {
+        bail!(
+            "the admin's steps file is for chain {} and the registry {}, not this deployment's \
+             (chain {chain_id}, registry {}). Nothing was sent.",
+            filed.chain_id,
+            filed.registry,
+            deployments.attestation
+        );
+    }
+    for step in &filed.steps {
+        check_step(step, chain_id, &targets)?;
+    }
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let station: Address = value
+        .get(deploy::STATION_IMPLEMENTATION_KEY)
+        .and_then(|at| serde_json::from_value(at.clone()).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "the deployment file records no station implementation: the admin's steps \
+                 can't be rebuilt from it. Nothing was sent."
+            )
+        })?;
+    let record: MainnetRecord = value
+        .get(MAINNET_KEY)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "the deployment file has no mainnet record: the admin's steps can't be rebuilt \
+                 from it. Nothing was sent."
+            )
+        })
+        .and_then(|record| Ok(serde_json::from_value(record)?))?;
+    let mut steps = vec![initialise_step(
+        chain_id,
+        deployments.station_factory,
+        deployments.attestation,
+        deployments.usd,
+        deployments.factory,
+        station,
+    )];
+    for (name, at) in &record.drivers {
+        steps.push(driver_step(
+            chain_id,
+            deployments.attestation,
+            name,
+            &format!("at {at}"),
+            *at,
+        ));
+    }
+    let mut notes = Vec::new();
+    let named = named_project(project);
+    if let (Some(name), Some(recorded)) = (named, record.project)
+        && project_hash(name) != recorded
+    {
+        bail!(
+            "PROJECT={name} is not the project the deploy recorded (its hash {recorded}, \
+             PROJECT's {}): it is never proposed. Nothing was sent.",
+            project_hash(name)
+        );
+    }
+    let project_step = named.map(|name| project_step(chain_id, deployments.attestation, name));
+    match (&project_step, record.project) {
+        (Some(step), _) => steps.push(step.clone()),
+        (None, Some(recorded)) => notes.push(format!(
+            "the deploy recorded the operator's project (its hash {recorded}): PROJECT=<its id> \
+             proposes it"
+        )),
+        (None, None) => {}
+    }
+    for step in &filed.steps {
+        let rebuilt = matches!(
+            step.kind,
+            StepKind::InitialiseStationFactory | StepKind::ProposeDriver
+        );
+        if rebuilt {
+            if !steps
+                .iter()
+                .any(|ours| ours.kind == step.kind && ours.to == step.to && ours.data == step.data)
+            {
+                bail!(
+                    "the admin's steps file holds \"{}\", which is not what the deployment file \
+                     records (a stale or edited file): it is never signed. Nothing was sent.",
+                    step.purpose
+                );
+            }
+        } else if step.kind == StepKind::ProposeProject {
+            match &project_step {
+                Some(ours) if ours.to == step.to && ours.data == step.data => {}
+                Some(_) => bail!(
+                    "the admin's steps file proposes a project that is not PROJECT={} (a stale \
+                     or edited file): it is never signed. Nothing was sent.",
+                    named.unwrap_or_default()
+                ),
+                None => notes.push(
+                    "the admin's steps file proposes a project, never signed from the file: \
+                     PROJECT=<its id> proposes it"
+                        .to_string(),
+                ),
+            }
+        } else {
+            bail!(
+                "the admin's steps file holds \"{}\", a step the deploy never prepares: it is \
+                 never signed. Nothing was sent.",
+                step.purpose
+            );
+        }
+    }
+    Ok((
+        AdminSteps {
+            chain_id,
+            admin: filed.admin,
+            registry: deployments.attestation,
+            from_block: deployments.deployed_block,
+            steps,
+        },
+        notes,
+    ))
+}
+
+/// The deployer recorded in a mainnet deployment file, if it records one.
+fn recorded_deployer(text: &str) -> Option<Address> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get(MAINNET_KEY)?
+        .get("deployer")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// What one chain is asked: its client, its steps, its deployment.
+struct ChainWork {
+    label: String,
+    client: Client,
+    steps: AdminSteps,
+    /// The contracts of this deployment its steps may call.
+    targets: DeploymentTargets,
+}
+
+/// The admin's key, for the action: on mainnet the owner's file, checked
+/// before anything is read from any chain; on a fork the throwaway; on a
+/// dry run none. The deployers it must not be are the one `DEPLOYER_KEYFILE`
+/// names and each one a deployment file records.
+fn admin_key_for(
+    mode: Mode,
+    flags: &mainnet_guard::Flags,
+    admin: Address,
+    deployment_texts: &[String],
+) -> Result<Option<PrivateKeySigner>> {
+    let mut deployers: Vec<Address> = deployment_texts
+        .iter()
+        .filter_map(|text| recorded_deployer(text))
+        .collect();
+    if let Some(path) = &flags.deployer_keyfile {
+        deployers.push(
+            mainnet_guard::read_key_file(path)
+                .map_err(|error| anyhow!("{error:#}. Nothing was sent."))?
+                .address(),
+        );
+    }
+    crate::mainnet_admin_key::evm_admin_key(
+        mode,
+        flags.admin_keyfile.as_deref(),
+        admin,
+        &deployers,
+        &mainnet_guard::fork_root(),
+    )
+}
+
+/// `mainnet-admin-steps`, `mainnet-image`, `mainnet-revoke-image`,
+/// `mainnet-kill-vault` and `mainnet-clear-root-key`: what only the admin
+/// may do, in the three modes. A dry run reads each chain and prints every
+/// step still to do (the chain, the contract, the calldata and what it
+/// does), sending nothing. With `ADMIN_KEYFILE` and `CONFIRM_MAINNET` the
+/// steps still to do are signed with the admin's key in this process and
+/// sent, each read again just before its send, its gas estimated and held
+/// under the chain's per-transaction cap, its receipt waited for. On a fork
+/// the same sends are signed by the fork's throwaway admin, and with `warp`
+/// each fork's clock is then moved past the registry's timelock.
+#[allow(clippy::too_many_arguments)]
+pub async fn act(
     chains: Vec<(ChainKey, ChainConfig)>,
+    deployments_dir: &Path,
     admin_steps_dir: &Path,
     flags: &mainnet_guard::Flags,
+    action: AdminAction,
     warp: bool,
 ) -> Result<()> {
     let ids: Vec<u64> = chains
         .iter()
         .filter_map(|(key, _)| key.evm_chain_id())
         .collect();
-    // The admin's steps need no generation of their own: the steps file
-    // names what they are for.
-    let (mode, admin) = mainnet_guard::decide_without_generation(flags, &ids)?;
-    if mode == Mode::Send {
-        bail!(
-            "the admin's steps are never sent from here on mainnet: they are the hardware key's. \
-             Run this without DEPLOYER_KEYFILE and CONFIRM_MAINNET to print its commands."
-        );
-    }
+    let (mode, admin) = mainnet_guard::decide_admin(flags, &ids)?;
     if warp && mode != Mode::Fork {
-        bail!("only a fork's clock can be moved (ON_FORK=1)");
+        bail!("only a fork's clock can be moved (ON_FORK=1). Nothing was sent.");
+    }
+    if matches!(action, AdminAction::KillVault { .. }) && chains.len() != 1 {
+        bail!(
+            "a vault is killed on the one chain it is on: name it (VAULT_CHAIN=<name>). Nothing \
+             was sent."
+        );
     }
     mainnet_guard::check_admin_steps_dir(mode, admin_steps_dir)?;
-    for (key, config) in chains {
-        let id = key.evm_chain_id().unwrap_or_default();
-        let file = AdminSteps::file_in(admin_steps_dir, id);
-        let text = std::fs::read_to_string(&file).with_context(|| {
-            format!(
-                "reading {}: run the deploy first (task chains:deploy NETWORK=mainnet)",
+    if mode == Mode::Fork && mainnet_guard::is_committed_dir(deployments_dir) {
+        bail!(
+            "a fork rehearsal reads the fork's deployment files, never config/deployments/mainnet. \
+             Nothing was sent."
+        );
+    }
+    // Every file is read, and the admin's key checked, before any chain is.
+    let mut read = Vec::new();
+    for (key, config) in &chains {
+        let id = key
+            .evm_chain_id()
+            .ok_or_else(|| anyhow!("{key} is not an EVM chain"))?;
+        let file = Deployments::file_in(deployments_dir, key);
+        let text = std::fs::read_to_string(&file).ok();
+        // Every step is built from (or checked against) the deployment
+        // file: the contracts it records are the only ones the admin's key
+        // calls. It also records the deployer the admin's key must not be.
+        let (text, deployments) = match text {
+            Some(text) => {
+                let deployments = Deployments::from_json(&text)?;
+                (text, deployments)
+            }
+            None => bail!(
+                "reading {}: deploy first. Nothing was sent.",
                 file.display()
-            )
-        })?;
-        let steps: AdminSteps = serde_json::from_str(&text)?;
-        if steps.admin != admin {
+            ),
+        };
+        if deployments.chain_id != id {
             bail!(
-                "{} is prepared for admin {}, not ADMIN={}",
+                "{} records chain {}, not {id}. Nothing was sent.",
                 file.display(),
-                steps.admin,
-                admin
+                deployments.chain_id
             );
         }
-        // What the hardware key is asked to sign is taken from what the
-        // chain answers: without ON_FORK, only the mainnet's endpoints.
+        if deployments.roles.admin != admin {
+            bail!(
+                "{} records the admin {}, not ADMIN={admin}. Nothing was sent.",
+                file.display(),
+                deployments.roles.admin
+            );
+        }
+        read.push((key.clone(), config.clone(), id, text, deployments));
+    }
+    let texts: Vec<String> = read.iter().map(|f| f.3.clone()).collect();
+    let signer = admin_key_for(mode, flags, admin, &texts)?;
+
+    // Each chain's steps: rebuilt from its deployment file (the deploy's)
+    // or built from it (the rest), and checked, before any chain is read.
+    let mut files = Vec::new();
+    for (key, config, id, text, deployments) in read {
+        let steps = match &action {
+            AdminAction::DeploySteps { project } => {
+                let steps_file = AdminSteps::file_in(admin_steps_dir, id);
+                let filed: AdminSteps = serde_json::from_str(
+                    &std::fs::read_to_string(&steps_file).with_context(|| {
+                        format!(
+                            "reading {}: run the deploy first (task chains:deploy NETWORK=mainnet)",
+                            steps_file.display()
+                        )
+                    })?,
+                )?;
+                if filed.admin != admin {
+                    bail!(
+                        "{} is prepared for admin {}, not ADMIN={admin}. Nothing was sent.",
+                        steps_file.display(),
+                        filed.admin
+                    );
+                }
+                let (steps, notes) =
+                    deploy_steps_from(&deployments, &text, &filed, project.as_deref())?;
+                for note in notes {
+                    println!("{} (chain {id}): {note}", config.label);
+                }
+                steps
+            }
+            other => {
+                let step = match other {
+                    AdminAction::ProposeImage { digest, kind_name } => image_step(
+                        id,
+                        deployments.attestation,
+                        *digest,
+                        crate::admin::kind_named(kind_name)?,
+                        kind_name,
+                    ),
+                    AdminAction::RevokeImage { digest } => {
+                        revoke_step(id, deployments.attestation, *digest)
+                    }
+                    AdminAction::KillVault { vault } => kill_step(id, *vault),
+                    // The signer is filled in once the registry is read.
+                    AdminAction::ClearRootKey => {
+                        clear_root_step(id, deployments.attestation, Address::ZERO)
+                    }
+                    AdminAction::DeploySteps { .. } => unreachable!(),
+                };
+                AdminSteps {
+                    chain_id: id,
+                    admin,
+                    registry: deployments.attestation,
+                    from_block: deployments.deployed_block,
+                    steps: vec![step],
+                }
+            }
+        };
+        files.push((key, config, deployments, steps));
+    }
+
+    // Every chain is looked at before anything is sent to any.
+    let mut work = Vec::new();
+    for (key, config, deployments, mut steps) in files {
+        let id = steps.chain_id;
         mainnet_guard::check_chain(mode, &config, id).await?;
-        let client =
-            chain::connect_with(&key, &config, NetworkName::Mainnet, Signing::ReadOnly).await?;
+        let signing = match &signer {
+            Some(signer) => Signing::Keys(vec![signer.clone()]),
+            None => Signing::ReadOnly,
+        };
+        let client = chain::connect_with(&key, &config, NetworkName::Mainnet, signing)
+            .await
+            .map_err(|error| match &signer {
+                Some(signer) => {
+                    crate::mainnet_admin_key::redacted(error, signer.to_bytes().as_slice())
+                }
+                None => error,
+            })?;
         mainnet_guard::check_chain_id(&config.label, id, client.chain_id)?;
+        let mut targets = DeploymentTargets::of(&deployments);
+        match &action {
+            AdminAction::KillVault { vault } => {
+                let made = client
+                    .read(deployments.factory, IMainnetVaultFactory::vaultsCall {})
+                    .await
+                    .context("reading the vault factory's vaults")?;
+                if !made.contains(vault) {
+                    bail!(
+                        "{vault} is not a vault this deployment's factory ({}) made on {}. Nothing \
+                         was sent.",
+                        deployments.factory,
+                        config.label
+                    );
+                }
+                let held = client.read(*vault, IMainnetVault::adminCall {}).await?;
+                if held != admin {
+                    bail!(
+                        "the vault {vault} names the admin {held}, not ADMIN={admin}. Nothing was \
+                         sent."
+                    );
+                }
+                targets.vaults.push(*vault);
+            }
+            AdminAction::RevokeImage { digest } => {
+                use chain::bindings::attestation::IAttestationRegistry;
+                let image = client
+                    .read(
+                        steps.registry,
+                        IAttestationRegistry::imageOfCall {
+                            imageDigest: *digest,
+                        },
+                    )
+                    .await?;
+                // One never proposed here has nothing to revoke (a
+                // revocation of it wouldn't last): nothing is sent there.
+                if image.allowedAt == 0 && !image.revoked {
+                    println!(
+                        "{} ({key}): the image {digest} was never proposed here: nothing to revoke",
+                        config.label
+                    );
+                    steps.steps.clear();
+                }
+            }
+            AdminAction::ClearRootKey => {
+                use chain::bindings::attestation::IAttestationRegistry;
+                let record = client
+                    .read(steps.registry, IAttestationRegistry::rootKeyCall {})
+                    .await?;
+                if record.signer == Address::ZERO {
+                    println!(
+                        "{} ({key}): no root key is recorded: nothing to clear",
+                        config.label
+                    );
+                    steps.steps.clear();
+                } else {
+                    steps.steps = vec![clear_root_step(id, steps.registry, record.signer)];
+                }
+            }
+            _ => {}
+        }
+        // Each step is one of the admin's known calls, aimed at this
+        // deployment's own contract for its kind, or nothing is sent to any
+        // chain.
+        for step in &steps.steps {
+            check_step(step, id, &targets)?;
+        }
+        work.push(ChainWork {
+            label: config.label.clone(),
+            client,
+            steps,
+            targets,
+        });
+    }
+
+    for chain in &work {
         println!(
-            "{} ({key}): {} admin steps",
-            config.label,
-            steps.steps.len()
+            "{} (chain {}): {} admin step(s)",
+            chain.label,
+            chain.steps.chain_id,
+            chain.steps.steps.len()
         );
-        match mode {
-            Mode::Fork => {
-                send_impersonated(&client, &steps).await?;
+        match &signer {
+            None => {
+                let mut to_do = 0;
+                for step in &chain.steps.steps {
+                    let done = step_done(&chain.client, &chain.steps, step).await?;
+                    if done {
+                        println!("  done: {}", step.purpose);
+                    } else {
+                        to_do += 1;
+                        println!("  to do: {}\n    {}", step.purpose, step_listing(step));
+                    }
+                }
+                println!(
+                    "  {to_do} still to do on {}: nothing was sent (a send takes \
+                     ADMIN_KEYFILE=<path> CONFIRM_MAINNET={})",
+                    chain.label,
+                    mainnet_guard::confirmation_for(&ids)
+                );
+            }
+            Some(signer) => {
+                if mode == Mode::Fork {
+                    fund_on_fork(&chain.client, signer.address(), &chain.label).await?;
+                }
+                send_steps(&chain.client, &chain.steps, &chain.targets, signer)
+                    .await
+                    .map_err(|error| {
+                        crate::mainnet_admin_key::redacted(error, signer.to_bytes().as_slice())
+                    })?;
                 if warp {
-                    let timelock = client
-                        .read(steps.registry, IMainnetRegistry::timelockCall {})
+                    let timelock = chain
+                        .client
+                        .read(chain.steps.registry, IMainnetRegistry::timelockCall {})
                         .await?;
-                    client
+                    chain
+                        .client
                         .raw_request("evm_increaseTime", serde_json::json!([timelock + 60]))
                         .await?;
-                    client
+                    chain
+                        .client
                         .raw_request("evm_mine", serde_json::json!([]))
                         .await?;
                     println!(
@@ -1776,80 +2375,94 @@ pub async fn admin(
                     );
                 }
             }
-            _ => {
-                let mut script = String::from("#!/bin/sh\nset -e\n");
-                for step in &steps.steps {
-                    let done = step_done(&client, &steps, step).await?;
-                    let command = ledger_command(step, steps.admin, &config.public_rpc);
-                    println!(
-                        "  {}: {}\n    {command}",
-                        if done { "done" } else { "to send" },
-                        step.purpose
-                    );
-                    if !done {
-                        script.push_str(&format!("# {}\n{command}\n", step.purpose));
-                    }
-                }
-                let script_file = file.with_extension("sh");
-                mainnet_guard::write_file(&script_file, script)?;
-                println!(
-                    "  nothing was sent: the hardware key's commands are in {}",
-                    script_file.display()
-                );
-            }
         }
     }
     Ok(())
 }
 
-async fn send_impersonated(client: &Client, steps: &AdminSteps) -> Result<()> {
-    client
-        .raw_request("anvil_impersonateAccount", serde_json::json!([steps.admin]))
-        .await
-        .context("impersonating the admin on the fork")?;
-    if client.balance(steps.admin).await? < U256::from(10u64).pow(U256::from(17u64)) {
-        client
-            .raw_request(
-                "anvil_setBalance",
-                serde_json::json!([
-                    steps.admin,
-                    format!("{:#x}", U256::from(10u64).pow(U256::from(19u64)))
-                ]),
-            )
-            .await?;
+/// Send each step not yet done, signed by the admin's key in this process:
+/// read again just before its send, its gas estimated as the admin and held
+/// under the chain's per-transaction cap (a step over it, or one the
+/// estimate refuses, is not sent), its receipt waited for, its transaction
+/// hash printed.
+async fn send_steps(
+    client: &Client,
+    steps: &AdminSteps,
+    targets: &DeploymentTargets,
+    signer: &PrivateKeySigner,
+) -> Result<()> {
+    use crate::mainnet_admin_key::{admin_gas_limit, admin_tx_gas_cap};
+    if signer.address() != steps.admin {
+        bail!(
+            "the key signing is {}, not the steps' admin {}. Nothing was sent.",
+            signer.address(),
+            steps.admin
+        );
     }
+    let cap = admin_tx_gas_cap(steps.chain_id);
     for step in &steps.steps {
+        check_step(step, steps.chain_id, targets)?;
         if step_done(client, steps, step).await? {
             println!("  done already: {}", step.purpose);
             continue;
         }
-        let request = TransactionRequest::default()
+        // A step whose earlier send may still land is never sent again: an
+        // admin transaction still pending (a run stopped while waiting for
+        // its receipt) holds every step back until it has been mined, and
+        // the step's effect is then read again by the next run.
+        let latest = client
+            .provider()
+            .get_transaction_count(steps.admin)
+            .latest()
+            .await
+            .context("reading the admin's nonce")?;
+        let pending = client
+            .provider()
+            .get_transaction_count(steps.admin)
+            .pending()
+            .await
+            .context("reading the admin's pending nonce")?;
+        if pending > latest {
+            bail!(
+                "the admin {} has {} transaction(s) not yet mined (nonce {latest} on): an earlier \
+                 send may still land, so {} is not sent. Wait until they are mined (or dropped) \
+                 and run again: what landed is read as done.",
+                steps.admin,
+                pending - latest,
+                step.purpose
+            );
+        }
+        let asking = TransactionRequest::default()
             .from(steps.admin)
             .to(step.to)
-            .value(step.value)
             .input(step.data.clone().into());
-        let receipt = client
+        let estimate = client
             .provider()
-            .send_transaction(request)
+            .estimate_gas(asking)
             .await
-            .with_context(|| format!("sending {}", step.purpose))?
-            .get_receipt()
+            .with_context(|| format!("estimating {} (refused: not sent)", step.purpose))?;
+        let gas = admin_gas_limit(estimate, cap).ok_or_else(|| {
+            anyhow!(
+                "{} needs {estimate} gas, over the chain's per-transaction cap of {cap}: not sent",
+                step.purpose
+            )
+        })?;
+        let receipt = client
+            .send_raw_with_gas_limit(steps.admin, step.to, step.data.clone(), Some(gas))
             .await
-            .with_context(|| format!("waiting for {}", step.purpose))?;
+            .with_context(|| format!("sending {}", step.purpose))?;
         if !receipt.status() {
-            bail!("{} was reverted", step.purpose);
+            bail!(
+                "{} was reverted (transaction {})",
+                step.purpose,
+                receipt.transaction_hash
+            );
         }
         println!(
-            "  sent as the admin (impersonated): {} (gas {})",
-            step.purpose, receipt.gas_used
+            "  sent: {} (transaction {}, gas {})",
+            step.purpose, receipt.transaction_hash, receipt.gas_used
         );
     }
-    client
-        .raw_request(
-            "anvil_stopImpersonatingAccount",
-            serde_json::json!([steps.admin]),
-        )
-        .await?;
     Ok(())
 }
 
@@ -1899,6 +2512,7 @@ pub async fn verify(
         Mode::Send
     };
     let mut failed = Vec::new();
+    let mut admins = Vec::new();
     for (key, config) in chains {
         let id = key.evm_chain_id().unwrap_or_default();
         mainnet_guard::check_chain(mode, &config, id).await?;
@@ -1908,7 +2522,7 @@ pub async fn verify(
         let file = Deployments::file_in(deployments_dir, &key);
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
-        let checks = verify_chain(
+        let mut checks = verify_chain(
             &client,
             id,
             &text,
@@ -1921,6 +2535,25 @@ pub async fn verify(
             expect_in_force,
         )
         .await?;
+        // The custody: the admin (and so the platform) is one key's plain
+        // account on every chain, the same address on each.
+        let code = client
+            .provider()
+            .get_code_at(decided.admin)
+            .await
+            .context("reading the admin's code")?;
+        check(
+            &mut checks,
+            "the admin (and platform) is a plain account: no code, no EIP-7702 delegation",
+            code.is_empty(),
+            if code.is_empty() {
+                format!("{} has no code", decided.admin)
+            } else {
+                format!("{} bytes of code", code.len())
+            },
+        );
+        let recorded_admin = Deployments::from_json(&text).map(|d| d.roles.admin).ok();
+        admins.push(recorded_admin);
         println!("{} ({key}), from {}:", config.label, file.display());
         for check in &checks {
             println!(
@@ -1934,6 +2567,16 @@ pub async fn verify(
         if bad > 0 {
             failed.push(format!("{} ({bad} failed)", config.label));
         }
+    }
+    let same = admins.iter().all(|admin| *admin == Some(decided.admin));
+    println!(
+        "  {} {:<58} {}",
+        if same { "ok  " } else { "FAIL" },
+        "every chain's file records the one admin, ADMIN",
+        decided.admin
+    );
+    if !same {
+        failed.push("the admin differs between chains".to_string());
     }
     if !failed.is_empty() {
         bail!("the read-back failed on {}", failed.join(", "));
@@ -2483,7 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn an_image_step_is_the_registry_s_proposal_for_the_hardware_wallet() {
+    fn an_image_step_is_the_registry_s_proposal_listed_for_the_admin() {
         use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
         let registry = Address::repeat_byte(5);
         let digest = B256::repeat_byte(6);
@@ -2492,9 +3135,11 @@ mod tests {
         assert_eq!(step.kind, StepKind::ProposeImage);
         let call = IAttestationRegistry::proposeImageCall::abi_decode(&step.data).unwrap();
         assert_eq!(call.imageDigest, digest);
-        let admin = Address::repeat_byte(9);
-        let command = ledger_command(&step, admin, "https://mainnet.base.org");
-        assert!(command.starts_with(&format!("cast send --ledger --from {admin} --chain 8453")));
+        let listed = step_listing(&step);
+        assert!(
+            listed.starts_with(&format!("chain 8453, to {registry}, calldata 0x")),
+            "{listed}"
+        );
     }
 
     #[test]
@@ -2775,7 +3420,7 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_step_s_command_is_for_the_hardware_wallet_as_the_admin() {
+    fn an_admin_step_is_listed_as_its_chain_target_and_calldata_never_as_a_command() {
         let step = AdminStep {
             chain_id: 8453,
             to: Address::repeat_byte(1),
@@ -2784,13 +3429,353 @@ mod tests {
             purpose: String::new(),
             kind: StepKind::ProposeDriver,
         };
-        let command = ledger_command(&step, ADMIN, "https://mainnet.base.org");
-        assert!(
-            command.starts_with("cast send --ledger --from "),
-            "{command}"
+        let listed = step_listing(&step);
+        assert!(listed.starts_with("chain 8453, to 0x"), "{listed}");
+        assert!(listed.ends_with("calldata 0xabcd"), "{listed}");
+        assert!(!listed.contains("cast"), "{listed}");
+        assert!(!listed.contains("private-key"), "{listed}");
+    }
+
+    #[test]
+    fn a_vault_killed_already_is_done_and_one_that_can_t_be_killed_is_refused() {
+        use vault_state::*;
+        let vault = Address::repeat_byte(3);
+        assert!(judge_kill(vault, KILLED).unwrap());
+        for open in [OPEN, WINDING_DOWN, FROZEN] {
+            assert!(!judge_kill(vault, open).unwrap());
+        }
+        for refused in [0, ACTIVATING, CLOSED, CANCELLED, 9] {
+            let error = judge_kill(vault, refused).unwrap_err().to_string();
+            assert!(error.contains("Nothing was sent"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_emergency_steps_call_the_registry_and_the_vault_as_the_contracts_name_them() {
+        let registry = Address::repeat_byte(5);
+        let digest = B256::repeat_byte(6);
+        let revoke = revoke_step(8453, registry, digest);
+        assert_eq!(revoke.to, registry);
+        let call = IMainnetRootKey::revokeImageCall::abi_decode(&revoke.data).unwrap();
+        assert_eq!(call.imageDigest, digest);
+        let vault = Address::repeat_byte(7);
+        let kill = kill_step(4663, vault);
+        assert_eq!((kill.to, kill.chain_id), (vault, 4663));
+        assert_eq!(&kill.data[..], &IMainnetVault::killCall::SELECTOR[..]);
+        let clear = clear_root_step(8453, registry, Address::repeat_byte(8));
+        assert_eq!(
+            &clear.data[..],
+            &IMainnetRootKey::clearRootKeyCall::SELECTOR[..]
         );
-        assert!(command.contains("--chain 8453"), "{command}");
-        assert!(command.ends_with(" 0xabcd"), "{command}");
-        assert!(!command.contains("private-key"), "{command}");
+        assert_eq!(clear.to, registry);
+    }
+
+    #[test]
+    fn the_deployer_a_deployment_file_records_is_read_for_the_admin_key_s_check() {
+        let deployer = Address::repeat_byte(0x44);
+        let text = format!(r#"{{"mainnet":{{"deployer":"{deployer}"}}}}"#);
+        assert_eq!(recorded_deployer(&text), Some(deployer));
+        assert_eq!(recorded_deployer("{}"), None);
+    }
+
+    /// A deployment file on Base: its registry, station factory, vault
+    /// factory, dollar and station, and one driver in its mainnet record.
+    fn recorded_deployment() -> (Deployments, String) {
+        let zero = Address::ZERO;
+        let roles = serde_json::json!({
+            "admin": ADMIN, "platform": ADMIN, "attestor": zero, "builder": zero,
+            "reviewer": zero, "executor": zero, "keeper": zero, "operator": zero,
+            "author": zero, "viewer": zero,
+        });
+        let text = serde_json::json!({
+            "chain_key": "evm:8453", "chain_id": 8453, "rpc_url": "", "deployed_block": 77,
+            "usd": Address::repeat_byte(0xd0), "venue": zero, "attestation_verifier": zero,
+            "attestation": Address::repeat_byte(0xa1), "publishing": zero, "prices": zero,
+            "strategies": zero, "reviews": zero, "profiles": zero,
+            "factory": Address::repeat_byte(0xfa),
+            "station_factory": Address::repeat_byte(0xa2), "driver": zero, "bridge": zero,
+            "closer": zero, "roles": roles,
+            deploy::STATION_IMPLEMENTATION_KEY: Address::repeat_byte(0x57),
+            MAINNET_KEY: {
+                "risc_zero": zero, "vault_implementation": zero,
+                "drivers": {"uniswap": Address::repeat_byte(0xd1)},
+                "deployer": Address::repeat_byte(0x44), "build": B256::ZERO,
+            },
+        })
+        .to_string();
+        (Deployments::from_json(&text).unwrap(), text)
+    }
+
+    fn filed(deployments: &Deployments, steps: Vec<AdminStep>) -> AdminSteps {
+        AdminSteps {
+            chain_id: 8453,
+            admin: ADMIN,
+            registry: deployments.attestation,
+            from_block: 0,
+            steps,
+        }
+    }
+
+    #[test]
+    fn the_admin_s_deploy_steps_are_rebuilt_from_the_deployment_file_never_taken_from_the_steps_file()
+     {
+        let (deployments, text) = recorded_deployment();
+        let registry = deployments.attestation;
+        let ours = |kind| {
+            let init = initialise_step(
+                8453,
+                deployments.station_factory,
+                registry,
+                deployments.usd,
+                deployments.factory,
+                Address::repeat_byte(0x57),
+            );
+            let driver = driver_step(8453, registry, "uniswap", "x", Address::repeat_byte(0xd1));
+            if kind == StepKind::InitialiseStationFactory {
+                init
+            } else {
+                driver
+            }
+        };
+        let project = AdminStep {
+            chain_id: 8453,
+            to: registry,
+            data: IMainnetRegistry::proposeProjectCall {
+                projectId: project_hash("shonin-fi"),
+            }
+            .abi_encode()
+            .into(),
+            value: U256::ZERO,
+            purpose: "the project".into(),
+            kind: StepKind::ProposeProject,
+        };
+        let file = filed(
+            &deployments,
+            vec![
+                ours(StepKind::InitialiseStationFactory),
+                ours(StepKind::ProposeDriver),
+                project.clone(),
+            ],
+        );
+        let (rebuilt, _) =
+            deploy_steps_from(&deployments, &text, &file, Some("shonin-fi")).unwrap();
+        assert_eq!(
+            rebuilt.from_block, 77,
+            "the deployment's block, not the file's"
+        );
+        let kinds: Vec<StepKind> = rebuilt.steps.iter().map(|step| step.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                StepKind::InitialiseStationFactory,
+                StepKind::ProposeDriver,
+                StepKind::ProposeProject
+            ]
+        );
+        assert_eq!(
+            rebuilt.steps[0].data,
+            ours(StepKind::InitialiseStationFactory).data
+        );
+        assert_eq!(rebuilt.steps[1].data, ours(StepKind::ProposeDriver).data);
+        // A steps file with nothing in it still gets the deploy's steps.
+        let (empty, _) =
+            deploy_steps_from(&deployments, &text, &filed(&deployments, vec![]), None).unwrap();
+        assert_eq!(empty.steps.len(), 2);
+
+        // An edited step: the driver proposed is another contract.
+        let mut edited = ours(StepKind::ProposeDriver);
+        edited.data = IMainnetRegistry::proposeDriverCall {
+            name: deploy::market_id("uniswap"),
+            implementation: Address::repeat_byte(0xee),
+        }
+        .abi_encode()
+        .into();
+        let refusal = deploy_steps_from(
+            &deployments,
+            &text,
+            &filed(&deployments, vec![edited]),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("not what the deployment file records"),
+            "{refusal}"
+        );
+        // A kind the deploy never prepares, aimed at the registry.
+        let revoke = revoke_step(8453, registry, B256::repeat_byte(1));
+        let refusal = deploy_steps_from(
+            &deployments,
+            &text,
+            &filed(&deployments, vec![revoke]),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refusal.contains("never prepares"), "{refusal}");
+        // A file for another registry.
+        let mut other = filed(&deployments, vec![]);
+        other.registry = Address::repeat_byte(0xbb);
+        assert!(deploy_steps_from(&deployments, &text, &other, None).is_err());
+    }
+
+    #[test]
+    fn the_admin_proposes_only_the_project_the_operator_named_and_the_deploy_recorded() {
+        let (deployments, text) = recorded_deployment();
+        let registry = deployments.attestation;
+        let ours = project_step(8453, registry, "shonin-fi");
+        assert_eq!(ours.purpose, "propose the operator's project shonin-fi");
+        // The steps file's proposal: words naming the operator's project
+        // over calldata proposing another.
+        let mut theirs = project_step(8453, registry, "someone-else");
+        theirs.purpose = ours.purpose.clone();
+        let file = filed(&deployments, vec![theirs.clone()]);
+
+        // No project named: the file's proposal is never signed.
+        let (steps, notes) = deploy_steps_from(&deployments, &text, &file, None).unwrap();
+        assert!(
+            steps
+                .steps
+                .iter()
+                .all(|step| step.kind != StepKind::ProposeProject),
+            "{:?}",
+            steps.steps
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("PROJECT=")),
+            "{notes:?}"
+        );
+        // Named: built from the name, and a file proposing another refused.
+        let refusal = deploy_steps_from(&deployments, &text, &file, Some("shonin-fi"))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("not PROJECT=shonin-fi"), "{refusal}");
+        let (steps, _) = deploy_steps_from(
+            &deployments,
+            &text,
+            &filed(&deployments, vec![]),
+            Some("shonin-fi"),
+        )
+        .unwrap();
+        let proposed = steps.steps.last().unwrap();
+        assert_eq!(proposed.data, ours.data);
+        assert_eq!(proposed.purpose, ours.purpose);
+
+        // The deploy recorded a project: PROJECT must be it.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value[MAINNET_KEY]["project"] = serde_json::json!(project_hash("shonin-fi"));
+        let recorded = value.to_string();
+        let refusal = deploy_steps_from(
+            &deployments,
+            &recorded,
+            &filed(&deployments, vec![]),
+            Some("someone-else"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("not the project the deploy recorded"),
+            "{refusal}"
+        );
+        let (steps, _) = deploy_steps_from(
+            &deployments,
+            &recorded,
+            &filed(&deployments, vec![]),
+            Some(" shonin-fi "),
+        )
+        .unwrap();
+        assert_eq!(steps.steps.last().unwrap().data, ours.data);
+        // Recorded but not named: nothing proposed, and the run says how.
+        let (steps, notes) =
+            deploy_steps_from(&deployments, &recorded, &filed(&deployments, vec![]), None).unwrap();
+        assert!(
+            steps
+                .steps
+                .iter()
+                .all(|step| step.kind != StepKind::ProposeProject)
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("recorded")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_admin_signs_only_its_known_calls_on_this_deployment_s_contracts() {
+        let (deployments, _) = recorded_deployment();
+        let registry = deployments.attestation;
+        let mut targets = DeploymentTargets::of(&deployments);
+        let vault = Address::repeat_byte(0x7a);
+        let elsewhere = Address::repeat_byte(0xbb);
+        let digest = B256::repeat_byte(3);
+        let image = image_step(
+            8453,
+            registry,
+            digest,
+            crate::admin::kind_named("executor").unwrap(),
+            "executor",
+        );
+        let init = initialise_step(
+            8453,
+            deployments.station_factory,
+            registry,
+            deployments.usd,
+            deployments.factory,
+            Address::repeat_byte(0x57),
+        );
+        for step in [
+            init.clone(),
+            driver_step(8453, registry, "uniswap", "x", Address::repeat_byte(0xd1)),
+            image.clone(),
+            revoke_step(8453, registry, digest),
+            clear_root_step(8453, registry, Address::repeat_byte(8)),
+        ] {
+            check_step(&step, 8453, &targets).unwrap();
+            // The same call aimed anywhere else is never signed.
+            let mut moved = step.clone();
+            moved.to = elsewhere;
+            assert!(
+                check_step(&moved, 8453, &targets)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Nothing was sent")
+            );
+            // Nor for another chain, nor with value.
+            let mut other_chain = step.clone();
+            other_chain.chain_id = 4663;
+            assert!(check_step(&other_chain, 8453, &targets).is_err());
+            let mut paid = step.clone();
+            paid.value = U256::from(1);
+            assert!(check_step(&paid, 8453, &targets).is_err());
+        }
+        // The station factory's call aimed at the registry is refused.
+        let mut init_at_registry = init.clone();
+        init_at_registry.to = registry;
+        assert!(check_step(&init_at_registry, 8453, &targets).is_err());
+        // A kind whose calldata is another call, or has bytes after it.
+        let mut mislabelled = revoke_step(8453, registry, digest);
+        mislabelled.kind = StepKind::ProposeDriver;
+        assert!(
+            check_step(&mislabelled, 8453, &targets)
+                .unwrap_err()
+                .to_string()
+                .contains("proposeDriver")
+        );
+        let mut trailing = image;
+        let mut data = trailing.data.to_vec();
+        data.push(0);
+        trailing.data = data.into();
+        assert!(check_step(&trailing, 8453, &targets).is_err());
+        // A kill: only on a vault the factory was read to have made.
+        let kill = kill_step(8453, vault);
+        assert!(check_step(&kill, 8453, &targets).is_err());
+        targets.vaults.push(vault);
+        check_step(&kill, 8453, &targets).unwrap();
+        // A zero registry (a file that records none) is never called.
+        let mut blank = targets.clone();
+        blank.registry = Address::ZERO;
+        let mut at_zero = revoke_step(8453, Address::ZERO, digest);
+        at_zero.to = Address::ZERO;
+        assert!(check_step(&at_zero, 8453, &blank).is_err());
     }
 }
