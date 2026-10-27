@@ -95,12 +95,14 @@ market = 3       # about 1.2 held once (its seed's SOL side and tick arrays), an
 # On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on
 # HyperEVM, so the task buys HYPE on HyperCore's spot market and sends it to
 # HyperEVM itself, never paying more than `max_price` dollars a HYPE or buying
-# more than `max_per_run` HYPE in one run. The cap only guards testnet play
-# money against a broken book: it sits well above where testnet HYPE trades,
-# so a top-up isn't refused when the price moves. The deploying account (the admin)
-# is given `activation_usd` on HyperCore so it exists there, and switched to
-# big blocks, since some contracts are larger than a small block's 2M gas.
+# more than `max_per_run` HYPE in one run. The HYPE the funder buys for the
+# Hyperliquid vaults' station accounts is under the same `max_price`. The cap
+# only guards testnet play money against a broken book: it sits well above
+# where testnet HYPE trades, so a top-up isn't refused when the price moves.
+# The deploying account (the admin) is given `activation_usd` on HyperCore so
+# it exists there, and switched to big blocks, since some contracts are larger
+# than a small block's 2M gas.
 [hyperliquid]
-max_price = 150.0
+max_price = 250.0
 max_per_run = 3.0
 activation_usd = 2.0

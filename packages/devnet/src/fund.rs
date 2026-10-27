@@ -119,7 +119,20 @@ impl Funding {
                 }
             }
         }
+        let ceiling = funding.hyperliquid.max_price;
+        if !(ceiling.is_finite() && ceiling > 0.0) {
+            bail!(
+                "{}'s [hyperliquid] max_price is {ceiling}: a price a HYPE, above zero",
+                path.display()
+            );
+        }
         Ok(funding)
+    }
+
+    /// The most a HYPE is bought for on HyperCore's spot market, in dollars:
+    /// the `[hyperliquid]` section's `max_price`, which the file must give.
+    pub fn max_hype_price(&self) -> f64 {
+        self.hyperliquid.max_price
     }
 
     /// What a role on a chain is topped up to, if the chain is listed.

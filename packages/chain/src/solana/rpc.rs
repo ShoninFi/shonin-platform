@@ -421,6 +421,12 @@ impl Rpc {
             .await
     }
 
+    /// The newest slot the node has at `commitment`.
+    pub async fn slot_at(&self, commitment: &str) -> Result<u64> {
+        self.call("getSlot", json!([{"commitment": commitment}]))
+            .await
+    }
+
     pub async fn account(&self, address: &Pubkey) -> Result<Option<Account>> {
         self.account_at(address, COMMITMENT).await
     }
