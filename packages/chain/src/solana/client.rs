@@ -780,12 +780,10 @@ impl SolanaClient {
                 table.missing(&wanted),
             ),
             None => {
-                let recent = self.rpc.slot().await?;
-                let (create, address) = tables::create_lookup_table(*payer, *payer, recent);
                 let first: Vec<Pubkey> =
                     wanted.iter().take(tables::ADDED_AT_ONCE).copied().collect();
-                let extend = tables::extend_lookup_table(address, *payer, Some(*payer), first);
-                setup.push(self.set_up(vec![create, extend], builder).await?);
+                let (address, record) = self.create_table(payer, first, builder).await?;
+                setup.push(record);
                 (
                     address,
                     Vec::new(),
@@ -824,6 +822,38 @@ impl SolanaClient {
         replace(known, &table);
         tracing::info!(%payer, table = %address, addresses = table.addresses.len(), "a lookup table grown");
         Ok((Some(table), setup))
+    }
+
+    /// Make a new table for `payer` holding `first`, derived from a slot
+    /// read at [`tables::DERIVED_FROM`] of the node it is sent to, and say
+    /// where it is. A creation the program refuses for its slot is made
+    /// again from a slot read again, up to [`tables::CREATION_TRIES`] times.
+    async fn create_table(
+        &self,
+        payer: &Pubkey,
+        first: Vec<Pubkey>,
+        builder: &Keypair,
+    ) -> Result<(Pubkey, TransactionRecord)> {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let recent = self.rpc.slot_at(tables::DERIVED_FROM).await?;
+            let (create, address) = tables::create_lookup_table(*payer, *payer, recent);
+            let extend = tables::extend_lookup_table(address, *payer, Some(*payer), first.clone());
+            match self.set_up(vec![create, extend], builder).await {
+                Ok(record) => return Ok((address, record)),
+                Err(error)
+                    if tries < tables::CREATION_TRIES
+                        && error
+                            .downcast_ref::<TransactionFailed>()
+                            .is_some_and(|failed| tables::slot_refused(&failed.logs)) =>
+                {
+                    tracing::warn!(%payer, slot = recent, "a lookup table's slot was refused as not recent: read again");
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Send a lookup table's set-up, `payer` paying.

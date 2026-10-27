@@ -201,7 +201,7 @@ async fn evm(
         if need.is_zero() {
             println!("  dollars: holds {}, enough", units(held, decimals));
         } else {
-            let sent = hyperliquid_vaults::Funder::new(&client)?
+            let sent = hyperliquid_vaults::Funder::new(&client, funding)?
                 .send_dollars(&client, wallet, need)
                 .await?;
             if let Some(dollars) = sent.from_core {

@@ -1397,6 +1397,7 @@ async fn main() -> Result<()> {
             }
             match (api, agent) {
                 (Some(api), Some(agent)) => {
+                    let funding = fund::Funding::read(&args.funding)?;
                     hyperliquid_vaults::run(
                         &client,
                         &args.artifacts,
@@ -1406,6 +1407,7 @@ async fn main() -> Result<()> {
                         hyperliquid_vaults::RunOptions {
                             api: &api,
                             agent: &agent,
+                            funding: &funding,
                             deposit_dollars: deposit,
                             station_dollars,
                             trade_minutes,

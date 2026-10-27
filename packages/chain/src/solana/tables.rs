@@ -38,6 +38,17 @@
 //!   is the paying key, it isn't deactivated, and every address remembered
 //!   from before is still at the same index. One that fails any of these is
 //!   never used again. The message is compiled from what was just read.
+//! - **The slot a table is made from.** The lookup-table program takes
+//!   only a slot in the `SlotHashes` of the bank that runs the creation:
+//!   one of the 512 slots before it, never its own. A slot read at the
+//!   confirmed commitment may be that very bank's (the node's preflight
+//!   runs at it), and one read of a node ahead of another the send reaches
+//!   is in no bank there yet; either is refused as "not a recent slot". So
+//!   the slot is read at the finalized commitment, of the node the creation
+//!   is sent to: behind every bank that may run it, by some thirty slots,
+//!   and far inside the 512 for as long as the transaction's blockhash
+//!   lives. A creation still refused for its slot is made again from a
+//!   slot read again.
 //! - **Warm-up.** Addresses added to a table can be looked up only from the
 //!   slot after the one they were added in, so after creating or extending
 //!   a table the send waits for the cluster to pass that slot.
@@ -61,6 +72,20 @@ pub use solana_address_lookup_table_interface::instruction::{
     create_lookup_table, extend_lookup_table,
 };
 pub use solana_address_lookup_table_interface::program::ID as PROGRAM;
+
+/// The commitment the slot a new table is derived from is read at (see the
+/// module's notes).
+pub const DERIVED_FROM: &str = super::rpc::FINALIZED;
+/// How many times a table's creation is made, each from a slot read again,
+/// while the program refuses its slot as not recent.
+pub const CREATION_TRIES: usize = 3;
+
+/// Whether a refusal's logs are the lookup-table program refusing the slot
+/// a table was to be derived from.
+pub fn slot_refused(logs: &[String]) -> bool {
+    logs.iter()
+        .any(|line| line.contains("is not a recent slot"))
+}
 
 /// The most addresses one table holds.
 pub const MOST_ADDRESSES: usize = LOOKUP_TABLE_MAX_ADDRESSES;

@@ -58,6 +58,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use shared::Allowances;
 
+use crate::fund::Funding;
+
 /// HyperEVM's testnet: the only chain this deploys to.
 pub const CHAIN_ID: u64 = 998;
 /// Circle's USDC on HyperEVM testnet, and its deposit contract into
@@ -425,16 +427,19 @@ pub struct Funder {
     core: HyperCore,
     api: Api,
     signer: PrivateKeySigner,
+    /// The most it pays for a HYPE: the funding file's `max_price`.
+    hype_ceiling: f64,
 }
 
 impl Funder {
-    pub fn new(client: &Client) -> Result<Self> {
+    pub fn new(client: &Client, funding: &Funding) -> Result<Self> {
         let signer = crate::fund::funder()?;
         let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
         Ok(Self {
             core: HyperCore::new(api.clone(), signer.clone()),
             api,
             signer,
+            hype_ceiling: funding.max_hype_price(),
         })
     }
 
@@ -577,7 +582,7 @@ impl Funder {
 
     /// Make sure the funder holds `amount` HYPE on HyperCore's spot side,
     /// buying what it lacks (at least the venue's $10 minimum, at no more
-    /// than [`HYPE_CEILING`] a HYPE).
+    /// than the funding file's `max_price` a HYPE).
     async fn hype_on_hand(&self, token: &hyperliquid::SpotToken, amount: f64) -> Result<()> {
         let me = self.signer.address();
         let held = self.api.spot_balance(me, SPOT).await?;
@@ -589,12 +594,8 @@ impl Funder {
             .ok_or_else(|| anyhow!("{SPOT} has no pair against USDC"))?;
         let (_, ask) = self.api.best_bid_ask(&format!("@{pair}")).await?;
         let ask = ask.ok_or_else(|| anyhow!("nobody is selling {SPOT} on HyperCore"))?;
-        if ask > HYPE_CEILING {
-            bail!("{SPOT}'s best ask is ${ask}, over the ${HYPE_CEILING} this run pays");
-        }
+        let limit = hype_limit(ask, self.hype_ceiling)?;
         let size = round_up((amount - held).max(12.0 / ask), token.sz_decimals);
-        let limit = (ask * 1.03).min(HYPE_CEILING);
-        let limit = (limit * 100.0).ceil() / 100.0;
         let cost = size * limit * 1.01;
         let spot_usdc = self.api.spot_balance(me, "USDC").await?;
         if spot_usdc < cost {
@@ -618,8 +619,18 @@ impl Funder {
 /// each staged after a valuation.
 const CLAIM_MINUTES: u64 = 60;
 
-/// The most the funder pays for a HYPE when it buys some for a station.
-const HYPE_CEILING: f64 = 100.0;
+/// The limit price of a purchase of HYPE at `ask`: a little over the ask,
+/// to sweep a thin book, and never over `ceiling`; an ask already over the
+/// ceiling is refused.
+fn hype_limit(ask: f64, ceiling: f64) -> Result<f64> {
+    if ask > ceiling {
+        bail!(
+            "{SPOT}'s best ask is ${ask}, over the ${ceiling} the funding file allows (its [hyperliquid] max_price)"
+        );
+    }
+    let limit = (ask * 1.03).min(ceiling);
+    Ok((limit * 100.0).ceil() / 100.0)
+}
 /// The HYPE a station's account is given for its sends home: above the
 /// executor's own floor, so it doesn't start by buying.
 pub const STATION_HYPE: f64 = 0.06;
@@ -1049,6 +1060,8 @@ impl Progress {
 pub struct RunOptions<'a> {
     pub api: &'a str,
     pub agent: &'a Path,
+    /// The funding file: the most the funder pays for the station's HYPE.
+    pub funding: &'a Funding,
     /// The depositor's deposit, in dollars: at least the factory's minimum.
     pub deposit_dollars: Option<f64>,
     /// What the funder sends the station's HyperCore account.
@@ -1096,7 +1109,7 @@ pub async fn run(
     let mut progress = Progress::read(&progress_file, &agent_name)?;
     let author = client.account(Role::Author)?;
     let depositor = client.account(Role::Viewer)?;
-    let funder = Funder::new(client)?;
+    let funder = Funder::new(client, options.funding)?;
     let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
 
     // A generation in USDC charges its publishing fee in USDC too: the
@@ -1291,6 +1304,54 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn funding_with(hyperliquid: &str) -> Result<Funding> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("shonin-hype-ceiling-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("funding.toml");
+        std::fs::write(&file, format!("[hyperliquid]\n{hyperliquid}"))?;
+        let funding = Funding::read(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+        funding
+    }
+
+    #[test]
+    fn a_run_buys_hype_up_to_the_funding_file_s_max_price_and_refuses_an_ask_over_it() {
+        let funding =
+            funding_with("max_price = 250.0\nmax_per_run = 3.0\nactivation_usd = 2.0\n").unwrap();
+        let ceiling = funding.max_hype_price();
+        assert_eq!(ceiling, 250.0);
+        // An ask over a ceiling once compiled in, under the file's, is bought.
+        let limit = hype_limit(155.56, ceiling).unwrap();
+        assert!((155.56..=ceiling).contains(&limit));
+        // Near the ceiling the order is capped at it, never above.
+        assert_eq!(hype_limit(245.0, ceiling).unwrap(), 250.0);
+        // Over it, nothing is bought.
+        assert!(hype_limit(250.01, ceiling).is_err());
+    }
+
+    #[test]
+    fn a_funding_file_without_a_hype_ceiling_is_refused_rather_than_defaulted() {
+        assert!(funding_with("max_per_run = 3.0\nactivation_usd = 2.0\n").is_err());
+        assert!(
+            funding_with("max_price = 0.0\nmax_per_run = 3.0\nactivation_usd = 2.0\n").is_err()
+        );
+    }
+
+    #[test]
+    fn the_repository_s_funding_file_gives_the_runs_their_hype_ceiling() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/funding.toml");
+        let funding = Funding::read(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let written: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            Some(funding.max_hype_price()),
+            written["hyperliquid"]["max_price"].as_float()
+        );
+    }
 
     #[test]
     fn the_stack_s_file_reads_back_as_written() {
