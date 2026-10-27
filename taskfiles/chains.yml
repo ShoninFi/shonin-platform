@@ -202,7 +202,7 @@ tasks:
           SHONIN_WS_SOLANA_MAINNET_BETA="${SHONIN_WS_SOLANA_MAINNET_BETA:-{{.SOLANA_FORK_WS}}}"{{end}}
           SHONIN_MAINNET_IDS="{{if .ON_FORK}}{{.PATH_MAINNET_SOLANA}}/program-ids{{end}}"
           {{.DEVNET_MAINNET}} --vault-chain solana mainnet-solana-admin-steps
-          --admin {{shellQuote .SOLANA_ADMIN}}
+          --admin {{shellQuote (.SOLANA_ADMIN | default "")}}
           {{if .SOLANA_ADMIN_KEYFILE}}--admin-keyfile {{shellQuote .SOLANA_ADMIN_KEYFILE}}{{end}}
           {{if .SOLANA_CONFIRM}}--confirm-mainnet {{shellQuote .SOLANA_CONFIRM}}{{end}}
           {{if .ON_FORK}}--on-fork{{end}}
