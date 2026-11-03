@@ -68,10 +68,10 @@ fn every_page_and_file_the_worker_serves_is_written() {
         "_redirects",
         "robots.txt",
         "sitemap.xml",
-        "share/shonin.png",
     ] {
         assert!(files.contains_key(path), "{path} is not written");
     }
+    assert!(files.keys().any(|p| is_share_image(p)));
     assert!(
         files
             .keys()
@@ -247,6 +247,13 @@ fn pages_run_only_the_hashed_boot_script_and_carry_no_inline_styles() {
 }
 
 /// The `content` of the first `<meta>` whose `property` or `name` is `key`.
+/// `share/shonin.<fingerprint>.png`.
+fn is_share_image(path: &str) -> bool {
+    path.strip_prefix("share/shonin.")
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|hash| hash.len() == 10 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn meta<'a>(html: &'a str, key: &str) -> Option<&'a str> {
     ["property", "name"].iter().find_map(|attr| {
         let needle = format!("<meta {attr}=\"{key}\" content=\"");
@@ -258,12 +265,13 @@ fn meta<'a>(html: &'a str, key: &str) -> Option<&'a str> {
 #[test]
 fn every_page_previews_with_the_share_image_at_its_full_address() {
     let files = files();
-    let image = files["share/shonin.png"].as_slice();
+    let path = files.keys().find(|p| is_share_image(p)).unwrap();
+    let image = files[path].as_slice();
     assert_eq!(ui::images::dimensions(image), Some((1200, 630)));
     for (page, html) in pages(&files) {
         assert_eq!(
             meta(&html, "og:image"),
-            Some("https://shonin.fi/share/shonin.png"),
+            Some(format!("https://shonin.fi/{path}").as_str()),
             "{page}"
         );
         assert_eq!(meta(&html, "og:image:width"), Some("1200"), "{page}");
@@ -298,8 +306,8 @@ fn every_page_previews_with_the_share_image_at_its_full_address() {
     }
     let headers = String::from_utf8(files["_headers"].clone()).unwrap();
     assert!(
-        headers.contains("/share/*\n  Cache-Control: public, max-age=86400\n"),
-        "the share image is cached, briefly, at an address that never changes"
+        headers.contains("/share/*\n  Cache-Control: public, max-age=31536000, immutable\n"),
+        "the share image is fingerprinted, so it is cached for good"
     );
 }
 
