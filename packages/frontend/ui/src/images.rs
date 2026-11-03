@@ -23,7 +23,8 @@ pub struct Share {
     pub alt: &'static str,
 }
 
-/// shonin.fi's share image: the home hero's eyebrow, headline and the mark.
+/// shonin.fi's share image: the home hero as it stands, its eyebrow, headline
+/// and four points beside its art, one attested machine on the four chains.
 pub const SHARE_SITE: Share = Share {
     png: Png {
         name: "shonin.png",

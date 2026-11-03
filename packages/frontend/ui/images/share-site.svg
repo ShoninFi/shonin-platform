@@ -1,19 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-  <!-- shonin.fi's share image (Open Graph and X cards): the home hero on its
-       navy ground. Colours are the design tokens' values (tokens.json):
-       hero-ground #041030, mark-deep #021a5e, mark-mid #0152de,
-       mark-bright #0070fd, mark-sky #2bbcfe, hero-ink #ffffff,
-       hero-ink-muted #b8c4ea. Rasterised by render.sh. -->
+  <!-- shonin.fi's share image (Open Graph and X cards): the home hero as it
+       stands, on its navy ground. The left is the hero's copy (the eyebrow,
+       the headline and the four points); the right is its illustration, one
+       attested machine sending orders to the four chains, drawn from the
+       same marks the page uses (packages/frontend/marketing/assets/chains).
+       Colours are the design tokens' values (tokens.json): hero-ground
+       #041030, mark-deep #021a5e, mark-mid #0152de, mark-bright #0070fd,
+       mark-sky #2bbcfe, hero-ink #ffffff, hero-ink-muted #b8c4ea, hero-edge
+       rgba(184,196,234,.3). Rasterised by render.sh. -->
   <style>
     @font-face { font-family: "Plus Jakarta Sans"; font-weight: 200 800; src: url("../fonts/PlusJakartaSans-Variable.woff2") format("woff2"); }
     @font-face { font-family: "Hanken Grotesk"; font-weight: 100 900; src: url("../fonts/HankenGrotesk-Variable.woff2") format("woff2"); }
-    @font-face { font-family: "JetBrains Mono"; font-weight: 100 800; src: url("../fonts/JetBrainsMono-Variable.woff2") format("woff2"); }
-    .eyebrow { font: 650 17px "Hanken Grotesk"; letter-spacing: 0.24em; fill: #b8c4ea; }
-    .title { font: 800 74px "Plus Jakarta Sans"; letter-spacing: -0.035em; fill: #ffffff; }
-    .host { font: 450 20px "JetBrains Mono"; fill: #b8c4ea; }
+    .eyebrow { font: 650 16px "Hanken Grotesk"; letter-spacing: 0.24em; fill: #b8c4ea; }
+    .title { font: 800 66px "Plus Jakarta Sans"; letter-spacing: -0.035em; fill: #ffffff; }
+    .point { font: 650 23px "Hanken Grotesk"; letter-spacing: -0.005em; fill: #ffffff; }
+    .ic { fill: none; stroke: #2bbcfe; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .art-orbit { fill: none; stroke: #b8c4ea; stroke-opacity: 0.18; stroke-width: 1; stroke-dasharray: 2 8; }
+    .art-line { fill: none; stroke: #ffffff; stroke-opacity: 0.5; stroke-width: 2; stroke-linecap: round; }
+    .art-pulse { fill: none; stroke: #2bbcfe; stroke-width: 3; stroke-linecap: round; }
+    .art-white { fill: #ffffff; }
+    .art-check { fill: none; stroke: #0152de; stroke-width: 3.2; stroke-linecap: round; stroke-linejoin: round; }
+    .art-slot { fill: #041030; stroke: #b8c4ea; stroke-opacity: 0.3; stroke-width: 1.5; }
+    .art-name { fill: #ffffff; font: 700 20px "Hanken Grotesk"; text-anchor: middle; }
+    .art-sub { fill: #b8c4ea; font: 500 15px "Hanken Grotesk"; text-anchor: middle; }
+    .art-label { fill: #ffffff; font: 600 21px "Hanken Grotesk"; text-anchor: middle; }
   </style>
   <defs>
-    <radialGradient id="ground" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(900 300) scale(760 560)">
+    <radialGradient id="ground" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(940 300) scale(760 560)">
       <stop offset="0" stop-color="#0152de"/>
       <stop offset="0.46" stop-color="#021a5e"/>
       <stop offset="0.82" stop-color="#041030"/>
@@ -32,17 +45,58 @@
   <rect width="1200" height="630" fill="url(#ground)"/>
   <rect width="1200" height="630" fill="url(#hexgrid)"/>
 
-  <!-- The mark, on the hero art's glow and orbit. -->
-  <circle cx="935" cy="315" r="330" fill="url(#glow)"/>
-  <circle cx="935" cy="315" r="214" fill="none" stroke="#b8c4ea" stroke-opacity="0.18" stroke-width="1.5" stroke-dasharray="3 10"/>
-  <circle cx="1149" cy="315" r="5" fill="#2bbcfe"/>
-  <circle cx="783.7" cy="466.3" r="3.5" fill="#b8c4ea"/>
-  <image href="../logos/shonin-mark.svg" x="830.5" y="201.5" width="209" height="227"/>
+  <!-- The illustration: the hero's 560-square art, scaled to the card. -->
+  <circle cx="940" cy="315" r="330" fill="url(#glow)"/>
+  <g transform="translate(699 74) scale(0.86)">
+    <circle class="art-orbit" cx="280" cy="280" r="220"/>
+
+    <path class="art-line" d="M205 205 L150 150"/>
+    <path class="art-line" d="M355 205 L410 150"/>
+    <path class="art-line" d="M355 355 L410 410"/>
+    <path class="art-line" d="M205 355 L150 410"/>
+    <path class="art-pulse" d="M372 222 L393 243"/>
+
+    <g transform="translate(280 146)">
+      <path class="art-white" d="M-2.9 -22.3 Q0 -24 2.9 -22.3 L17.9 -13.7 Q20.8 -12 20.8 -8.6 L20.8 8.6 Q20.8 12 17.9 13.7 L2.9 22.3 Q0 24 -2.9 22.3 L-17.9 13.7 Q-20.8 12 -20.8 8.6 L-20.8 -8.6 Q-20.8 -12 -17.9 -13.7 Z"/>
+      <path class="art-check" d="M-8 0.5 l5 5 l11 -11"/>
+    </g>
+
+    <g transform="translate(124.4 124.4)"><circle class="art-slot" r="36"/><image href="../../marketing/assets/chains/hyperliquid.svg" x="-18.95" y="-14" width="37.9" height="28"/></g>
+    <g transform="translate(435.6 124.4)"><circle class="art-slot" r="36"/><image href="../../marketing/assets/chains/solana.svg" x="-17.2" y="-15" width="34.4" height="30"/></g>
+    <g transform="translate(435.6 435.6)"><circle class="art-slot" r="36"/><image href="../../marketing/assets/chains/base.svg" x="-13" y="-13" width="26" height="26"/></g>
+    <g transform="translate(124.4 435.6)"><circle class="art-slot" r="36"/><image href="../../marketing/assets/chains/robinhood-chain.svg" x="-12.95" y="-17" width="25.9" height="34"/></g>
+
+    <image href="../logos/shonin-mark.svg" x="186" y="178" width="188" height="204"/>
+
+    <text class="art-name" x="280" y="416">Attested machine</text>
+    <text class="art-sub" x="280" y="438">proves which build it runs</text>
+    <text class="art-label" x="124.4" y="70">Hyperliquid</text>
+    <text class="art-label" x="435.6" y="70">Solana</text>
+    <text class="art-label" x="435.6" y="504">Base</text>
+    <text class="art-label" x="124.4" y="504">Robinhood Chain</text>
+  </g>
 
   <!-- The words. -->
-  <image href="../logos/shonin-lockup-reversed.svg" x="80" y="68" width="136" height="44"/>
-  <text class="eyebrow" x="80" y="268">THE OPEN PLATFORM FOR AUTONOMOUS FINANCE</text>
-  <text class="title" x="76" y="362">Trading agents</text>
-  <text class="title" x="76" y="442">Verifiable by design</text>
-  <text class="host" x="80" y="558">shonin.fi</text>
+  <image href="../logos/shonin-lockup-reversed.svg" x="80" y="64" width="136" height="44"/>
+  <text class="eyebrow" x="80" y="206">THE OPEN PLATFORM FOR AUTONOMOUS FINANCE</text>
+  <text class="title" x="76" y="294">Trading agents</text>
+  <text class="title" x="76" y="366">Verifiable by design</text>
+
+  <!-- The four points, with the page's own icons (24-unit strokes). -->
+  <g transform="translate(80 406) scale(1)">
+    <g class="ic" transform="translate(0 -13)"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><rect x="9.75" y="9.75" width="4.5" height="4.5" rx="1"/><path d="M9.5 3.5v3M14.5 3.5v3M9.5 17.5v3M14.5 17.5v3M3.5 9.5h3M3.5 14.5h3M17.5 9.5h3M17.5 14.5h3"/></g>
+    <text class="point" x="38" y="7">Attested execution</text>
+  </g>
+  <g transform="translate(80 450)">
+    <g class="ic" transform="translate(0 -13)"><path d="M6.5 3.5h7l4 4v4"/><path d="M13.5 3.5v4h4"/><path d="M6.5 3.5a1.5 1.5 0 0 0-1.5 1.5v14a1.5 1.5 0 0 0 1.5 1.5H10"/><circle cx="15.5" cy="15.5" r="3.5"/><path d="M18 18l2.5 2.5"/></g>
+    <text class="point" x="38" y="7">AI reviews (even for sealed code)</text>
+  </g>
+  <g transform="translate(80 494)">
+    <g class="ic" transform="translate(0 -13)"><path d="M8.5 7.5L4 12l4.5 4.5"/><path d="M15.5 7.5L20 12l-4.5 4.5"/><path d="M13.2 5.5l-2.4 13"/></g>
+    <text class="point" x="38" y="7">Powerful off-chain applications</text>
+  </g>
+  <g transform="translate(80 538)">
+    <g class="ic" transform="translate(0 -13)"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><circle cx="12" cy="12" r="3.5"/><path d="M12 8.5V7M12 17v-1.5M8.5 12H7M17 12h-1.5"/><path d="M6.5 19.5v1.5M17.5 19.5v1.5"/></g>
+    <text class="point" x="38" y="7">Enforced safeguards for your capital</text>
+  </g>
 </svg>

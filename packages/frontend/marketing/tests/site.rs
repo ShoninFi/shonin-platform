@@ -283,6 +283,18 @@ fn every_page_previews_with_the_share_image_at_its_full_address() {
             meta(&html, "og:image"),
             "{page}"
         );
+        // X reads its own tags before the Open Graph ones; name both, the
+        // same, so a card never depends on the fallback.
+        assert_eq!(
+            meta(&html, "twitter:title"),
+            meta(&html, "og:title"),
+            "{page}"
+        );
+        assert_eq!(
+            meta(&html, "twitter:description"),
+            meta(&html, "og:description"),
+            "{page}"
+        );
     }
     let headers = String::from_utf8(files["_headers"].clone()).unwrap();
     assert!(
