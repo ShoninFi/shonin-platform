@@ -51,10 +51,11 @@ render() {
 }
 
 mkdir -p "$here/share" "$here/icons"
-# The share images to 256 colours (their gradients stay smooth, at a third
-# of the size); the icons losslessly.
-render share-site.svg share/shonin.png 1200 630 --palette
-render share-app.svg share/shonin-app.png 1200 630 --palette
+# The share images as plain RGB, the form every link-preview fetcher reads
+# (X showed the palette form's card without its image); the icons
+# losslessly, with a palette where that loses nothing.
+render share-site.svg share/shonin.png 1200 630
+render share-app.svg share/shonin-app.png 1200 630
 render icon-32.svg icons/shonin-32.png 32 32
 render icon.svg icons/shonin-180.png 180 180
 render icon.svg icons/shonin-512.png 512 512
