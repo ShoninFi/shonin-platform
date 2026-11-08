@@ -251,7 +251,8 @@ fn the_policy_allows_only_this_origin_and_cloudflare_web_analytics() {
         csp,
         "default-src 'none'; script-src 'self' https://static.cloudflareinsights.com; \
          style-src 'self'; img-src 'self'; font-src 'self'; \
-         connect-src https://cloudflareinsights.com/cdn-cgi/rum; manifest-src 'self'; \
+         connect-src https://app.shonin.fi/cdn-cgi/rum https://cloudflareinsights.com/cdn-cgi/rum; \
+         manifest-src 'self'; \
          base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
     );
     for header in [

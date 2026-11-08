@@ -243,7 +243,11 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
     });
     files.push(File {
         path: "_headers".into(),
-        bytes: headers(&format!("'self' {} {ANALYTICS_SCRIPT}", boot_hash())).into_bytes(),
+        bytes: headers(
+            &format!("'self' {} {ANALYTICS_SCRIPT}", boot_hash()),
+            ANALYTICS_REPORT,
+        )
+        .into_bytes(),
     });
     files.push(File {
         path: "_redirects".into(),
@@ -312,7 +316,11 @@ pub fn shutdown(links: &Links) -> Result<Vec<File>> {
     });
     files.push(File {
         path: "_headers".into(),
-        bytes: headers(&format!("'self' {ANALYTICS_SCRIPT}")).into_bytes(),
+        bytes: headers(
+            &format!("'self' {ANALYTICS_SCRIPT}"),
+            &format!("{}{ANALYTICS_REPORT_PATH} {ANALYTICS_REPORT}", links.app),
+        )
+        .into_bytes(),
     });
     files.push(File {
         path: share_image_path().trim_start_matches('/').into(),
@@ -449,20 +457,23 @@ fn base64(bytes: &[u8]) -> String {
 pub const ANALYTICS_SCRIPT: &str = "https://static.cloudflareinsights.com";
 /// Where the beacon reports, and the only place a page may send anything.
 pub const ANALYTICS_REPORT: &str = "https://cloudflareinsights.com/cdn-cgi/rum";
+/// The same endpoint on the page's own origin, where the beacon reports on a
+/// site Cloudflare serves (the zone answers it at the edge).
+pub const ANALYTICS_REPORT_PATH: &str = "/cdn-cgi/rum";
 
 /// Workers static assets read these from the output root. The policy allows
 /// only this origin, plus the scripts `script_src` names (the hashed boot
 /// script, on the marketing site) and Cloudflare Web Analytics (its script's
-/// host, and its one reporting endpoint): no inline styles, no other hosts,
-/// no frames, no forms.
-fn headers(script_src: &str) -> String {
+/// host, and the reporting endpoints `connect_src` names): no inline styles,
+/// no other hosts, no frames, no forms.
+fn headers(script_src: &str, connect_src: &str) -> String {
     let csp = [
         "default-src 'none'".to_string(),
         format!("script-src {script_src}"),
         "style-src 'self'".into(),
         "img-src 'self'".into(),
         "font-src 'self'".into(),
-        format!("connect-src {ANALYTICS_REPORT}"),
+        format!("connect-src {connect_src}"),
         "manifest-src 'self'".into(),
         "base-uri 'none'".into(),
         "form-action 'none'".into(),
