@@ -1,5 +1,7 @@
 # Shonin Platform
 
+**Status (8 November 2026): Shonin is shut down.** Its services and test networks are retired, app.shonin.fi shows a notice, and the code stays here for whoever carries it forward. Interested? Write to [contact@shonin.fi](mailto:contact@shonin.fi). The documentation stays up at [docs.shonin.fi](https://docs.shonin.fi).
+
 Shonin is an open platform for verifiable trading strategies with pooled capital. Authors publish strategies as WASM components, depositors pool capital in vaults, and attested executors run the strategies, able to move funds only between a vault's own accounts.
 
 This repository is the platform: the contracts, the frontends, the attested machines and the services around them, and the tooling that runs them. Everything off-chain is Rust, in one Cargo workspace; the EVM contracts are Solidity, built with Foundry, and the Solana programs are built with Anchor.
@@ -162,7 +164,7 @@ task docs:deploy   # build and deploy it to Cloudflare
 
 | Worker | Where | Task |
 | --- | --- | --- |
-| `shonin-app` | app.shonin.fi: the app | `task frontend:app:deploy` |
+| `shonin-app` | app.shonin.fi: the shutdown notice (the full app, which needs the testnet API: `task frontend:app:deploy:full`) | `task frontend:app:deploy` |
 | `shonin-landing` | shonin.fi: the marketing site, static pages with no data, API or wallet code | `task frontend:landing:deploy` |
 | `shonin-docs` | docs.shonin.fi | `task docs:deploy` |
 

@@ -32,7 +32,7 @@ dev = []
 dev-wallet = []
 # The Solana programs' ids for the testnet (devnet) deployment. Without it a
 # build names the local deploy keypairs' ids, as the local services do.
-# `task frontend:app:build` (and `app:dev` against the testnet API) turn it on.
+# `task frontend:app:build:full` (and `app:dev` against the testnet API) turn it on.
 devnet = ["chain/devnet"]
 
 [dependencies]

@@ -8,6 +8,8 @@
 //! runs at all.
 //!
 //! [`site`] renders every file the site serves; [`write`] puts them on disk.
+//! [`shutdown`] renders the notice app.shonin.fi serves now that the app is
+//! shut down: the same head, tokens, faces and styles, and no script at all.
 
 pub mod html;
 mod icons;
@@ -33,6 +35,8 @@ pub struct File {
 const CSS: &str = include_str!("../assets/site.css");
 /// The motion and the interactive controls.
 const JS: &str = include_str!("../assets/site.js");
+/// The shutdown notice's own styles, after the marketing ones.
+const SHUTDOWN_CSS: &str = include_str!("../assets/shutdown.css");
 
 /// Runs before first paint: motion is on only when the reader hasn't asked
 /// for less of it and the browser can observe what is on screen. If the main
@@ -175,8 +179,8 @@ pub fn share_image_path() -> String {
     )
 }
 
-/// Every file the site serves.
-pub fn site(links: &Links) -> Result<Vec<File>> {
+/// The fingerprinted assets, as files, and each one's address by its key.
+fn fingerprinted() -> (Vec<File>, BTreeMap<&'static str, String>) {
     let mut files = Vec::new();
     let mut assets: BTreeMap<&'static str, String> = BTreeMap::new();
     for asset in ASSETS {
@@ -193,9 +197,20 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
             bytes: asset.bytes.to_vec(),
         });
     }
+    (files, assets)
+}
+
+/// Every file the site serves.
+pub fn site(links: &Links) -> Result<Vec<File>> {
+    let (mut files, assets) = fingerprinted();
 
     let pages = pages::all();
-    let css = stylesheet(&assets, &pages)?;
+    let sources: Vec<&str> = pages
+        .iter()
+        .map(|(_, page)| page.main)
+        .chain([html::MENU])
+        .collect();
+    let css = stylesheet(&assets, &sources, "")?;
     let css_path = format!("assets/site.{}.css", fingerprint(css.as_bytes()));
     let js_path = format!("assets/site.{}.js", fingerprint(JS.as_bytes()));
     let theme = token_value("hero-ground")?;
@@ -204,10 +219,11 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
         links,
         assets: &assets,
         stylesheet: &format!("/{css_path}"),
-        script: &format!("/{js_path}"),
-        boot: BOOT,
+        script: Some(&format!("/{js_path}")),
+        boot: Some(BOOT),
         theme_color: &theme,
         share_image: &share_image_path(),
+        home: &links.site,
     };
     for (file, page) in &pages {
         files.push(File {
@@ -227,7 +243,7 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
     });
     files.push(File {
         path: "_headers".into(),
-        bytes: headers().into_bytes(),
+        bytes: headers(&format!("'self' {} {ANALYTICS_SCRIPT}", boot_hash())).into_bytes(),
     });
     files.push(File {
         path: "_redirects".into(),
@@ -244,6 +260,67 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
     files.push(File {
         path: "robots.txt".into(),
         bytes: robots(links).into_bytes(),
+    });
+    Ok(files)
+}
+
+/// Every file the shutdown notice serves, at app.shonin.fi: the notice as
+/// `index.html` and again as `404.html`, the assets, the share image,
+/// `_headers` and a `robots.txt` that keeps it all out of search. No script,
+/// no `_redirects` and no sitemap: the Worker answers every address that
+/// isn't a file with `index.html` (`not_found_handling:
+/// "single-page-application"`), so an old deep link lands on the notice.
+///
+/// `links.app` is where the notice itself is served (the share image's
+/// origin), `links.site` is shonin.fi, and `links.docs` the docs.
+pub fn shutdown(links: &Links) -> Result<Vec<File>> {
+    let (mut files, assets) = fingerprinted();
+
+    let page = pages::shutdown::page();
+    let css = stylesheet(&assets, &[page.main], SHUTDOWN_CSS)?;
+    let css_path = format!("assets/shutdown.{}.css", fingerprint(css.as_bytes()));
+    let theme = token_value("hero-ground")?;
+    let own = Links {
+        app: links.app.clone(),
+        docs: links.docs.clone(),
+        site: links.app.clone(),
+    };
+    let cx = html::Cx {
+        links: &own,
+        assets: &assets,
+        stylesheet: &format!("/{css_path}"),
+        script: None,
+        boot: None,
+        theme_color: &theme,
+        share_image: &share_image_path(),
+        home: &links.site,
+    };
+    let notice = html::notice(&page, &cx)
+        .context("rendering the shutdown notice")?
+        .into_bytes();
+    files.push(File {
+        path: "index.html".into(),
+        bytes: notice.clone(),
+    });
+    files.push(File {
+        path: "404.html".into(),
+        bytes: notice,
+    });
+    files.push(File {
+        path: css_path,
+        bytes: css.into_bytes(),
+    });
+    files.push(File {
+        path: "_headers".into(),
+        bytes: headers(&format!("'self' {ANALYTICS_SCRIPT}")).into_bytes(),
+    });
+    files.push(File {
+        path: share_image_path().trim_start_matches('/').into(),
+        bytes: ui::images::SHARE_SITE.png.bytes.to_vec(),
+    });
+    files.push(File {
+        path: "robots.txt".into(),
+        bytes: b"User-agent: *\nDisallow: /\n".to_vec(),
     });
     Ok(files)
 }
@@ -278,12 +355,14 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The tokens, the self-hosted faces, the marketing styles, and one
-/// `animation-delay` rule for every `dl-<ms>` class the pages use (classes,
-/// not inline styles, so the CSP needs no `'unsafe-inline'`).
+/// The tokens, the self-hosted faces, the marketing styles (then `extra`,
+/// any styles of the build's own), and one `animation-delay` rule for every
+/// `dl-<ms>` class the `sources` use (classes, not inline styles, so the CSP
+/// needs no `'unsafe-inline'`).
 fn stylesheet(
     assets: &BTreeMap<&'static str, String>,
-    pages: &[(&str, html::Page)],
+    sources: &[&str],
+    extra: &str,
 ) -> Result<String> {
     let mut css = tokens::css()?;
     let faces = [
@@ -302,10 +381,10 @@ fn stylesheet(
         );
     }
     css.push_str(CSS);
+    css.push_str(extra);
 
     let mut delays = BTreeSet::new();
-    let sources = pages.iter().map(|(_, page)| page.main).chain([html::MENU]);
-    for source in sources {
+    for &source in sources {
         for (at, _) in source.match_indices("dl-") {
             let digits: String = source[at + 3..]
                 .chars()
@@ -372,13 +451,14 @@ pub const ANALYTICS_SCRIPT: &str = "https://static.cloudflareinsights.com";
 pub const ANALYTICS_REPORT: &str = "https://cloudflareinsights.com/cdn-cgi/rum";
 
 /// Workers static assets read these from the output root. The policy allows
-/// only this origin, plus the hashed boot script and Cloudflare Web
-/// Analytics (its script's host, and its one reporting endpoint): no inline
-/// styles, no other hosts, no frames, no forms.
-fn headers() -> String {
+/// only this origin, plus the scripts `script_src` names (the hashed boot
+/// script, on the marketing site) and Cloudflare Web Analytics (its script's
+/// host, and its one reporting endpoint): no inline styles, no other hosts,
+/// no frames, no forms.
+fn headers(script_src: &str) -> String {
     let csp = [
         "default-src 'none'".to_string(),
-        format!("script-src 'self' {} {ANALYTICS_SCRIPT}", boot_hash()),
+        format!("script-src {script_src}"),
         "style-src 'self'".into(),
         "img-src 'self'".into(),
         "font-src 'self'".into(),

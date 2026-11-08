@@ -6,6 +6,8 @@
 //! a handful of placeholders the build fills in:
 //!
 //! - `{{app}}` and `{{docs}}`: the app's and the docs' origins.
+//! - `{{home}}`: shonin.fi's own origin, for the shutdown notice, which is
+//!   served at another one.
 //! - `{{i:name:size}}` (or `{{i:name:size:stroke}}`): an icon.
 //! - `{{asset:name}}`: the fingerprinted address of a logo or font.
 //! - `{{social}}`: the footer's social links, each with its brand mark.
@@ -37,12 +39,16 @@ pub struct Cx<'a> {
     /// Asset name (`mark`, `lockup-reversed`, `font-sans`...) to its address.
     pub assets: &'a BTreeMap<&'static str, String>,
     pub stylesheet: &'a str,
-    pub script: &'a str,
-    /// The inline script that runs before first paint, and its CSP hash.
-    pub boot: &'a str,
+    /// The site script, if the page has one (the shutdown notice has none).
+    pub script: Option<&'a str>,
+    /// The inline script that runs before first paint, its hash in the CSP.
+    pub boot: Option<&'a str>,
     pub theme_color: &'a str,
     /// The share image's path on this site, such as `/share/shonin.png`.
     pub share_image: &'a str,
+    /// Shonin's home, the organisation's address in the structured data:
+    /// this site itself, except for the notice at the app's old origin.
+    pub home: &'a str,
 }
 
 /// Which page is current, for `aria-current` in the header.
@@ -111,6 +117,9 @@ fn placeholder(name: &str, cx: &Cx) -> Result<String> {
     if name == "docs" {
         return Ok(esc(&cx.links.docs));
     }
+    if name == "home" {
+        return Ok(esc(cx.home));
+    }
     if name == "social" {
         return Ok(ui::social::Social::row_html(20));
     }
@@ -138,6 +147,59 @@ fn placeholder(name: &str, cx: &Cx) -> Result<String> {
 
 /// The whole document.
 pub fn document(page: &Page, cx: &Cx) -> Result<String> {
+    let footer = match page.footer {
+        Footer::Full => FOOTER,
+        Footer::Compact => FOOTER_COMPACT,
+    };
+    let body = format!(
+        r##"<body class="{class}">
+<a class="skip" href="#content">Skip to content</a>
+<div class="page" id="page">
+{header}
+<main id="content" tabindex="-1">
+{main}
+</main>
+{footer}
+</div>
+{menu}
+</body>
+</html>
+"##,
+        class = esc(page.class),
+        header = header(page.current),
+        main = page.main,
+        menu = MENU,
+    );
+    expand(&(head(page, cx) + &body), cx)
+}
+
+/// The shutdown notice: the same head, then its own small header and its
+/// footer, with no menu and no script. `page.current` and `page.footer` are
+/// the marketing chrome's and play no part here.
+pub fn notice(page: &Page, cx: &Cx) -> Result<String> {
+    let body = format!(
+        r##"<body class="{class}">
+<a class="skip" href="#content">Skip to content</a>
+<div class="page" id="page">
+{header}
+<main id="content" tabindex="-1">
+{main}
+</main>
+{footer}
+</div>
+</body>
+</html>
+"##,
+        class = esc(page.class),
+        header = NOTICE_HEADER,
+        main = page.main,
+        footer = NOTICE_FOOTER,
+    );
+    expand(&(head(page, cx) + &body), cx)
+}
+
+/// The document head, up to `</head>`, with its placeholders unfilled.
+fn head(page: &Page, cx: &Cx) -> String {
     let share = &ui::images::SHARE_SITE;
     // A page that is listed names its one address; the 404 is served at any
     // address, so it names none and asks not to be listed.
@@ -149,7 +211,7 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
     } else {
         "<meta name=\"robots\" content=\"noindex\">\n".to_string()
     };
-    let head = format!(
+    format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
@@ -179,9 +241,7 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
 <link rel="preload" href="{{{{asset:font-sans}}}}" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="{{{{asset:font-display}}}}" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="{stylesheet}">
-<script>{boot}</script>
-<script src="{script}" defer></script>
-</head>
+{scripts}</head>
 "#,
         title = esc(page.title),
         description = esc(page.description),
@@ -190,35 +250,25 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
         width = share.png.width,
         height = share.png.height,
         alt = esc(share.alt),
-        social = ui::social::head_html(&cx.links.site),
+        social = ui::social::head_html(cx.home),
         stylesheet = esc(cx.stylesheet),
-        boot = cx.boot,
-        script = esc(cx.script),
-    );
-    let footer = match page.footer {
-        Footer::Full => FOOTER,
-        Footer::Compact => FOOTER_COMPACT,
-    };
-    let body = format!(
-        r##"<body class="{class}">
-<a class="skip" href="#content">Skip to content</a>
-<div class="page" id="page">
-{header}
-<main id="content" tabindex="-1">
-{main}
-</main>
-{footer}
-</div>
-{menu}
-</body>
-</html>
-"##,
-        class = esc(page.class),
-        header = header(page.current),
-        main = page.main,
-        menu = MENU,
-    );
-    expand(&(head + &body), cx)
+        scripts = scripts(cx),
+    )
+}
+
+/// The boot script inline, then the site script, each only if there is one.
+fn scripts(cx: &Cx) -> String {
+    let mut out = String::new();
+    if let Some(boot) = cx.boot {
+        out.push_str(&format!("<script>{boot}</script>\n"));
+    }
+    if let Some(script) = cx.script {
+        out.push_str(&format!(
+            "<script src=\"{}\" defer></script>\n",
+            esc(script)
+        ));
+    }
+    out
 }
 
 /// The marketing header: transparent over the hero, and it scrolls away with
@@ -347,6 +397,71 @@ const FOOTER_COMPACT: &str = r#"<footer class="site-footer site-footer--compact 
         </ul>
       </div>
       <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed.</p>
+    </div>
+  </div>
+</footer>"#;
+
+/// The shutdown notice's header: the lockup, home to shonin.fi, and the two
+/// places that stay up. Short enough for a phone, so it needs no menu.
+const NOTICE_HEADER: &str = r#"<header class="site-header sh-hero">
+  <div class="wrap site-header__bar">
+    <a class="site-header__home" href="{{home}}/" aria-label="Shonin home"><img src="{{asset:lockup-reversed}}" alt="Shonin" width="93" height="30"></a>
+    <nav class="notice-nav" aria-label="Main">
+      <a class="sh-nav sh-nav--ext" href="{{docs}}/">Docs{{i:external:16}}</a>
+      <a class="sh-nav sh-nav--ext" href="https://github.com/ShoninFi">GitHub{{i:external:16}}</a>
+    </nav>
+  </div>
+</header>"#;
+
+/// The shutdown notice's footer: the marketing footer's band, its columns
+/// pointing only at what stays up.
+const NOTICE_FOOTER: &str = r#"<footer class="site-footer sh-hero">
+  <div class="wrap">
+    <div class="site-footer__cols">
+      <div class="site-footer__brand">
+        <img src="{{asset:tagline-reversed}}" alt="Shonin, verifiable autonomous finance" width="173" height="56">
+        <p>Attested agents. Explicit constraints.</p>
+      </div>
+      <nav class="site-footer__col" aria-label="Learn">
+        <p class="sh-label">Learn</p>
+        <ul>
+          <li><a href="{{docs}}/basics/trading-agents/">How Shonin works</a></li>
+          <li><a href="{{docs}}/under-the-hood/attestation/">Under the hood</a></li>
+          <li><a href="{{docs}}/verify/">Verification</a></li>
+          <li><a href="{{docs}}/writing/getting-started/">Writing an agent</a></li>
+          <li><a href="{{docs}}/reference/glossary/">Glossary</a></li>
+        </ul>
+      </nav>
+      <nav class="site-footer__col" aria-label="Source code">
+        <p class="sh-label">Source code</p>
+        <ul>
+          <li><a href="https://github.com/ShoninFi/shonin-platform">The platform</a></li>
+          <li><a href="https://github.com/ShoninFi/shonin-agents">The reference agents</a></li>
+          <li><a href="https://github.com/ShoninFi/shonin-agent-template">The agent template</a></li>
+        </ul>
+      </nav>
+      <nav class="site-footer__col" aria-label="Shonin">
+        <p class="sh-label">Shonin</p>
+        <ul>
+          <li><a href="{{home}}/">shonin.fi</a></li>
+          <li><a href="{{docs}}/">Docs</a></li>
+          <li><a href="https://github.com/ShoninFi">GitHub</a></li>
+          <li><a href="mailto:contact@shonin.fi">contact@shonin.fi</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="site-footer__end">
+      <div class="site-footer__row">
+        <nav class="site-footer__legal" aria-label="Legal">
+          <span>© 2026 Shonin</span>
+          <a href="{{home}}/terms">Terms of Use</a>
+          <a href="{{home}}/privacy">Privacy Policy</a>
+        </nav>
+        <ul class="site-footer__social" aria-label="Shonin elsewhere">
+          {{social}}
+        </ul>
+      </div>
+      <p class="site-footer__risk">Shonin never launched on mainnet: no deposits are held, and there is nothing to withdraw. The docs describe the platform as designed.</p>
     </div>
   </div>
 </footer>"#;

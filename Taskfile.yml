@@ -81,12 +81,12 @@ tasks:
       - services:keeper
 
   build:
-    desc: "Release builds of the frontends: tokens, the app, the marketing site"
+    desc: "Release builds of the frontends: tokens, the shutdown notice app.shonin.fi serves, the marketing site"
     cmds:
       - task: frontend:build
 
   deploy:
-    desc: "Build and deploy both sites to Cloudflare: the app at app.shonin.fi and the marketing site at shonin.fi"
+    desc: "Build and deploy both sites to Cloudflare: the shutdown notice at app.shonin.fi and the marketing site at shonin.fi"
     cmds:
       - task: frontend:deploy
 

@@ -1,8 +1,13 @@
-//! Builds the marketing site, or builds it and serves it locally.
+//! Builds the marketing site, or builds it and serves it locally; or builds
+//! the shutdown notice app.shonin.fi serves.
 //!
 //! `build` writes the site; `serve` builds it and serves it the way Workers
 //! static assets do: `/x` from `x.html`, `/` from `index.html`, and anything
 //! else that isn't a file from `404.html` with a 404 status.
+//!
+//! `shutdown` writes the notice; with `--port` it serves it too, as its
+//! Worker does (`not_found_handling: "single-page-application"`): anything
+//! that isn't a file is `index.html`, with a 200 status.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,6 +42,25 @@ struct Site {
     site_url: String,
 }
 
+#[derive(clap::Args, Clone)]
+struct Notice {
+    /// Where to write the notice.
+    #[arg(long)]
+    out: PathBuf,
+    /// Where the notice is served (the app's old origin).
+    #[arg(long, default_value = "https://app.shonin.fi")]
+    app_url: String,
+    /// Where the documentation is.
+    #[arg(long, default_value = "https://docs.shonin.fi")]
+    docs_url: String,
+    /// Where the marketing site is.
+    #[arg(long, default_value = "https://shonin.fi")]
+    site_url: String,
+    /// Serve the notice on this port once it is written.
+    #[arg(long)]
+    port: Option<u16>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Write the site.
@@ -48,6 +72,17 @@ enum Command {
         #[arg(long, default_value_t = 19_082)]
         port: u16,
     },
+    /// Write the shutdown notice app.shonin.fi serves (and serve it, with --port).
+    Shutdown(Notice),
+}
+
+/// What the server answers for a path that isn't a file.
+#[derive(Clone, Copy)]
+enum Missing {
+    /// `404.html`, with a 404 status: the marketing site.
+    NotFound,
+    /// `index.html`, with a 200 status: the shutdown notice.
+    Index,
 }
 
 #[tokio::main]
@@ -63,13 +98,23 @@ async fn main() -> Result<()> {
         Command::Build(site) => build(&site),
         Command::Serve { site, port } => {
             build(&site)?;
-            serve(site.out, port).await
+            serve(site.out, port, Missing::NotFound).await
+        }
+        Command::Shutdown(notice) => {
+            shutdown(&notice)?;
+            match notice.port {
+                Some(port) => serve(notice.out, port, Missing::Index).await,
+                None => Ok(()),
+            }
         }
     }
 }
 
+fn trim(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 fn build(site: &Site) -> Result<()> {
-    let trim = |url: &str| url.trim_end_matches('/').to_string();
     let links = Links {
         app: trim(&site.app_url),
         docs: trim(&site.docs_url),
@@ -81,25 +126,37 @@ fn build(site: &Site) -> Result<()> {
     Ok(())
 }
 
-async fn serve(dir: PathBuf, port: u16) -> Result<()> {
-    let app = axum::Router::new().fallback(file).with_state(dir);
+fn shutdown(notice: &Notice) -> Result<()> {
+    let links = Links {
+        app: trim(&notice.app_url),
+        docs: trim(&notice.docs_url),
+        site: trim(&notice.site_url),
+    };
+    let files = marketing::shutdown(&links)?;
+    marketing::write(&files, &notice.out)?;
+    tracing::info!(out = %notice.out.display(), files = files.len(), "the shutdown notice is written");
+    Ok(())
+}
+
+async fn serve(dir: PathBuf, port: u16, missing: Missing) -> Result<()> {
+    let app = axum::Router::new()
+        .fallback(file)
+        .with_state((dir.clone(), missing));
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("listening on {address}"))?;
-    tracing::info!("the marketing site is at http://localhost:{port}/");
+    tracing::info!("serving {} at http://localhost:{port}/", dir.display());
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 /// One request, answered from the built site as the Worker would.
-async fn file(State(dir): State<PathBuf>, request: Request<Body>) -> Response<Body> {
-    let path = request.uri().path();
-    let found = resolve(&dir, path);
-    let (status, file) = match found {
-        Some(file) => (StatusCode::OK, file),
-        None => (StatusCode::NOT_FOUND, dir.join("404.html")),
-    };
+async fn file(
+    State((dir, missing)): State<(PathBuf, Missing)>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let (status, file) = answer(&dir, request.uri().path(), missing);
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
             let mut response = Response::new(Body::from(bytes));
@@ -125,6 +182,17 @@ async fn file(State(dir): State<PathBuf>, request: Request<Body>) -> Response<Bo
             *response.status_mut() = StatusCode::NOT_FOUND;
             response
         }
+    }
+}
+
+/// The status and the file the Worker answers a path with: the file the
+/// path names, or for a path that names none, the 404 page (the marketing
+/// site) or the notice itself with a 200 (the shutdown notice).
+fn answer(dir: &Path, path: &str, missing: Missing) -> (StatusCode, PathBuf) {
+    match (resolve(dir, path), missing) {
+        (Some(file), _) => (StatusCode::OK, file),
+        (None, Missing::NotFound) => (StatusCode::NOT_FOUND, dir.join("404.html")),
+        (None, Missing::Index) => (StatusCode::OK, dir.join("index.html")),
     }
 }
 
@@ -180,5 +248,50 @@ fn kind(file: &Path) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A site holding just the two pages, in a directory of the test's own.
+    fn site_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("marketing-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["index.html", "404.html"] {
+            std::fs::write(dir.join(file), file).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn an_old_app_address_gets_the_notice_with_a_200() {
+        let dir = site_dir("notice");
+        for path in [
+            "/portfolio/claims/123",
+            "/publish/jobs/7",
+            "/you/agents/x",
+            "/agents",
+        ] {
+            assert_eq!(
+                answer(&dir, path, Missing::Index),
+                (StatusCode::OK, dir.join("index.html")),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_marketing_site_still_answers_an_unknown_path_with_its_404() {
+        let dir = site_dir("site");
+        assert_eq!(
+            answer(&dir, "/portfolio/claims/123", Missing::NotFound),
+            (StatusCode::NOT_FOUND, dir.join("404.html"))
+        );
+        assert_eq!(
+            answer(&dir, "/", Missing::NotFound),
+            (StatusCode::OK, dir.join("index.html"))
+        );
     }
 }
