@@ -168,6 +168,8 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
 <meta property="og:image:height" content="{height}">
 <meta property="og:image:alt" content="{alt}">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{description}">
 <meta name="twitter:image" content="{image}">
 <meta name="twitter:image:alt" content="{alt}">
 {social}<link rel="icon" type="image/png" sizes="32x32" href="{{{{asset:icon-32}}}}">

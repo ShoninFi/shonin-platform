@@ -5,7 +5,9 @@
 //!
 //! Each is drawn from an SVG source in `images/` on the tokens' colours and
 //! the self-hosted fonts, rasterised by `images/render.sh`, and committed.
-//! Change the source and rerun the script; never edit a PNG by hand.
+//! Change the source and rerun the script; never edit a PNG by hand. The
+//! share images are plain RGB PNGs: the fetchers behind link previews differ
+//! in what they take, and that is the form every one of them reads.
 
 /// One PNG, with the size it is declared at (a test reads the file's own
 /// header and checks it).
@@ -23,7 +25,8 @@ pub struct Share {
     pub alt: &'static str,
 }
 
-/// shonin.fi's share image: the home hero's eyebrow, headline and the mark.
+/// shonin.fi's share image: the home hero as it stands, its eyebrow, headline
+/// and four points beside its art, one attested machine on the four chains.
 pub const SHARE_SITE: Share = Share {
     png: Png {
         name: "shonin.png",
@@ -98,7 +101,7 @@ mod tests {
                 "{}",
                 png.name
             );
-            assert!(png.bytes.len() < 300 * 1024, "{} is too heavy", png.name);
+            assert!(png.bytes.len() < 512 * 1024, "{} is too heavy", png.name);
         }
     }
 

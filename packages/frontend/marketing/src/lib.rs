@@ -165,10 +165,15 @@ const ASSETS: &[Asset] = &[
     },
 ];
 
-/// Where the share image is served. Not fingerprinted: link previews are
-/// cached by address, sometimes for long after a page changes, so the
-/// address stays put and `_headers` gives it a short cache life instead.
-pub const SHARE_IMAGE: &str = "/share/shonin.png";
+/// Where the share image is served: fingerprinted, like the assets. Link
+/// previews remember an address for a long time, a failed fetch of it
+/// included, so a changed card gets a new address and is read afresh.
+pub fn share_image_path() -> String {
+    format!(
+        "/share/shonin.{}.png",
+        fingerprint(ui::images::SHARE_SITE.png.bytes)
+    )
+}
 
 /// Every file the site serves.
 pub fn site(links: &Links) -> Result<Vec<File>> {
@@ -202,7 +207,7 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
         script: &format!("/{js_path}"),
         boot: BOOT,
         theme_color: &theme,
-        share_image: SHARE_IMAGE,
+        share_image: &share_image_path(),
     };
     for (file, page) in &pages {
         files.push(File {
@@ -229,7 +234,7 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
         bytes: redirects(links).into_bytes(),
     });
     files.push(File {
-        path: SHARE_IMAGE.trim_start_matches('/').into(),
+        path: share_image_path().trim_start_matches('/').into(),
         bytes: ui::images::SHARE_SITE.png.bytes.to_vec(),
     });
     files.push(File {
@@ -396,7 +401,7 @@ fn headers() -> String {
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
 /share/*
-  Cache-Control: public, max-age=86400
+  Cache-Control: public, max-age=31536000, immutable
 "
     )
 }
