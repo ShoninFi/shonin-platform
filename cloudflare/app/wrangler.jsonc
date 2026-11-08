@@ -1,8 +1,10 @@
 {
-  // app — the web app's static Trunk dist, served as Workers static assets at
-  // app.shonin.fi. There is no Worker script (`main`); Cloudflare serves the
-  // files. It is public: anyone may open it, and nothing in front of it
-  // asks who they are.
+  // app — app.shonin.fi. Shonin is shut down, so this Worker now serves the
+  // shutdown notice (`task frontend:app:build`, the marketing generator's
+  // `shutdown` subcommand) as Workers static assets: one static page, its
+  // assets, its _headers and robots.txt, and no script. There is no Worker
+  // script (`main`); Cloudflare serves the files. It is public: anyone may
+  // open it, and nothing in front of it asks who they are.
   "$schema": "../../node_modules/wrangler/config-schema.json",
   // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name.
   "name": "shonin-app",
@@ -16,10 +18,11 @@
   "assets": {
     // Must match PATH_DIST_APP in taskfiles/config.yml.
     "directory": "../../.trunk-dist/app",
-    // Every route has its own pre-rendered file (src/bin/seo.rs), or, for an
-    // address with an id, a shared page `_redirects` serves with status 200;
-    // unknown paths get a real 404 status with 404.html, not a soft-404
-    // index.html.
-    "not_found_handling": "404-page"
+    // Every path that isn't a file, the app's old deep links included
+    // (/portfolio/claims/123, /publish/jobs/7), gets the notice, index.html,
+    // with status 200. To serve the full app again (`task
+    // frontend:app:deploy:full`), set this back to "404-page": the app gives
+    // each route its own pre-rendered file and unknown paths a real 404.
+    "not_found_handling": "single-page-application"
   }
 }

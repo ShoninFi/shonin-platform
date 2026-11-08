@@ -1,6 +1,7 @@
 //! The design system's 24px line icons, as the SVG bodies its reference
 //! components draw, plus the handoff's new ones (arrow, chevrons, close,
-//! menu) and the two the marketing boards add (key, swap).
+//! menu), the two the marketing boards add (key, swap), and the two the
+//! shutdown notice uses (the design system's pause, and mail).
 //!
 //! Every icon is drawn at 1.75 stroke on a 24px grid, round caps and joins,
 //! in `currentColor`, and is always `aria-hidden`: a word beside it, or the
@@ -62,6 +63,10 @@ pub fn body(name: &str) -> Option<&'static str> {
         "close" => r#"<path d="M6 6l12 12M18 6L6 18"/>"#,
         "menu" => r#"<path d="M4 7h16M4 12h16M4 17h16"/>"#,
         "key" => r#"<circle cx="8" cy="12" r="3.5"/><path d="M11.5 12H20M17 12v3M20 12v2.5"/>"#,
+        "pause" => r#"<circle cx="12" cy="12" r="8.5"/><path d="M10 9v6M14 9v6"/>"#,
+        "mail" => {
+            r#"<rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="M4.5 7.5l7.5 5.5 7.5-5.5"/>"#
+        }
         "swap" => r#"<path d="M8 5v14M5 16l3 3 3-3"/><path d="M16 19V5M13 8l3-3 3 3"/>"#,
         _ => return None,
     })

@@ -4,6 +4,7 @@ pub mod authors;
 pub mod home;
 pub mod legal;
 pub mod not_found;
+pub mod shutdown;
 
 use crate::html::Page;
 
